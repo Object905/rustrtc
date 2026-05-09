@@ -12,6 +12,7 @@ use tracing::debug;
 
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
+    pub rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
     pub remote_addr: RwLock<SocketAddr>,
     pub remote_rtcp_addr: RwLock<Option<SocketAddr>>,
     pub dtls_receiver: RwLock<Option<Weak<dyn PacketReceiver>>>,
@@ -26,8 +27,17 @@ impl IceConn {
         socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
         remote_addr: SocketAddr,
     ) -> Arc<Self> {
+        Self::new_with_rtcp(socket_rx.clone(), socket_rx, remote_addr)
+    }
+
+    pub fn new_with_rtcp(
+        socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
+        rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
+        remote_addr: SocketAddr,
+    ) -> Arc<Self> {
         Arc::new(Self {
             socket_rx,
+            rtcp_socket_rx,
             remote_addr: RwLock::new(remote_addr),
             remote_rtcp_addr: RwLock::new(None),
             dtls_receiver: RwLock::new(None),
@@ -88,39 +98,40 @@ impl IceConn {
     }
 
     pub async fn send_rtcp(&self, buf: &[u8]) -> Result<usize> {
-        let socket_rx = self.socket_rx.clone();
-        let socket_opt = socket_rx.borrow().clone();
+        let rtcp_addr = *self.remote_rtcp_addr.read();
+        let remote = if let Some(rtcp_addr) = rtcp_addr {
+            rtcp_addr
+        } else {
+            *self.remote_addr.read()
+        };
+
+        if remote.port() == 0 {
+            return Err(anyhow::anyhow!("Remote address not set"));
+        }
+
+        let mut socket_rx = if rtcp_addr.is_some() {
+            self.rtcp_socket_rx.clone()
+        } else {
+            self.socket_rx.clone()
+        };
+        let mut socket_opt = socket_rx.borrow().clone();
+        if socket_opt.is_none() {
+            socket_opt = socket_rx.borrow_and_update().clone();
+        }
+
+        if socket_opt.is_none() && rtcp_addr.is_some() {
+            let mut fallback_rx = self.socket_rx.clone();
+            socket_opt = fallback_rx.borrow().clone();
+            if socket_opt.is_none() {
+                socket_opt = fallback_rx.borrow_and_update().clone();
+            }
+        }
 
         if let Some(socket) = socket_opt {
-            let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read() {
-                rtcp_addr
-            } else {
-                *self.remote_addr.read()
-            };
-
-            if remote.port() == 0 {
-                return Err(anyhow::anyhow!("Remote address not set"));
-            }
             socket.send_to(buf, remote).await
         } else {
-            // Fallback
-            let mut socket_rx = self.socket_rx.clone();
-            let socket_opt = socket_rx.borrow_and_update().clone();
-            if let Some(socket) = socket_opt {
-                let remote = if let Some(rtcp_addr) = *self.remote_rtcp_addr.read() {
-                    rtcp_addr
-                } else {
-                    *self.remote_addr.read()
-                };
-
-                if remote.port() == 0 {
-                    return Err(anyhow::anyhow!("Remote address not set"));
-                }
-                socket.send_to(buf, remote).await
-            } else {
-                tracing::debug!("IceConn: send_rtcp failed - no selected socket");
-                Err(anyhow::anyhow!("No selected socket"))
-            }
+            tracing::debug!("IceConn: send_rtcp failed - no selected socket");
+            Err(anyhow::anyhow!("No selected socket"))
         }
     }
 }
@@ -239,9 +250,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_ice_conn_send_rtcp_no_mux() {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let socket_wrapper = IceSocketWrapper::Udp(Arc::new(socket));
+        let rtp_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rtp_socket_addr = rtp_socket.local_addr().unwrap();
+        let socket_wrapper = IceSocketWrapper::Udp(rtp_socket);
         let (_tx, rx) = watch::channel(Some(socket_wrapper));
+
+        let rtcp_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rtcp_socket_addr = rtcp_socket.local_addr().unwrap();
+        let rtcp_socket_wrapper = IceSocketWrapper::Udp(rtcp_socket);
+        let (_rtcp_tx, rtcp_rx) = watch::channel(Some(rtcp_socket_wrapper));
 
         let rtp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rtp_addr = rtp_receiver.local_addr().unwrap();
@@ -249,19 +266,21 @@ mod tests {
         let rtcp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rtcp_addr = rtcp_receiver.local_addr().unwrap();
 
-        let conn = IceConn::new(rx, rtp_addr);
+        let conn = IceConn::new_with_rtcp(rx, rtcp_rx, rtp_addr);
         conn.set_remote_rtcp_addr(Some(rtcp_addr));
 
         // Send RTP (via send) -> should go to rtp_addr
         conn.send(b"rtp").await.unwrap();
         let mut buf = [0u8; 1024];
-        let (len, _) = rtp_receiver.recv_from(&mut buf).await.unwrap();
+        let (len, rtp_src) = rtp_receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"rtp");
+        assert_eq!(rtp_src, rtp_socket_addr);
 
-        // Send RTCP (via send_rtcp) -> should go to rtcp_addr
+        // Send RTCP (via send_rtcp) -> should go to rtcp_addr from the RTCP socket.
         conn.send_rtcp(b"rtcp").await.unwrap();
-        let (len, _) = rtcp_receiver.recv_from(&mut buf).await.unwrap();
+        let (len, rtcp_src) = rtcp_receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"rtcp");
+        assert_eq!(rtcp_src, rtcp_socket_addr);
     }
 
     struct NoopReceiver;

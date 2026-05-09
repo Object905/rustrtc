@@ -756,6 +756,22 @@ impl MediaSection {
         }
 
         let mut capabilities = Vec::new();
+        let wildcard_rtcp_fbs: Vec<String> = self
+            .attributes
+            .iter()
+            .filter_map(|attr| {
+                if attr.key != "rtcp-fb" {
+                    return None;
+                }
+                let value = attr.value.as_ref()?;
+                let (pt_part, rest) = value.split_once(' ')?;
+                if pt_part == "*" {
+                    Some(rest.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         for fmt in &self.formats {
             let payload_type: u8 = match fmt.parse() {
@@ -820,13 +836,15 @@ impl MediaSection {
             }
 
             // Parse rtcp-fb for this payload type
-            let mut rtcp_fbs = Vec::new();
+            let mut rtcp_fbs = wildcard_rtcp_fbs.clone();
             for attr in &self.attributes {
                 if attr.key == "rtcp-fb" {
                     if let Some(value) = &attr.value {
                         if let Some((pt_part, rest)) = value.split_once(' ') {
                             if let Ok(pt) = pt_part.parse::<u8>() {
-                                if pt == payload_type {
+                                if pt == payload_type
+                                    && !rtcp_fbs.iter().any(|existing| existing == rest)
+                                {
                                     rtcp_fbs.push(rest.to_string());
                                 }
                             }
@@ -1618,6 +1636,31 @@ a=rtcp-fb:97 nack pli\r\n";
             caps[1].fmtp.as_deref().unwrap(),
             "packetization-mode=1;profile-level-id=42e01f"
         );
+        assert_eq!(caps[1].rtcp_fbs, vec!["nack pli"]);
+    }
+
+    #[test]
+    fn test_parse_video_capabilities_expands_wildcard_rtcp_fb() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 4016 RTP/AVP 99 100\r\n\
+c=IN IP4 192.168.3.7\r\n\
+a=rtpmap:99 H264/90000\r\n\
+a=fmtp:99 profile-level-id=42e01e; packetization-mode=1\r\n\
+a=rtpmap:100 VP8/90000\r\n\
+a=rtcp-fb:* nack pli\r\n\
+a=rtcp-fb:99 nack pli\r\n\
+a=rtcp-fb:99 ccm fir\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_video_capabilities();
+
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0].payload_type, 99);
+        assert_eq!(caps[0].rtcp_fbs, vec!["nack pli", "ccm fir"]);
+        assert_eq!(caps[1].payload_type, 100);
         assert_eq!(caps[1].rtcp_fbs, vec!["nack pli"]);
     }
 

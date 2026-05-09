@@ -125,6 +125,8 @@ struct IceTransportInner {
     buffer_stats: Arc<BufferStats>,
     selected_socket: watch::Sender<Option<IceSocketWrapper>>,
     _socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
+    selected_rtcp_socket: watch::Sender<Option<IceSocketWrapper>>,
+    _rtcp_socket_rx_keeper: watch::Receiver<Option<IceSocketWrapper>>,
     selected_pair_notifier: watch::Sender<Option<IceCandidatePair>>,
     _selected_pair_rx_keeper: watch::Receiver<Option<IceCandidatePair>>,
     last_received: parking_lot::Mutex<Instant>,
@@ -156,6 +158,7 @@ impl std::fmt::Debug for IceTransportInner {
             .field("buffered_packets", &self.buffered_packets.lock().len())
             .field("buffer_stats", &self.buffer_stats)
             .field("selected_socket", &self.selected_socket)
+            .field("selected_rtcp_socket", &self.selected_rtcp_socket)
             .field("selected_pair_notifier", &self.selected_pair_notifier)
             .field("candidate_tx", &self.candidate_tx)
             .field("cmd_tx", &self.cmd_tx)
@@ -639,6 +642,7 @@ impl IceTransport {
         let runner_state_rx = state_tx.subscribe();
         let (gathering_state_tx, _) = watch::channel(IceGathererState::New);
         let (selected_socket_tx, selected_socket_rx) = watch::channel(None);
+        let (selected_rtcp_socket_tx, selected_rtcp_socket_rx) = watch::channel(None);
         let (selected_pair_tx, selected_pair_rx) = watch::channel(None);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (nomination_complete_tx, nomination_complete_rx) = watch::channel(None);
@@ -661,6 +665,8 @@ impl IceTransport {
             buffered_packets: parking_lot::Mutex::new(VecDeque::new()),
             selected_socket: selected_socket_tx,
             _socket_rx_keeper: selected_socket_rx,
+            selected_rtcp_socket: selected_rtcp_socket_tx,
+            _rtcp_socket_rx_keeper: selected_rtcp_socket_rx,
             selected_pair_notifier: selected_pair_tx,
             _selected_pair_rx_keeper: selected_pair_rx,
             last_received: parking_lot::Mutex::new(Instant::now()),
@@ -704,6 +710,10 @@ impl IceTransport {
         self.inner.selected_socket.subscribe()
     }
 
+    pub fn subscribe_selected_rtcp_socket(&self) -> watch::Receiver<Option<IceSocketWrapper>> {
+        self.inner.selected_rtcp_socket.subscribe()
+    }
+
     pub fn subscribe_selected_pair(&self) -> watch::Receiver<Option<IceCandidatePair>> {
         self.inner.selected_pair_notifier.subscribe()
     }
@@ -724,6 +734,38 @@ impl IceTransport {
 
     pub fn local_candidates(&self) -> Vec<IceCandidate> {
         self.inner.gatherer.local_candidates()
+    }
+
+    pub fn local_rtcp_addr(&self) -> Option<SocketAddr> {
+        self.inner
+            .gatherer
+            .local_candidates()
+            .into_iter()
+            .find(|candidate| candidate.component == 2)
+            .map(|candidate| candidate.address)
+    }
+
+    pub async fn ensure_direct_rtcp_socket(&self) -> Result<()> {
+        if self.local_rtcp_addr().is_some() {
+            return Ok(());
+        }
+
+        let rtp_candidate = self
+            .inner
+            .gatherer
+            .local_candidates()
+            .into_iter()
+            .find(|candidate| candidate.component == 1)
+            .ok_or_else(|| anyhow!("No RTP candidate available for RTCP socket"))?;
+        let rtp_base = rtp_candidate.base_address();
+        let (rtcp, candidate) =
+            bind_direct_rtcp_socket(&self.inner, rtp_base, rtp_candidate.address.ip()).await?;
+        self.inner.gatherer.push_candidate(candidate);
+        let _ = self
+            .inner
+            .selected_rtcp_socket
+            .send(Some(IceSocketWrapper::Udp(rtcp)));
+        Ok(())
     }
 
     pub fn remote_candidates(&self) -> Vec<IceCandidate> {
@@ -837,7 +879,8 @@ impl IceTransport {
         *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair) {
-            let _ = self.inner.selected_socket.send(Some(socket));
+            let _ = self.inner.selected_socket.send(Some(socket.clone()));
+            publish_selected_rtcp_socket(&self.inner, Some(socket));
         }
         let _ = self.inner.state.send(IceTransportState::Connected);
         Ok(())
@@ -847,6 +890,14 @@ impl IceTransport {
     /// STUN lookups, or connectivity checks.
     /// Binds a single socket, registers it, and marks the transport as connected.
     pub async fn setup_direct_rtp(&self, remote_addr: SocketAddr) -> Result<SocketAddr> {
+        self.setup_direct_rtp_with_rtcp(remote_addr, false).await
+    }
+
+    pub async fn setup_direct_rtp_with_rtcp(
+        &self,
+        remote_addr: SocketAddr,
+        bind_rtcp: bool,
+    ) -> Result<SocketAddr> {
         let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
             bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
                 get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
@@ -916,7 +967,18 @@ impl IceTransport {
         if cand_addr != local_addr {
             local_candidate.related_address = Some(local_addr);
         }
+        let mut rtcp_socket = None;
+        let mut rtcp_candidate = None;
+        if bind_rtcp {
+            let (rtcp, candidate) =
+                bind_direct_rtcp_socket(&self.inner, local_addr, cand_addr.ip()).await?;
+            rtcp_socket = Some(rtcp);
+            rtcp_candidate = Some(candidate);
+        }
         self.inner.gatherer.push_candidate(local_candidate.clone());
+        if let Some(candidate) = rtcp_candidate {
+            self.inner.gatherer.push_candidate(candidate);
+        }
 
         // Set gathering as complete
         *self.inner.gatherer.state.lock() = IceGathererState::Complete;
@@ -930,7 +992,12 @@ impl IceTransport {
         let _ = self
             .inner
             .selected_socket
-            .send(Some(IceSocketWrapper::Udp(socket)));
+            .send(Some(IceSocketWrapper::Udp(socket.clone())));
+        let rtcp_socket = rtcp_socket.unwrap_or_else(|| socket.clone());
+        let _ = self
+            .inner
+            .selected_rtcp_socket
+            .send(Some(IceSocketWrapper::Udp(rtcp_socket)));
         let _ = self.inner.state.send(IceTransportState::Connected);
 
         Ok(cand_addr)
@@ -940,6 +1007,10 @@ impl IceTransport {
     /// Binds a socket and registers the local candidate, but does NOT set the
     /// selected pair or transition to Connected.
     pub async fn setup_direct_rtp_offer(&self) -> Result<SocketAddr> {
+        self.setup_direct_rtp_offer_with_rtcp(false).await
+    }
+
+    pub async fn setup_direct_rtp_offer_with_rtcp(&self, bind_rtcp: bool) -> Result<SocketAddr> {
         let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
             bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
                 get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
@@ -1005,7 +1076,24 @@ impl IceTransport {
         if cand_addr != local_addr {
             local_candidate.related_address = Some(local_addr);
         }
+        let mut rtcp_socket = None;
+        let mut rtcp_candidate = None;
+        if bind_rtcp {
+            let (rtcp, candidate) =
+                bind_direct_rtcp_socket(&self.inner, local_addr, cand_addr.ip()).await?;
+            rtcp_socket = Some(rtcp);
+            rtcp_candidate = Some(candidate);
+        }
         self.inner.gatherer.push_candidate(local_candidate);
+        if let Some(candidate) = rtcp_candidate {
+            self.inner.gatherer.push_candidate(candidate);
+        }
+        if let Some(rtcp_socket) = rtcp_socket {
+            let _ = self
+                .inner
+                .selected_rtcp_socket
+                .send(Some(IceSocketWrapper::Udp(rtcp_socket)));
+        }
 
         *self.inner.gatherer.state.lock() = IceGathererState::Complete;
         let _ = self.inner.gathering_state.send(IceGathererState::Complete);
@@ -1022,7 +1110,7 @@ impl IceTransport {
             .gatherer
             .local_candidates()
             .into_iter()
-            .next()
+            .find(|candidate| candidate.component == 1)
             .unwrap_or_else(|| {
                 IceCandidate::host(
                     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
@@ -1033,7 +1121,8 @@ impl IceTransport {
         *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair) {
-            let _ = self.inner.selected_socket.send(Some(socket));
+            let _ = self.inner.selected_socket.send(Some(socket.clone()));
+            publish_selected_rtcp_socket(&self.inner, Some(socket));
         }
         let _ = self.inner.state.send(IceTransportState::Connected);
     }
@@ -1041,6 +1130,7 @@ impl IceTransport {
     pub fn stop(&self) {
         let _ = self.inner.state.send(IceTransportState::Closed);
         let _ = self.inner.selected_socket.send(None);
+        let _ = self.inner.selected_rtcp_socket.send(None);
         let _ = self.inner.selected_pair_notifier.send(None);
         *self.inner.selected_pair.lock() = None;
         self.inner.gatherer.sockets.lock().clear();
@@ -1062,7 +1152,8 @@ impl IceTransport {
         *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
         if let Some(socket) = resolve_socket(&self.inner, &pair) {
-            let _ = self.inner.selected_socket.send(Some(socket));
+            let _ = self.inner.selected_socket.send(Some(socket.clone()));
+            publish_selected_rtcp_socket(&self.inner, Some(socket));
         }
         let _ = self.inner.state.send(IceTransportState::Connected);
     }
@@ -1198,6 +1289,9 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 );
                 continue;
             }
+            if local.component != remote.component {
+                continue;
+            }
             // Filter out Loopback -> Non-Loopback to avoid EADDRNOTAVAIL (os error 49)
             if local.address.ip().is_loopback() && !remote.address.ip().is_loopback() {
                 continue;
@@ -1274,7 +1368,8 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             *inner.selected_pair.lock() = Some(pair.clone());
             let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
             if let Some(socket) = resolve_socket(&inner, &pair) {
-                let _ = inner.selected_socket.send(Some(socket));
+                let _ = inner.selected_socket.send(Some(socket.clone()));
+                publish_selected_rtcp_socket(&inner, Some(socket));
             }
             let _ = inner.state.send(IceTransportState::Connected);
             success = true;
@@ -1352,6 +1447,76 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         }
         socket.map(IceSocketWrapper::Udp)
     }
+}
+
+fn resolve_rtcp_socket(inner: &IceTransportInner) -> Option<IceSocketWrapper> {
+    let candidate = inner
+        .gatherer
+        .local_candidates()
+        .into_iter()
+        .find(|candidate| candidate.component == 2)?;
+
+    if candidate.typ == IceCandidateType::Relay {
+        let clients = inner.gatherer.turn_clients.lock();
+        clients
+            .get(&candidate.address)
+            .map(|client| IceSocketWrapper::Turn(client.clone(), candidate.address))
+    } else {
+        let socket = inner.gatherer.get_socket(candidate.base_address());
+        if socket.is_none() {
+            debug!(
+                "resolve_rtcp_socket: failed to find socket for {}",
+                candidate.base_address()
+            );
+        }
+        socket.map(IceSocketWrapper::Udp)
+    }
+}
+
+fn publish_selected_rtcp_socket(inner: &IceTransportInner, fallback: Option<IceSocketWrapper>) {
+    if let Some(socket) = resolve_rtcp_socket(inner).or(fallback) {
+        let _ = inner.selected_rtcp_socket.send(Some(socket));
+    }
+}
+
+async fn bind_direct_rtcp_socket(
+    inner: &IceTransportInner,
+    rtp_base: SocketAddr,
+    advertised_ip: IpAddr,
+) -> Result<(Arc<UdpSocket>, IceCandidate)> {
+    let rtcp_bind_addr = rtp_base
+        .port()
+        .checked_add(1)
+        .map(|port| SocketAddr::new(rtp_base.ip(), port));
+    let rtcp = if let Some(addr) = rtcp_bind_addr {
+        match UdpSocket::bind(addr).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                debug!(
+                    "Failed to bind RTCP socket on {}, falling back to ephemeral port: {}",
+                    addr, err
+                );
+                UdpSocket::bind(SocketAddr::new(rtp_base.ip(), 0)).await?
+            }
+        }
+    } else {
+        UdpSocket::bind(SocketAddr::new(rtp_base.ip(), 0)).await?
+    };
+    let local_rtcp_addr = rtcp.local_addr()?;
+    let rtcp = Arc::new(rtcp);
+    inner.gatherer.sockets.lock().push(rtcp.clone());
+    let _ = inner
+        .gatherer
+        .socket_tx
+        .send(IceSocketWrapper::Udp(rtcp.clone()));
+
+    let mut rtcp_cand_addr = local_rtcp_addr;
+    rtcp_cand_addr.set_ip(advertised_ip);
+    let mut candidate = IceCandidate::host(rtcp_cand_addr, 2);
+    if rtcp_cand_addr != local_rtcp_addr {
+        candidate.related_address = Some(local_rtcp_addr);
+    }
+    Ok((rtcp, candidate))
 }
 
 async fn handle_packet(
@@ -1557,7 +1722,8 @@ async fn handle_stun_request(
                 *inner.selected_pair.lock() = Some(new_pair.clone());
                 let _ = inner.selected_pair_notifier.send(Some(new_pair.clone()));
                 if let Some(socket) = resolve_socket(&inner, &new_pair) {
-                    let _ = inner.selected_socket.send(Some(socket));
+                    let _ = inner.selected_socket.send(Some(socket.clone()));
+                    publish_selected_rtcp_socket(&inner, Some(socket));
                 }
             }
         }
@@ -1614,7 +1780,8 @@ async fn handle_stun_request(
                     *inner.selected_pair.lock() = Some(pair.clone());
                     let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
                     if let Some(socket) = resolve_socket(&inner, &pair) {
-                        let _ = inner.selected_socket.send(Some(socket));
+                        let _ = inner.selected_socket.send(Some(socket.clone()));
+                        publish_selected_rtcp_socket(&inner, Some(socket));
                     }
                     let _ = inner.state.send(IceTransportState::Connected);
                     // Controlled side: nomination is decided by the controlling agent;

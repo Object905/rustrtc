@@ -659,19 +659,29 @@ impl PeerConnection {
         *transceiver.sender_stream_id.lock() = Some(sender.stream_id().to_string());
         *transceiver.sender_track_id.lock() = Some(sender.track_id().to_string());
 
-        // If transport is already established, set it on the sender immediately.
+        // If transport is already established, attach the new transceiver
+        // immediately. In direct RTP mode, only attach to an explicit media
+        // transport; falling back to the primary transport would put a newly
+        // added non-BUNDLE video sender on the audio socket until SDP setup
+        // catches up.
         let transport = self
             .inner
             .rtp_media_transports
             .lock()
             .get(&transceiver.id())
             .cloned()
-            .or_else(|| self.inner.rtp_transport.lock().clone());
-        if let Some(transport) = transport {
-            sender.set_transport(transport);
-        }
+            .or_else(|| {
+                if self.inner.config.transport_mode == TransportMode::Rtp {
+                    None
+                } else {
+                    self.inner.rtp_transport.lock().clone()
+                }
+            });
 
         transceiver.set_sender(Some(sender.clone()));
+        if let Some(transport) = transport {
+            self.attach_rtp_transport_to_transceiver(&transceiver, transport);
+        }
         Ok(sender)
     }
 
@@ -1345,9 +1355,11 @@ impl PeerConnection {
             .ok_or(RtcError::Internal("No selected pair".into()))?;
 
         let socket_rx = self.inner.ice_transport.subscribe_selected_socket();
+        let rtcp_socket_rx = self.inner.ice_transport.subscribe_selected_rtcp_socket();
 
         // Create IceConn and register it immediately to avoid dropping packets
-        let ice_conn = IceConn::new(socket_rx.clone(), pair.remote.address);
+        let ice_conn =
+            IceConn::new_with_rtcp(socket_rx.clone(), rtcp_socket_rx, pair.remote.address);
         if self.config().transport_mode == TransportMode::Rtp && self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
         }
@@ -1990,11 +2002,19 @@ impl PeerConnection {
             }
         }
 
+        let needs_rtcp_socket = !section.attributes.iter().any(|attr| attr.key == "rtcp-mux");
         if ice_transport.local_candidates().is_empty() {
-            ice_transport.setup_direct_rtp(remote_addr).await.map_err(|e| {
-                crate::RtcError::Internal(format!("RTP direct error: {}", e))
-            })?;
+            ice_transport
+                .setup_direct_rtp_with_rtcp(remote_addr, needs_rtcp_socket)
+                .await
+                .map_err(|e| crate::RtcError::Internal(format!("RTP direct error: {}", e)))?;
         } else {
+            if needs_rtcp_socket && ice_transport.local_rtcp_addr().is_none() {
+                ice_transport
+                    .ensure_direct_rtcp_socket()
+                    .await
+                    .map_err(|e| crate::RtcError::Internal(format!("RTCP direct error: {}", e)))?;
+            }
             ice_transport.complete_direct_rtp(remote_addr);
         }
 
@@ -2042,7 +2062,8 @@ impl PeerConnection {
         }
 
         let socket_rx = ice_transport.subscribe_selected_socket();
-        let ice_conn = IceConn::new(socket_rx, remote_addr);
+        let rtcp_socket_rx = ice_transport.subscribe_selected_rtcp_socket();
+        let ice_conn = IceConn::new_with_rtcp(socket_rx, rtcp_socket_rx, remote_addr);
         if self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
         }
@@ -3337,15 +3358,30 @@ impl PeerConnectionInner {
             _ => false,
         } && ordered_transceivers.len() > 1
             && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
+        let local_offers_rtcp_mux = self.config.rtcp_mux_policy
+            == crate::config::RtcpMuxPolicy::Require
+            && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
 
         if mode == TransportMode::Rtp {
             // RTP mode: bind a direct socket without ICE gathering.
             // If we don't have candidates yet, bind now via setup_direct_rtp_offer.
+            let primary_needs_rtcp = match sdp_type {
+                SdpType::Answer => ordered_transceivers
+                    .first()
+                    .map(|(_, remote_offered_rtcp_mux)| !*remote_offered_rtcp_mux)
+                    .unwrap_or(!local_offers_rtcp_mux),
+                _ => !local_offers_rtcp_mux,
+            };
             if self.ice_transport.local_candidates().is_empty() {
                 self.ice_transport
-                    .setup_direct_rtp_offer()
+                    .setup_direct_rtp_offer_with_rtcp(primary_needs_rtcp)
                     .await
                     .map_err(|err| RtcError::Internal(format!("RTP socket bind failed: {err}")))?;
+            } else if primary_needs_rtcp && self.ice_transport.local_rtcp_addr().is_none() {
+                self.ice_transport
+                    .ensure_direct_rtcp_socket()
+                    .await
+                    .map_err(|err| RtcError::Internal(format!("RTCP socket bind failed: {err}")))?;
             }
             // Since we skip run_gathering_loop in RTP mode, update gathering state directly.
             let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
@@ -3475,6 +3511,7 @@ impl PeerConnectionInner {
                 section.protocol = "RTP/AVP".to_string();
             }
 
+            let mut local_rtcp_addr = None;
             if mode == TransportMode::WebRtc {
                 section.connection = Some("IN IP4 0.0.0.0".to_string());
                 section
@@ -3503,20 +3540,36 @@ impl PeerConnectionInner {
                     if mode == TransportMode::Rtp && !will_bundle && media_index > 0 {
                         let ice_transport =
                             self.direct_rtp_ice_transport(transceiver.id(), false);
+                        let needs_rtcp = match sdp_type {
+                            SdpType::Answer => !remote_offered_rtcp_mux,
+                            _ => !local_offers_rtcp_mux,
+                        };
                         if ice_transport.local_candidates().is_empty() {
-                            ice_transport.setup_direct_rtp_offer().await.map_err(|err| {
-                                RtcError::Internal(format!("RTP socket bind failed: {err}"))
-                            })?;
+                            ice_transport
+                                .setup_direct_rtp_offer_with_rtcp(needs_rtcp)
+                                .await
+                                .map_err(|err| {
+                                    RtcError::Internal(format!("RTP socket bind failed: {err}"))
+                                })?;
+                        } else if needs_rtcp && ice_transport.local_rtcp_addr().is_none() {
+                            ice_transport
+                                .ensure_direct_rtcp_socket()
+                                .await
+                                .map_err(|err| {
+                                    RtcError::Internal(format!("RTCP socket bind failed: {err}"))
+                                })?;
                         }
                         ice_transport
                     } else {
                         self.ice_transport.clone()
                     };
                 let candidates = section_ice_transport.local_candidates();
+                local_rtcp_addr = section_ice_transport.local_rtcp_addr();
                 if let Some(cand) = candidates
                     .iter()
+                    .filter(|c| c.component == 1)
                     .find(|c| !c.address.ip().is_loopback())
-                    .or(candidates.first())
+                    .or_else(|| candidates.iter().find(|c| c.component == 1))
                 {
                     section.port = cand.address.port();
                     let conn = format!("IN IP4 {}", cand.address.ip());
@@ -3570,6 +3623,14 @@ impl PeerConnectionInner {
             self.populate_media_capabilities(&mut section, transceiver.kind(), sdp_type);
             if sdp_type == SdpType::Answer && !remote_offered_rtcp_mux {
                 section.attributes.retain(|attr| attr.key != "rtcp-mux");
+            }
+            if mode == TransportMode::Rtp
+                && !section.attributes.iter().any(|attr| attr.key == "rtcp-mux")
+                && let Some(rtcp_addr) = local_rtcp_addr
+            {
+                section
+                    .attributes
+                    .push(Attribute::new("rtcp", Some(rtcp_addr.port().to_string())));
             }
             if let Some(sender) = sender_info {
                 Self::attach_sender_attributes(
@@ -3760,14 +3821,18 @@ impl PeerConnectionInner {
             ));
         }
 
-        // Add sdes:mid extmap for BUNDLE support (RFC 8843).
-        // When the remote endpoint offered sdes:mid (e.g. Linphone in BUNDLE mode),
-        // echo the same extension ID back in the answer so the remote knows we
-        // support it.  Without this, Linphone's RtpBundle cannot register our
-        // SSRCs and drops every incoming packet ("SSRC not found" warnings).
-        // Only add in Standard/WebRTC mode; LegacySip never uses BUNDLE.
+        // Add sdes:mid extmap for BUNDLE support (RFC 8843).  Answers echo the
+        // remote ID when offered; WebRTC offers use a default ID so bundled
+        // audio/video can still be demuxed when payload types overlap.
         if self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip {
-            if let Some(id) = self.get_remote_extmap_id(&section.mid, crate::sdp::SDES_MID_URI) {
+            let mut sdes_mid_id = self.get_remote_extmap_id(&section.mid, crate::sdp::SDES_MID_URI);
+            if sdp_type == SdpType::Offer
+                && sdes_mid_id.is_none()
+                && self.config.transport_mode != TransportMode::Rtp
+            {
+                sdes_mid_id = Some("4".to_string());
+            }
+            if let Some(id) = sdes_mid_id {
                 section.attributes.push(crate::sdp::Attribute::new(
                     "extmap",
                     Some(format!("{} {}", id, crate::sdp::SDES_MID_URI)),
@@ -4369,10 +4434,21 @@ impl RtpTransceiver {
             *self.sender_stream_id.lock() = Some(s.stream_id().to_string());
             *self.sender_track_id.lock() = Some(s.track_id().to_string());
 
-            // Apply any deferred sdes:mid configuration that arrived via update_extmap()
-            // before the sender existed (e.g. when the remote offer was processed first).
-            if let Some((id, mid_val)) = self.pending_sdes_mid.lock().take() {
+            // Apply any negotiated sdes:mid configuration to replacement senders too.
+            let pending_sdes_mid = self.pending_sdes_mid.lock().take();
+            if let Some((id, mid_val)) = pending_sdes_mid {
                 s.set_sdes_mid(id, mid_val);
+            } else {
+                let mid_value = self.mid.lock().clone();
+                let sdes_mid_id = self
+                    .extmap
+                    .read()
+                    .iter()
+                    .find(|(_, uri)| uri.as_str() == crate::sdp::SDES_MID_URI)
+                    .map(|(id, _)| *id);
+                if let (Some(id), Some(mid)) = (sdes_mid_id, mid_value) {
+                    s.set_sdes_mid(id, Arc::from(mid.as_str()));
+                }
             }
         }
         *self.sender.lock() = sender;
@@ -4514,6 +4590,8 @@ pub struct RtpSender {
     /// sdes:mid extension to inject: (extension header ID, mid value).
     /// Set automatically by update_extmap() when negotiation contains sdes:mid.
     sdes_mid: Arc<Mutex<Option<(u8, Arc<str>)>>>,
+    transport_generation: Arc<AtomicU64>,
+    transport_change_tx: watch::Sender<u64>,
 }
 
 pub struct RtpSenderBuilder {
@@ -4600,6 +4678,8 @@ impl RtpSender {
         let stream_id = Arc::<str>::from(stream_id);
         let cname = Arc::<str>::from(format!("rustrtc-cname-{ssrc}"));
         let (rtcp_tx, _) = broadcast::channel(100);
+        let (transport_change_tx, _) = watch::channel(0);
+
         Self {
             track,
             transport: Mutex::new(None),
@@ -4616,6 +4696,8 @@ impl RtpSender {
             last_rtp_timestamp: Arc::new(AtomicU32::new(0)),
             interceptors,
             sdes_mid: Arc::new(Mutex::new(None)),
+            transport_generation: Arc::new(AtomicU64::new(0)),
+            transport_change_tx,
         }
     }
 
@@ -4686,11 +4768,19 @@ impl RtpSender {
             }
         }
 
+        let generation = self
+            .transport_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let _ = self.transport_change_tx.send(generation);
+
         *self.transport.lock() = Some(transport.clone());
         let track = self.track.clone();
         let ssrc = self.ssrc;
         let params_lock = self.params.clone();
         let stop_rx = self.stop_tx.clone();
+        let mut transport_change_rx = self.transport_change_tx.subscribe();
+        let transport_generation = self.transport_generation.clone();
         let next_seq = self.next_sequence_number.clone();
         let packets_sent = self.packets_sent.clone();
         let octets_sent = self.octets_sent.clone();
@@ -4714,9 +4804,26 @@ impl RtpSender {
             tokio::pin!(notified);
 
             loop {
+                if transport_generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
+
                 tokio::select! {
                     _ = &mut notified => break,
+                    changed = transport_change_rx.changed() => {
+                        match changed {
+                            Ok(()) => {
+                                if *transport_change_rx.borrow() != generation {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     _ = rtcp_interval.tick(), if packets_sent.load(Ordering::Relaxed) > 0 => {
+                        if transport_generation.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
                         let packet_count = packets_sent.load(Ordering::Relaxed);
 
                         let octet_count = octets_sent.load(Ordering::Relaxed);
@@ -4737,6 +4844,9 @@ impl RtpSender {
                         }
                     }
                     rtcp = rtcp_rx.recv() => {
+                        if transport_generation.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
                         match rtcp {
                             Ok(packet) => {
                                 for interceptor in &interceptors {
@@ -4747,6 +4857,9 @@ impl RtpSender {
                         }
                     }
                     res = track.recv() => {
+                        if transport_generation.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
                         match res {
                             Ok(mut sample) => {
                                 let payload_type = {
@@ -5214,7 +5327,18 @@ impl RtpReceiver {
                 payload_types.push(pt);
             }
         }
-        transport.register_payload_list_listener(payload_types, tx.clone());
+        transport.register_payload_list_listener(payload_types.clone(), tx.clone());
+        debug!(
+            transport_id = format_args!("{:p}", Arc::as_ptr(&transport)),
+            transceiver_id = route_transceiver.as_ref().map(|t| t.id()),
+            transceiver_kind = ?route_transceiver.as_ref().map(|t| t.kind()),
+            transceiver_mid = ?route_transceiver.as_ref().and_then(|t| t.mid()),
+            receiver_kind = ?self.track.kind(),
+            receiver_ssrc = ssrc,
+            default_pt,
+            payload_types = ?payload_types,
+            "RTP receiver registered on transport"
+        );
 
         *self.packet_tx.lock() = Some(tx);
 
@@ -6938,6 +7062,11 @@ a=mid:0
             "Answer must not advertise rtcp-mux when the remote offer omitted it, got:\n{}",
             sdp
         );
+        assert!(
+            sdp.contains("a=rtcp:"),
+            "Answer without rtcp-mux must advertise the separate RTCP port, got:\n{}",
+            sdp
+        );
     }
 
     #[tokio::test]
@@ -7610,6 +7739,10 @@ a=mid:0
             "LegacySip offer must not contain a=rtcp-mux, got SDP:\n{sdp}"
         );
         assert!(
+            sdp.contains("a=rtcp:"),
+            "LegacySip offer without rtcp-mux must advertise the separate RTCP port, got SDP:\n{sdp}"
+        );
+        assert!(
             !sdp.contains("a=group:BUNDLE"),
             "LegacySip offer must not contain a=group:BUNDLE, got SDP:\n{sdp}"
         );
@@ -7675,6 +7808,11 @@ a=mid:0
         assert!(
             !sdp.contains("a=mid:"),
             "LegacySip must not emit a=mid, got:\n{sdp}"
+        );
+        assert_eq!(
+            sdp.matches("a=rtcp:").count(),
+            2,
+            "non-BUNDLE RTP offer must advertise separate RTCP ports for audio and video:\n{sdp}"
         );
     }
 
