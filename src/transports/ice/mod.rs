@@ -365,16 +365,18 @@ impl IceTransportRunner {
     async fn run_keepalive_tick(inner: &Arc<IceTransportInner>) -> Option<BoxFuture<'static, ()>> {
         let state = *inner.state.borrow();
         if state == IceTransportState::Connected || state == IceTransportState::Disconnected {
-            let elapsed = inner.last_received.lock().elapsed();
-            let ice_conn_timeout = inner.config.ice_connection_timeout;
-            if elapsed > ice_conn_timeout {
-                let _ = inner.state.send(IceTransportState::Failed);
-            } else if elapsed > Duration::from_secs(5) {
-                if state != IceTransportState::Disconnected {
-                    let _ = inner.state.send(IceTransportState::Disconnected);
+            if inner.config.transport_mode == crate::TransportMode::WebRtc {
+                let elapsed = inner.last_received.lock().elapsed();
+                let ice_conn_timeout = inner.config.ice_connection_timeout;
+                if elapsed > ice_conn_timeout {
+                    let _ = inner.state.send(IceTransportState::Failed);
+                } else if elapsed > Duration::from_secs(5) {
+                    if state != IceTransportState::Disconnected {
+                        let _ = inner.state.send(IceTransportState::Disconnected);
+                    }
+                } else if state == IceTransportState::Disconnected {
+                    let _ = inner.state.send(IceTransportState::Connected);
                 }
-            } else if state == IceTransportState::Disconnected {
-                let _ = inner.state.send(IceTransportState::Connected);
             }
 
             // Send Keepalive

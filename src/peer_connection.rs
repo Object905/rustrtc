@@ -880,9 +880,8 @@ impl PeerConnection {
                     debug!("Answerer: applying reinvite from offer");
                     self.handle_reinvite(&desc).await?;
                 }
-                // Offerer receiving answer: apply now (was pending since we sent offer)
-                (SdpType::Answer, SignalingState::HaveLocalOffer) => {
-                    debug!("Offerer: applying reinvite from answer");
+                (SdpType::Answer | SdpType::Pranswer, SignalingState::HaveLocalOffer) => {
+                    debug!("Offerer: applying reinvite from answer/pranswer");
                     self.handle_reinvite(&desc).await?;
                 }
                 // Invalid states for reinvite
@@ -921,8 +920,19 @@ impl PeerConnection {
                     }
                     let _ = state.send(SignalingState::Stable);
                 }
-                SdpType::Rollback | SdpType::Pranswer => {
-                    return Err(RtcError::NotImplemented("pranswer/rollback"));
+                SdpType::Pranswer => {
+                    // Provisional answer (SIP 183 early media): set up media transport like an
+                    // answer but keep signaling state in HaveLocalOffer so the final 200 OK
+                    // answer can still arrive and complete the negotiation.
+                    if *state.borrow() != SignalingState::HaveLocalOffer {
+                        return Err(RtcError::InvalidState(
+                            "set_remote_description(pranswer) requires local offer".into(),
+                        ));
+                    }
+                    // Do NOT transition to Stable – stay in HaveLocalOffer.
+                }
+                SdpType::Rollback => {
+                    return Err(RtcError::NotImplemented("rollback"));
                 }
             }
         }
@@ -1296,7 +1306,7 @@ impl PeerConnection {
                     }
                 }
             }
-        } else if desc.sdp_type == SdpType::Answer {
+        } else if desc.sdp_type == SdpType::Answer || desc.sdp_type == SdpType::Pranswer {
             for (t, section_idx) in self.matched_rtp_media_sections(&desc) {
                 let section = &desc.media_sections[section_idx];
                 let mid = &section.mid;
@@ -3818,8 +3828,8 @@ impl PeerConnectionInner {
 
     fn validate_sdp_type(&self, sdp_type: &SdpType) -> RtcResult<()> {
         match sdp_type {
-            SdpType::Offer | SdpType::Answer => Ok(()),
-            _ => Err(RtcError::NotImplemented("pranswer/rollback")),
+            SdpType::Offer | SdpType::Answer | SdpType::Pranswer => Ok(()),
+            _ => Err(RtcError::NotImplemented("rollback")),
         }
     }
 
@@ -5969,6 +5979,39 @@ mod tests {
         answer.sdp_type = SdpType::Answer;
         pc.set_remote_description(answer).await.unwrap();
         assert_eq!(pc.signaling_state(), SignalingState::Stable);
+    }
+
+    /// SIP 183 Session Progress scenario: callee sends a pranswer (early media),
+    /// caller should set up the media transport immediately and stay in
+    /// HaveLocalOffer so the final 200 OK answer can still arrive.
+    #[tokio::test]
+    async fn pranswer_sets_up_media_without_completing_negotiation() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer.clone()).unwrap();
+        assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+
+        // Simulate 183 Session Progress with a provisional answer SDP.
+        let mut pranswer = offer.clone();
+        pranswer.sdp_type = SdpType::Pranswer;
+        pc.set_remote_description(pranswer).await.unwrap();
+        // State must remain HaveLocalOffer so the final answer can still come in.
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::HaveLocalOffer,
+            "pranswer must not complete negotiation"
+        );
+
+        // Simulate 200 OK with the final answer.
+        let mut answer = offer.clone();
+        answer.sdp_type = SdpType::Answer;
+        pc.set_remote_description(answer).await.unwrap();
+        assert_eq!(
+            pc.signaling_state(),
+            SignalingState::Stable,
+            "final answer must complete negotiation"
+        );
     }
 
     #[tokio::test]
