@@ -713,15 +713,15 @@ impl PeerConnection {
             .build_description(SdpType::Offer, |dir| dir)
             .await?;
         if self.inner.config.transport_mode == TransportMode::Rtp && !Self::sdp_has_bundle(&desc) {
-            for (media_index, (transceiver, _)) in
-                self.matched_rtp_media_sections(&desc).into_iter().enumerate()
+            for (media_index, (transceiver, _)) in self
+                .matched_rtp_media_sections(&desc)
+                .into_iter()
+                .enumerate()
             {
                 if media_index == 0 {
                     continue;
                 }
-                let ice_transport = self
-                    .inner
-                    .direct_rtp_ice_transport(transceiver.id(), false);
+                let ice_transport = self.inner.direct_rtp_ice_transport(transceiver.id(), false);
                 self.ensure_direct_rtp_media_transport(&transceiver, &ice_transport, None, None)
                     .await;
             }
@@ -1337,6 +1337,22 @@ impl PeerConnection {
                                 ssrc_val, mid
                             );
                         }
+                    }
+                    // For non-RTP modes the transport already exists at this point;
+                    // propagate the expected SSRC so latching can use it.
+                    let transport = self
+                        .inner
+                        .rtp_media_transports
+                        .lock()
+                        .get(&t.id())
+                        .cloned()
+                        .or_else(|| self.inner.rtp_transport.lock().clone());
+                    if let Some(transport) = transport {
+                        transport.ice_conn().set_expected_ssrc(ssrc_val);
+                        debug!(
+                            "Answer SDP: set expected SSRC {} for latching (mid={})",
+                            ssrc_val, mid
+                        );
                     }
                 }
             }
@@ -2044,6 +2060,9 @@ impl PeerConnection {
                     section,
                     remote_addr,
                 ));
+                if let Some(ssrc) = Self::remote_ssrc_from_section(section) {
+                    ice_conn.set_expected_ssrc(ssrc);
+                }
                 self.attach_rtp_transport_to_transceiver(transceiver, transport);
             }
             return Ok(());
@@ -2081,11 +2100,12 @@ impl PeerConnection {
                     remote_addr,
                     "media direct RTP remote from SDP",
                 );
-                ice_conn.set_remote_rtcp_addr(
-                    section.and_then(|section| {
-                        Self::remote_rtcp_addr_from_media_section(section, remote_addr)
-                    }),
-                );
+                ice_conn.set_remote_rtcp_addr(section.and_then(|section| {
+                    Self::remote_rtcp_addr_from_media_section(section, remote_addr)
+                }));
+                if let Some(ssrc) = section.and_then(Self::remote_ssrc_from_section) {
+                    ice_conn.set_expected_ssrc(ssrc);
+                }
             }
             return transport;
         }
@@ -2100,9 +2120,13 @@ impl PeerConnection {
             ice_conn.enable_latch_on_rtp();
         }
         ice_conn.set_remote_rtcp_addr(
-            section
-                .and_then(|section| Self::remote_rtcp_addr_from_media_section(section, remote_addr)),
+            section.and_then(|section| {
+                Self::remote_rtcp_addr_from_media_section(section, remote_addr)
+            }),
         );
+        if let Some(ssrc) = section.and_then(Self::remote_ssrc_from_section) {
+            ice_conn.set_expected_ssrc(ssrc);
+        }
 
         let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
             ice_conn.clone(),
@@ -2169,10 +2193,23 @@ impl PeerConnection {
                 let section = &desc.media_sections[section_idx];
                 let ice_conn = transport.ice_conn();
                 let remote_addr = *ice_conn.remote_addr.read();
-                ice_conn
-                    .set_remote_rtcp_addr(Self::remote_rtcp_addr_from_media_section(section, remote_addr));
+                ice_conn.set_remote_rtcp_addr(Self::remote_rtcp_addr_from_media_section(
+                    section,
+                    remote_addr,
+                ));
             }
         }
+    }
+
+    /// Extract the first `a=ssrc:NNNNN` value from a media section.
+    fn remote_ssrc_from_section(section: &MediaSection) -> Option<u32> {
+        section
+            .attributes
+            .iter()
+            .find(|a| a.key == "ssrc")
+            .and_then(|a| a.value.as_ref())
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|s| s.parse().ok())
     }
 
     fn remote_rtcp_addr_from_sdp(
@@ -2181,7 +2218,11 @@ impl PeerConnection {
     ) -> Option<std::net::SocketAddr> {
         let section = Self::bundle_tag_mid(desc)
             .as_ref()
-            .and_then(|mid| desc.media_sections.iter().find(|section| section.mid == *mid))
+            .and_then(|mid| {
+                desc.media_sections
+                    .iter()
+                    .find(|section| section.mid == *mid)
+            })
             .or_else(|| desc.media_sections.first())?;
         Self::remote_rtcp_addr_from_media_section(section, remote_rtp_addr)
     }
@@ -2287,8 +2328,7 @@ impl PeerConnection {
                 let old_addr = *ice_conn_monitor.remote_addr.read();
                 trace!(
                     "PeerConnection: pair_monitor initial update: {} -> {}",
-                    old_addr,
-                    pair.remote.address
+                    old_addr, pair.remote.address
                 );
                 ice_conn_monitor.set_remote_addr_from_signaling(
                     pair.remote.address,
@@ -2302,10 +2342,8 @@ impl PeerConnection {
                         "PeerConnection: pair_monitor update: {} -> {}",
                         old_addr, pair.remote.address
                     );
-                    ice_conn_monitor.set_remote_addr_from_signaling(
-                        pair.remote.address,
-                        "pair monitor update",
-                    );
+                    ice_conn_monitor
+                        .set_remote_addr_from_signaling(pair.remote.address, "pair monitor update");
                 }
             }
         }
@@ -3550,8 +3588,7 @@ impl PeerConnectionInner {
                 // Prefer non-loopback candidates
                 let section_ice_transport = if mode == TransportMode::Rtp {
                     let ice_transport = if !will_bundle && media_index > 0 {
-                        let ice_transport =
-                            self.direct_rtp_ice_transport(transceiver.id(), false);
+                        let ice_transport = self.direct_rtp_ice_transport(transceiver.id(), false);
                         ice_transport
                     } else {
                         self.ice_transport.clone()
@@ -3602,26 +3639,20 @@ impl PeerConnectionInner {
                             .push(Attribute::new("ice-lite", None));
                     }
                     let section_ice_params = section_ice_transport.local_parameters();
-                    let section_candidate_lines: Vec<String> = candidates
-                        .iter()
-                        .map(IceCandidate::to_sdp)
-                        .collect();
+                    let section_candidate_lines: Vec<String> =
+                        candidates.iter().map(IceCandidate::to_sdp).collect();
                     let section_gather_complete = matches!(
                         section_ice_transport.gather_state(),
                         IceGathererState::Complete
                     );
-                    section
-                        .attributes
-                        .push(Attribute::new(
-                            "ice-ufrag",
-                            Some(section_ice_params.username_fragment.clone()),
-                        ));
-                    section
-                        .attributes
-                        .push(Attribute::new(
-                            "ice-pwd",
-                            Some(section_ice_params.password.clone()),
-                        ));
+                    section.attributes.push(Attribute::new(
+                        "ice-ufrag",
+                        Some(section_ice_params.username_fragment.clone()),
+                    ));
+                    section.attributes.push(Attribute::new(
+                        "ice-pwd",
+                        Some(section_ice_params.password.clone()),
+                    ));
                     for candidate in &section_candidate_lines {
                         section
                             .attributes
@@ -5678,8 +5709,11 @@ mod tests {
         let conn = IceConn::new(socket_rx, initial_addr);
         conn.enable_latch_on_rtp();
 
-        conn.receive(bytes::Bytes::from_static(&[0x80, 0x00, 0x00, 0x00]), rtp_src)
-            .await;
+        conn.receive(
+            bytes::Bytes::from_static(&[0x80, 0x00, 0x00, 0x00]),
+            rtp_src,
+        )
+        .await;
         assert!(conn.rtp_latched.load(Ordering::Relaxed));
 
         let local = IceCandidate::host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20000), 1);
@@ -7885,7 +7919,8 @@ a=mid:0
         let audio_port = offer.media_sections[0].port;
         let video_port = offer.media_sections[1].port;
         assert_ne!(
-            audio_port, video_port,
+            audio_port,
+            video_port,
             "non-BUNDLE RTP offer must not reuse one RTP port for audio and video:\n{}",
             offer.to_sdp_string()
         );
@@ -7991,7 +8026,11 @@ a=mid:0
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
 
         let local_offer = pc.create_offer().await.unwrap();
-        assert_eq!(local_offer.media_sections.len(), 2, "should have audio+video");
+        assert_eq!(
+            local_offer.media_sections.len(),
+            2,
+            "should have audio+video"
+        );
         assert_ne!(
             local_offer.media_sections[0].port,
             local_offer.media_sections[1].port,

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -20,6 +20,7 @@ pub struct IceConn {
     pub latch_on_rtp: AtomicBool,
     pub rtp_latched: AtomicBool,
     pub rtcp_latched: AtomicBool,
+    pub expected_ssrc: AtomicU32,
 }
 
 impl IceConn {
@@ -45,6 +46,7 @@ impl IceConn {
             latch_on_rtp: AtomicBool::new(false),
             rtp_latched: AtomicBool::new(false),
             rtcp_latched: AtomicBool::new(false),
+            expected_ssrc: AtomicU32::new(0),
         })
     }
 
@@ -52,16 +54,19 @@ impl IceConn {
         self.latch_on_rtp.store(true, Ordering::Relaxed);
     }
 
+    /// Set the expected SSRC from the remote answer SDP.
+    /// When set, RTP latching uses SSRC match instead of source-address
+    /// mismatch, allowing latch to succeed even when NAT changes the port.
+    pub fn set_expected_ssrc(&self, ssrc: u32) {
+        self.expected_ssrc.store(ssrc, Ordering::Relaxed);
+    }
+
     pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
         *self.remote_rtcp_addr.write() = addr;
         self.rtcp_latched.store(false, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_remote_addr_from_signaling(
-        &self,
-        addr: SocketAddr,
-        reason: &'static str,
-    ) {
+    pub(crate) fn set_remote_addr_from_signaling(&self, addr: SocketAddr, reason: &'static str) {
         let current = *self.remote_addr.read();
         if self.latch_on_rtp.load(Ordering::Relaxed)
             && self.rtp_latched.load(Ordering::Relaxed)
@@ -215,9 +220,28 @@ impl PacketReceiver for IceConn {
                         *remote_rtcp_addr = Some(addr);
                         self.rtcp_latched.store(true, Ordering::Relaxed);
                     }
-                } else if addr != current_remote && !self.rtp_latched.load(Ordering::Relaxed) {
-                    *self.remote_addr.write() = addr;
-                    self.rtp_latched.store(true, Ordering::Relaxed);
+                } else if !self.rtp_latched.load(Ordering::Relaxed) {
+                    let expected = self.expected_ssrc.load(Ordering::Relaxed);
+                    let should_latch = if expected != 0 {
+                        packet.len() >= 12 && {
+                            let pkt_ssrc =
+                                u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+                            pkt_ssrc == expected
+                        }
+                    } else {
+                        addr != current_remote
+                    };
+                    if should_latch {
+                        if addr != current_remote {
+                            *self.remote_addr.write() = addr;
+                        }
+                        self.rtp_latched.store(true, Ordering::Relaxed);
+                        tracing::info!(
+                            "IceConn: RTP latched to {} (expected_ssrc={})",
+                            addr,
+                            expected
+                        );
+                    }
                 }
             }
             let receiver = {
@@ -433,29 +457,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_rtcp_payload_types_recognized() {
+    async fn test_ssrc_based_latch_ignores_port_mismatch() {
+        // Simulates the VoLTE/NAT scenario: the answer SDP advertises
+        // remote port 4162, but real RTP arrives from port 17687.
+        // Latching should succeed because the SSRC matches.
         let (_tx, rx) = watch::channel(None);
-        let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
-        let conn = IceConn::new(rx, rtp_addr);
+        let sdp_addr: SocketAddr = "10.17.230.54:4162".parse().unwrap();
+        let real_addr: SocketAddr = "112.96.43.157:17687".parse().unwrap();
+        let expected_ssrc: u32 = 787_088_145;
+
+        let conn = IceConn::new(rx, sdp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_expected_ssrc(expected_ssrc);
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        // Build a minimal 12-byte RTP packet with the matching SSRC.
+        let mut pkt = vec![0x80u8, 0x00, 0x10, 0x98, 0x00, 0x00, 0x00, 0xa0];
+        pkt.extend_from_slice(&expected_ssrc.to_be_bytes()); // bytes 8-11
+
+        conn.receive(Bytes::from(pkt), real_addr).await;
+
+        assert_eq!(
+            *conn.remote_addr.read(),
+            real_addr,
+            "Should latch to real NAT address when SSRC matches"
+        );
+        assert!(
+            conn.rtp_latched.load(Ordering::Relaxed),
+            "rtp_latched should be set after SSRC match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssrc_based_latch_ignores_wrong_ssrc() {
+        // A stray packet with a different SSRC should not trigger latching.
+        let (_tx, rx) = watch::channel(None);
+        let sdp_addr: SocketAddr = "10.17.230.54:4162".parse().unwrap();
+        let rogue_addr: SocketAddr = "1.2.3.4:9999".parse().unwrap();
+        let expected_ssrc: u32 = 787_088_145;
+        let wrong_ssrc: u32 = 99_999_999;
+
+        let conn = IceConn::new(rx, sdp_addr);
+        conn.enable_latch_on_rtp();
+        conn.set_expected_ssrc(expected_ssrc);
+        conn.set_rtp_receiver(Arc::new(NoopReceiver));
+
+        let mut pkt = vec![0x80u8, 0x00, 0x10, 0x98, 0x00, 0x00, 0x00, 0xa0];
+        pkt.extend_from_slice(&wrong_ssrc.to_be_bytes());
+
+        conn.receive(Bytes::from(pkt), rogue_addr).await;
+
+        assert_eq!(
+            *conn.remote_addr.read(),
+            sdp_addr,
+            "Should NOT latch when SSRC does not match"
+        );
+        assert!(
+            !conn.rtp_latched.load(Ordering::Relaxed),
+            "rtp_latched should remain false for wrong SSRC"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_address_based_latch_fallback_when_no_expected_ssrc() {
+        // When no expected SSRC is configured, latching falls back to
+        // the original address-mismatch logic (current behaviour).
+        let (_tx, rx) = watch::channel(None);
+        let initial_addr: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let new_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+
+        let conn = IceConn::new(rx, initial_addr);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
-        conn.set_remote_rtcp_addr(Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001)));
+        // expected_ssrc stays 0 — no SDP SSRC hint
 
-        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
-        conn.receive(Bytes::from_static(&[0x80, 0x60, 0x00, 0x00]), rtp_src)
-            .await;
+        let pkt = Bytes::from_static(&[
+            0x80, 0x00, 0x10, 0x98, 0x00, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x01, 0x23,
+        ]);
 
-        for pt in 200u8..=211u8 {
-            let rtcp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000 + pt as u16);
-            let packet = Bytes::from(vec![0x80, pt, 0x00, 0x00]);
-            conn.receive(packet, rtcp_src).await;
+        conn.receive(pkt, new_addr).await;
 
-            assert_eq!(
-                *conn.remote_addr.read(),
-                rtp_src,
-                "RTP address changed for RTCP PT={}",
-                pt
-            );
-        }
+        assert_eq!(*conn.remote_addr.read(), new_addr);
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
     }
 }
