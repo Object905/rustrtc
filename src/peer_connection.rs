@@ -1625,7 +1625,10 @@ impl PeerConnection {
                 res = pair_rx.changed() => {
                     if res.is_ok() {
                         if let Some(pair) = pair_rx.borrow().clone() {
-                            *ice_conn_monitor.remote_addr.write() = pair.remote.address;
+                            ice_conn_monitor.set_remote_addr_from_signaling(
+                                pair.remote.address,
+                                "dtls pair monitor update",
+                            );
                         }
                     }
                 }
@@ -2033,7 +2036,10 @@ impl PeerConnection {
         if primary {
             if let Some(transport) = self.inner.rtp_transport.lock().clone() {
                 let ice_conn = transport.ice_conn();
-                *ice_conn.remote_addr.write() = remote_addr;
+                ice_conn.set_remote_addr_from_signaling(
+                    remote_addr,
+                    "primary direct RTP remote from SDP",
+                );
                 ice_conn.set_remote_rtcp_addr(Self::remote_rtcp_addr_from_media_section(
                     section,
                     remote_addr,
@@ -2071,7 +2077,10 @@ impl PeerConnection {
         {
             if let Some(remote_addr) = remote_addr {
                 let ice_conn = transport.ice_conn();
-                *ice_conn.remote_addr.write() = remote_addr;
+                ice_conn.set_remote_addr_from_signaling(
+                    remote_addr,
+                    "media direct RTP remote from SDP",
+                );
                 ice_conn.set_remote_rtcp_addr(
                     section.and_then(|section| {
                         Self::remote_rtcp_addr_from_media_section(section, remote_addr)
@@ -2275,12 +2284,16 @@ impl PeerConnection {
     ) -> impl Future<Output = ()> + Send {
         async move {
             if let Some(pair) = pair_rx.borrow().clone() {
+                let old_addr = *ice_conn_monitor.remote_addr.read();
                 trace!(
                     "PeerConnection: pair_monitor initial update: {} -> {}",
-                    *ice_conn_monitor.remote_addr.read(),
+                    old_addr,
                     pair.remote.address
                 );
-                *ice_conn_monitor.remote_addr.write() = pair.remote.address;
+                ice_conn_monitor.set_remote_addr_from_signaling(
+                    pair.remote.address,
+                    "pair monitor initial update",
+                );
             }
             while pair_rx.changed().await.is_ok() {
                 if let Some(pair) = pair_rx.borrow().clone() {
@@ -2289,7 +2302,10 @@ impl PeerConnection {
                         "PeerConnection: pair_monitor update: {} -> {}",
                         old_addr, pair.remote.address
                     );
-                    *ice_conn_monitor.remote_addr.write() = pair.remote.address;
+                    ice_conn_monitor.set_remote_addr_from_signaling(
+                        pair.remote.address,
+                        "pair monitor update",
+                    );
                 }
             }
         }
@@ -2590,7 +2606,10 @@ impl PeerConnection {
                             debug!("Updated RTP remote address to {}", remote_addr);
                         } else if self.config().transport_mode == TransportMode::Srtp {
                             if let Some(transport) = self.inner.rtp_transport.lock().as_ref() {
-                                *transport.ice_conn().remote_addr.write() = remote_addr;
+                                transport.ice_conn().set_remote_addr_from_signaling(
+                                    remote_addr,
+                                    "SRTP remote from SDP",
+                                );
                                 debug!("Updated SRTP remote address to {}", remote_addr);
                             }
                         }
@@ -5646,6 +5665,37 @@ mod tests {
     const VIDEO_PAYLOAD_TYPE: u8 = 96;
     const SCTP_FORMAT: &str = "webrtc-datachannel";
     const SCTP_PORT: u16 = 5000;
+
+    #[tokio::test]
+    async fn repro_pair_monitor_must_not_override_latched_rtp_remote() {
+        use crate::transports::PacketReceiver;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let (_socket_tx, socket_rx) = tokio::sync::watch::channel(None);
+        let initial_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        let sdp_private = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4162);
+        let conn = IceConn::new(socket_rx, initial_addr);
+        conn.enable_latch_on_rtp();
+
+        conn.receive(bytes::Bytes::from_static(&[0x80, 0x00, 0x00, 0x00]), rtp_src)
+            .await;
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
+
+        let local = IceCandidate::host(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20000), 1);
+        let remote = IceCandidate::host(sdp_private, 1);
+        let pair = crate::transports::ice::IceCandidatePair::new(local, remote);
+        let (pair_tx, pair_rx) = tokio::sync::watch::channel(Some(pair));
+        drop(pair_tx);
+
+        PeerConnection::create_pair_monitor(pair_rx, conn.clone()).await;
+
+        assert_eq!(
+            *conn.remote_addr.read(),
+            rtp_src,
+            "selected-pair update must not replace an RTP-latched public tuple with private SDP"
+        );
+    }
 
     #[tokio::test]
     async fn create_offer_contains_transceiver() {

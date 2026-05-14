@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::watch;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub struct IceConn {
     pub socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
@@ -55,6 +55,26 @@ impl IceConn {
     pub fn set_remote_rtcp_addr(&self, addr: Option<SocketAddr>) {
         *self.remote_rtcp_addr.write() = addr;
         self.rtcp_latched.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_remote_addr_from_signaling(
+        &self,
+        addr: SocketAddr,
+        reason: &'static str,
+    ) {
+        let current = *self.remote_addr.read();
+        if self.latch_on_rtp.load(Ordering::Relaxed)
+            && self.rtp_latched.load(Ordering::Relaxed)
+            && current != addr
+        {
+            warn!(
+                "IceConn: preserving latched RTP remote {} instead of signaling remote {} ({})",
+                current, addr, reason
+            );
+            return;
+        }
+
+        *self.remote_addr.write() = addr;
     }
 
     pub fn set_dtls_receiver(&self, receiver: Arc<dyn PacketReceiver>) {
