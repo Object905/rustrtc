@@ -826,8 +826,16 @@ impl PeerConnection {
                     }
                     let _ = state.send(SignalingState::Stable);
                 }
-                SdpType::Rollback | SdpType::Pranswer => {
-                    return Err(RtcError::NotImplemented("pranswer/rollback"));
+                SdpType::Pranswer => {
+                    if *state.borrow() != SignalingState::HaveRemoteOffer {
+                        return Err(RtcError::InvalidState(
+                            "set_local_description(pranswer) requires remote offer".into(),
+                        ));
+                    }
+                    // Stay in HaveRemoteOffer.
+                }
+                SdpType::Rollback => {
+                    return Err(RtcError::NotImplemented("rollback"));
                 }
             }
         }
@@ -6012,6 +6020,162 @@ mod tests {
             SignalingState::Stable,
             "final answer must complete negotiation"
         );
+    }
+
+    #[tokio::test]
+    async fn set_local_description_pranswer_keeps_have_remote_offer_state() {
+        let offerer = PeerConnection::new(RtcConfiguration::default());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = offerer.create_offer().await.unwrap();
+
+        let callee = PeerConnection::new(RtcConfiguration::default());
+        callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        callee.set_remote_description(offer).await.unwrap();
+        assert_eq!(callee.signaling_state(), SignalingState::HaveRemoteOffer);
+
+        let answer = callee.create_answer().await.unwrap();
+        let mut pranswer = answer.clone();
+        pranswer.sdp_type = SdpType::Pranswer;
+        callee.set_local_description(pranswer).unwrap();
+
+        assert_eq!(
+            callee.signaling_state(),
+            SignalingState::HaveRemoteOffer,
+            "pranswer must NOT complete negotiation"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_local_description_pranswer_then_answer_completes_negotiation() {
+        let offerer = PeerConnection::new(RtcConfiguration::default());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = offerer.create_offer().await.unwrap();
+
+        let callee = PeerConnection::new(RtcConfiguration::default());
+        callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        callee.set_remote_description(offer).await.unwrap();
+
+        // Step 1: provisional answer (SIP 183).
+        let answer = callee.create_answer().await.unwrap();
+        let mut pranswer = answer.clone();
+        pranswer.sdp_type = SdpType::Pranswer;
+        callee.set_local_description(pranswer).unwrap();
+        assert_eq!(
+            callee.signaling_state(),
+            SignalingState::HaveRemoteOffer,
+            "after pranswer state must remain HaveRemoteOffer"
+        );
+
+        // Step 2: final answer (SIP 200 OK).
+        callee.set_local_description(answer).unwrap();
+        assert_eq!(
+            callee.signaling_state(),
+            SignalingState::Stable,
+            "after final answer state must be Stable"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_local_description_pranswer_requires_have_remote_offer() {
+        // Case 1: Stable state (no negotiation in progress).
+        {
+            let pc = PeerConnection::new(RtcConfiguration::default());
+            pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+            let offer = pc.create_offer().await.unwrap();
+            let mut pranswer = offer.clone();
+            pranswer.sdp_type = SdpType::Pranswer;
+            let err = pc.set_local_description(pranswer).unwrap_err();
+            assert!(
+                matches!(err, RtcError::InvalidState(_)),
+                "pranswer from Stable must return InvalidState, got: {err:?}"
+            );
+        }
+
+        // Case 2: HaveLocalOffer (caller side, waiting for remote answer).
+        {
+            let pc = PeerConnection::new(RtcConfiguration::default());
+            pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+            let offer = pc.create_offer().await.unwrap();
+            pc.set_local_description(offer.clone()).unwrap();
+            assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+
+            let mut pranswer = offer.clone();
+            pranswer.sdp_type = SdpType::Pranswer;
+            let err = pc.set_local_description(pranswer).unwrap_err();
+            assert!(
+                matches!(err, RtcError::InvalidState(_)),
+                "pranswer from HaveLocalOffer must return InvalidState, got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_local_description_pranswer_stores_local_description() {
+        let offerer = PeerConnection::new(RtcConfiguration::default());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = offerer.create_offer().await.unwrap();
+
+        let callee = PeerConnection::new(RtcConfiguration::default());
+        callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        callee.set_remote_description(offer).await.unwrap();
+
+        assert!(
+            callee.local_description().is_none(),
+            "no local description before pranswer"
+        );
+
+        let answer = callee.create_answer().await.unwrap();
+        let mut pranswer = answer.clone();
+        pranswer.sdp_type = SdpType::Pranswer;
+        callee.set_local_description(pranswer).unwrap();
+
+        let stored = callee
+            .local_description()
+            .expect("local_description must be set after pranswer");
+        assert_eq!(
+            stored.sdp_type,
+            SdpType::Pranswer,
+            "stored description must have type Pranswer"
+        );
+        assert!(
+            !stored.media_sections.is_empty(),
+            "stored pranswer must contain media sections"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_local_description_pranswer_allows_multiple_provisional_answers() {
+        let offerer = PeerConnection::new(RtcConfiguration::default());
+        offerer.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let offer = offerer.create_offer().await.unwrap();
+
+        let callee = PeerConnection::new(RtcConfiguration::default());
+        callee.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        callee.set_remote_description(offer).await.unwrap();
+
+        let answer = callee.create_answer().await.unwrap();
+
+        // First provisional answer.
+        let mut pranswer1 = answer.clone();
+        pranswer1.sdp_type = SdpType::Pranswer;
+        callee
+            .set_local_description(pranswer1)
+            .expect("first pranswer must succeed");
+        assert_eq!(callee.signaling_state(), SignalingState::HaveRemoteOffer);
+
+        // Second provisional answer (e.g., updated early media).
+        let mut pranswer2 = answer.clone();
+        pranswer2.sdp_type = SdpType::Pranswer;
+        callee
+            .set_local_description(pranswer2)
+            .expect("second pranswer must succeed");
+        assert_eq!(callee.signaling_state(), SignalingState::HaveRemoteOffer);
+
+        // Final answer.
+        callee
+            .set_local_description(answer)
+            .expect("final answer after multiple pranswers must succeed");
+        assert_eq!(callee.signaling_state(), SignalingState::Stable);
     }
 
     #[tokio::test]
