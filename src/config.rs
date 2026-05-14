@@ -117,7 +117,7 @@ impl Default for AudioCapability {
             codec_name: "opus".to_string(),
             clock_rate: 48000,
             channels: 2,
-            fmtp: Some("minptime=10;useinbandfec=1".to_string()),
+            fmtp: Some("minptime=10;useinbandfec=1;stereo=1".to_string()),
             rtcp_fbs: vec![],
         }
     }
