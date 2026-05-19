@@ -2585,7 +2585,7 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
         .await
         .expect("Should have selected pair after ICE connected");
     let socket_rx = ctrl.subscribe_selected_socket();
-    let ice_conn = IceConn::new(socket_rx, selected_pair.remote.address);
+    let ice_conn = IceConn::new(socket_rx, selected_pair.remote.address, None);
 
     // 2. Register DTLS receiver FIRST (as the fix does: DtlsTransport::new → set_dtls_receiver)
     let (dtls_tx, mut dtls_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -2611,7 +2611,8 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
         );
         if let Ok(Some(pkt)) = received {
             assert_eq!(
-                pkt[0], 0x16,
+                pkt[0],
+                0x16,
                 "Packet #{} should be a DTLS handshake record",
                 i + 1
             );
@@ -2628,6 +2629,7 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
     let ice_conn2 = IceConn::new(
         ctrl.subscribe_selected_socket(),
         selected_pair.remote.address,
+        None,
     );
     let (lost_tx, mut lost_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     // Intentionally NOT calling set_dtls_receiver — simulating the old buggy ordering

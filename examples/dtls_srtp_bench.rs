@@ -76,10 +76,10 @@ async fn bench_dtls() {
     let addr2 = s2.local_addr().unwrap();
 
     let (_tx1, rx1) = watch::channel(Some(IceSocketWrapper::Udp(s1.clone())));
-    let conn1 = IceConn::new(rx1, addr2);
+    let conn1 = IceConn::new(rx1, addr2, None);
 
     let (_tx2, rx2) = watch::channel(Some(IceSocketWrapper::Udp(s2.clone())));
-    let conn2 = IceConn::new(rx2, addr1);
+    let conn2 = IceConn::new(rx2, addr1, None);
 
     // Spawn read loops
     let s1_clone = s1.clone();

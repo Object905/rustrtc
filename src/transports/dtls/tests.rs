@@ -50,13 +50,12 @@ async fn test_dtls_handshake_client_hello() -> Result<()> {
     let server_addr = server_socket.local_addr()?;
 
     let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
-    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
-
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr, None);
     let cert = generate_certificate()?;
 
     // Start client
     let (_client_dtls, _rx, runner) =
-        DtlsTransport::new(client_conn, cert.clone(), true, 1500, None).await?;
+        DtlsTransport::new(client_conn, cert, true, 1500, None).await?;
     tokio::spawn(runner);
 
     // Read from server socket to verify ClientHello
@@ -87,13 +86,10 @@ async fn test_dtls_handshake_server_hello() -> Result<()> {
     let server_addr = server_socket.local_addr()?;
 
     let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
-    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
-
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
     let cert = generate_certificate()?;
-
-    // Start server
-    let (_server_dtls, _rx, runner) =
-        DtlsTransport::new(server_conn.clone(), cert.clone(), false, 1500, None).await?;
+    let (_server_dtls, _, runner) =
+        DtlsTransport::new(server_conn.clone(), cert, false, 1500, None).await?;
     tokio::spawn(runner);
 
     // Start a loop to feed server_dtls
@@ -235,10 +231,10 @@ async fn test_dtls_handshake_full_flow() -> Result<()> {
     let server_addr = server_socket.local_addr()?;
 
     let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
-    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr, None);
 
     let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
-    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
 
     let client_cert = generate_certificate()?;
     let server_cert = generate_certificate()?;
@@ -281,10 +277,10 @@ async fn test_dtls_handshake_fails_on_fingerprint_mismatch() -> Result<()> {
     let server_addr = server_socket.local_addr()?;
 
     let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
-    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr, None);
 
     let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
-    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
 
     let client_cert = generate_certificate()?;
     let server_cert = generate_certificate()?;
@@ -408,10 +404,10 @@ async fn test_dtls_handshake_no_fingerprint_skips_check() -> Result<()> {
     let server_addr = server_socket.local_addr()?;
 
     let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
-    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr);
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr, None);
 
     let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
-    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr);
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
 
     let client_cert = generate_certificate()?;
     let server_cert = generate_certificate()?;

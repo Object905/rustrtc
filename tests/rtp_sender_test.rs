@@ -22,7 +22,7 @@ mod tests {
         let receiver_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver_addr = receiver_socket.local_addr().unwrap();
 
-        let ice_conn = IceConn::new(rx, receiver_addr);
+        let ice_conn = IceConn::new(rx, receiver_addr, None);
         let rtp_transport = Arc::new(RtpTransport::new(ice_conn, false));
 
         // 2. Create a track and source
@@ -93,7 +93,7 @@ mod tests {
         let receiver_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver_addr = receiver_socket.local_addr().unwrap();
 
-        let ice_conn = IceConn::new(rx, receiver_addr);
+        let ice_conn = IceConn::new(rx, receiver_addr, None);
         let rtp_transport = Arc::new(RtpTransport::new(ice_conn, false));
 
         // 2. Create a track and source

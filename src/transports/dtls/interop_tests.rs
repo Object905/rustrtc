@@ -64,7 +64,7 @@ async fn test_interop_rustrtc_client_webrtc_server() -> Result<()> {
     let socket_writer = socket_reader.clone();
 
     let (socket_tx, _) = tokio::sync::watch::channel(Some(IceSocketWrapper::Udp(socket_writer)));
-    let client_conn = IceConn::new(socket_tx.subscribe(), server_addr);
+    let client_conn = IceConn::new(socket_tx.subscribe(), server_addr, None);
 
     // Start read loop
     let conn_clone = client_conn.clone();
@@ -219,7 +219,7 @@ async fn test_interop_rustrtc_client_openssl_server() -> Result<()> {
     let socket_writer = socket_reader.clone();
 
     let (socket_tx, _) = tokio::sync::watch::channel(Some(IceSocketWrapper::Udp(socket_writer)));
-    let client_conn = IceConn::new(socket_tx.subscribe(), server_addr);
+    let client_conn = IceConn::new(socket_tx.subscribe(), server_addr, None);
 
     // Start read loop - forwards incoming UDP packets to IceConn
     let conn_clone = client_conn.clone();

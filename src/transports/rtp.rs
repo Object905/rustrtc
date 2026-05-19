@@ -245,7 +245,8 @@ impl ListenerRegistry {
     }
 
     fn remove_sender(&mut self, tx: &mpsc::Sender<(RtpPacket, SocketAddr)>) {
-        self.by_ssrc.retain(|_, existing| !existing.same_channel(tx));
+        self.by_ssrc
+            .retain(|_, existing| !existing.same_channel(tx));
         self.by_rid.retain(|_, existing| !existing.same_channel(tx));
         self.routes.retain(|route| !route.tx.same_channel(tx));
     }
@@ -517,7 +518,7 @@ impl PacketReceiver for RtpTransport {
                 guard.clone()
             };
             if let Some(tx) = listener {
-                match parse_rtcp_packets(&unprotected) {
+                match parse_rtcp_packets(&unprotected, Some(addr)) {
                     Ok(packets) => {
                         if try_send_with_fallback(&tx, packets).await.is_err() {
                             let mut guard = self.rtcp_listener.lock();
@@ -528,6 +529,12 @@ impl PacketReceiver for RtpTransport {
                         tracing::debug!("RTCP parse failed: {}", e);
                     }
                 }
+            } else {
+                tracing::debug!(
+                    "No RTCP listener, dropping {} bytes from {}",
+                    unprotected.len(),
+                    addr
+                );
             }
         } else {
             let rtp_packet = {
@@ -630,7 +637,12 @@ impl PacketReceiver for RtpTransport {
                     }
                 }
             } else {
-                tracing::debug!("No listener found for packet SSRC: {} PT: {}", ssrc, pt);
+                tracing::debug!(
+                    "No listener found for packet SSRC: {} PT: {} from {}",
+                    ssrc,
+                    pt,
+                    addr
+                );
             }
         }
     }
@@ -649,7 +661,7 @@ mod tests {
         use tokio::sync::watch;
 
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
-        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
         let transport = RtpTransport::new(ice_conn, false);
 
         let (tx, mut rx) = mpsc::channel(10);
@@ -698,7 +710,7 @@ mod tests {
 
         // Setup RtpTransport with a mock/dummy IceConn
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
-        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
         let transport = RtpTransport::new(ice_conn, false);
 
         // Register a provisional listener
@@ -759,7 +771,7 @@ mod tests {
         use tokio::sync::watch;
 
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
-        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
         let transport = RtpTransport::new(ice_conn, false);
 
         let (audio_tx, mut audio_rx) = mpsc::channel(10);
@@ -795,7 +807,7 @@ mod tests {
         use tokio::sync::watch;
 
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
-        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
         let transport = RtpTransport::new(ice_conn, false);
         transport.set_sdes_mid_extension_id(Some(1));
 
@@ -850,7 +862,7 @@ mod tests {
         use tokio::sync::watch;
 
         let (_ice_tx, ice_rx) = watch::channel(None::<IceSocketWrapper>);
-        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap());
+        let ice_conn = IceConn::new(ice_rx, "127.0.0.1:1234".parse().unwrap(), None);
         let transport = RtpTransport::new(ice_conn, false);
         transport.set_sdes_mid_extension_id(Some(1));
 
@@ -904,12 +916,12 @@ mod tests {
 
         let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
-        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap());
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
         let src_transport = RtpTransport::new(src_conn, false);
 
         let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
-        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap());
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
         let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
 
         src_transport.bridge_rewrite_to(

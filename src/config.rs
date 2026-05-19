@@ -358,6 +358,8 @@ pub struct RtcConfiguration {
     /// SDP generation compatibility mode.
     #[serde(default)]
     pub sdp_compatibility: SdpCompatibilityMode,
+    #[serde(skip, default)]
+    pub label: Option<String>,
 }
 
 impl Default for RtcConfiguration {
@@ -399,6 +401,7 @@ impl Default for RtcConfiguration {
             buffer_drop_strategy: BufferDropStrategy::default(),
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
             sdp_compatibility: SdpCompatibilityMode::default(),
+            label: None,
         }
     }
 }

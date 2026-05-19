@@ -1,5 +1,6 @@
 use crate::errors::{RtpError, RtpResult};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::time::SystemTime;
 use tracing::debug;
 
@@ -10,6 +11,8 @@ pub const RTCP_SDES: u8 = 202;
 pub const RTCP_BYE: u8 = 203;
 pub const RTCP_RTPFB: u8 = 205;
 pub const RTCP_PSFB: u8 = 206;
+/// RTCP Extended Report (RFC 3611)
+pub const RTCP_XR: u8 = 207;
 
 pub const RTCP_RTPFB_NACK: u8 = 1;
 pub const RTCP_RTPFB_TWCC: u8 = 15;
@@ -453,7 +456,7 @@ pub enum RtcpPacket {
     TransportWideCc(TransportWideCc),
 }
 
-pub fn parse_rtcp_packets(raw: &[u8]) -> RtpResult<Vec<RtcpPacket>> {
+pub fn parse_rtcp_packets(raw: &[u8], addr: Option<SocketAddr>) -> RtpResult<Vec<RtcpPacket>> {
     let mut packets = Vec::new();
     let mut offset = 0usize;
     while offset + 4 <= raw.len() {
@@ -489,8 +492,14 @@ pub fn parse_rtcp_packets(raw: &[u8]) -> RtpResult<Vec<RtcpPacket>> {
             RTCP_BYE => packets.push(RtcpPacket::Goodbye(parse_goodbye(fmt, body)?)),
             RTCP_RTPFB => packets.push(parse_rtcp_rtpfb(fmt, body)?),
             RTCP_PSFB => packets.push(parse_rtcp_psfb(fmt, body)?),
+            RTCP_XR => {
+                // XR (Extended Report, RFC 3611) — valid but not parsed; skip silently
+            }
             _ => {
-                debug!("unsupported RTCP packet type: {}", packet_type);
+                debug!(
+                    "unsupported RTCP packet type: {} from {:?}",
+                    packet_type, addr
+                );
             }
         }
         offset += packet_len;
@@ -1048,7 +1057,7 @@ mod tests {
         };
         let bytes =
             marshal_rtcp_packets(&[RtcpPacket::RemoteBitrateEstimate(remb.clone())]).unwrap();
-        let parsed = parse_rtcp_packets(&bytes).unwrap();
+        let parsed = parse_rtcp_packets(&bytes, None).unwrap();
         match &parsed[0] {
             RtcpPacket::RemoteBitrateEstimate(decoded) => {
                 assert_eq!(decoded.sender_ssrc, remb.sender_ssrc);
@@ -1071,7 +1080,7 @@ mod tests {
             media_ssrc: 2,
         });
         let bytes = marshal_rtcp_packets(&[pli.clone()]).unwrap();
-        let parsed = parse_rtcp_packets(&bytes).unwrap();
+        let parsed = parse_rtcp_packets(&bytes, None).unwrap();
         assert!(matches!(parsed[0], RtcpPacket::PictureLossIndication(_)));
     }
 
@@ -1083,7 +1092,7 @@ mod tests {
             lost_packets: vec![100, 102],
         });
         let bytes = marshal_rtcp_packets(&[nack.clone()]).unwrap();
-        let parsed = parse_rtcp_packets(&bytes).unwrap();
+        let parsed = parse_rtcp_packets(&bytes, None).unwrap();
         match &parsed[0] {
             RtcpPacket::GenericNack(out) => {
                 assert_eq!(out.sender_ssrc, 5);
@@ -1124,7 +1133,7 @@ mod tests {
         };
         let packet = RtcpPacket::SourceDescription(sdes.clone());
         let bytes = marshal_rtcp_packets(&[packet]).unwrap();
-        let parsed = parse_rtcp_packets(&bytes).unwrap();
+        let parsed = parse_rtcp_packets(&bytes, None).unwrap();
 
         match &parsed[0] {
             RtcpPacket::SourceDescription(decoded) => {

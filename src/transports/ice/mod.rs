@@ -176,7 +176,8 @@ struct IceTransportRunner {
 }
 
 impl IceTransportRunner {
-    async fn run(mut self) {
+    fn run(mut self) -> impl std::future::Future<Output = ()> + Send {
+        async move {
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
@@ -271,6 +272,7 @@ impl IceTransportRunner {
                     gathering_future = Box::pin(futures::future::pending());
                 }
             }
+        }
         }
     }
 
@@ -1185,7 +1187,10 @@ impl IceTransport {
             if buffer.is_empty() {
                 return;
             }
-            tracing::info!(count = buffer.len(), "Flushing buffered RTP packets to newly registered data_receiver");
+            tracing::info!(
+                count = buffer.len(),
+                "Flushing buffered RTP packets to newly registered data_receiver"
+            );
             buffer.drain(..).collect()
         };
 
@@ -2745,17 +2750,33 @@ impl IceGatherer {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
 
         // Find a suitable host address to bind to (prefer non-loopback IPv4)
-        let bind_ip = self
-            .local_candidates
-            .lock()
-            .iter()
-            .filter(|c| c.typ == IceCandidateType::Host)
-            .filter_map(|c| match c.address.ip() {
-                IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(IpAddr::V4(ip)),
-                _ => None,
-            })
-            .next()
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)));
+        let bind_ip = if addr.is_ipv6() {
+            self.local_candidates
+                .lock()
+                .iter()
+                .filter(|c| c.typ == IceCandidateType::Host)
+                .filter_map(|c| match c.address.ip() {
+                    IpAddr::V6(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+                        Some(IpAddr::V6(ip))
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+        } else {
+            self.local_candidates
+                .lock()
+                .iter()
+                .filter(|c| c.typ == IceCandidateType::Host)
+                .filter_map(|c| match c.address.ip() {
+                    IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+                        Some(IpAddr::V4(ip))
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))
+        };
 
         let socket = match uri.transport {
             IceTransportProtocol::Udp => self.bind_socket(bind_ip).await?,

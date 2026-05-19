@@ -1410,8 +1410,12 @@ impl PeerConnection {
         let rtcp_socket_rx = self.inner.ice_transport.subscribe_selected_rtcp_socket();
 
         // Create IceConn and register it immediately to avoid dropping packets
-        let ice_conn =
-            IceConn::new_with_rtcp(socket_rx.clone(), rtcp_socket_rx, pair.remote.address);
+        let ice_conn = IceConn::new_with_rtcp(
+            socket_rx.clone(),
+            rtcp_socket_rx,
+            pair.remote.address,
+            self.config().label.clone(),
+        );
         if self.config().transport_mode == TransportMode::Rtp && self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
         }
@@ -2133,7 +2137,12 @@ impl PeerConnection {
         let remote_addr = remote_addr.unwrap_or_else(|| {
             std::net::SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
         });
-        let ice_conn = IceConn::new_with_rtcp(socket_rx, rtcp_socket_rx, remote_addr);
+        let ice_conn = IceConn::new_with_rtcp(
+            socket_rx,
+            rtcp_socket_rx,
+            remote_addr,
+            self.config().label.clone(),
+        );
         if self.config().enable_latching {
             ice_conn.enable_latch_on_rtp();
         }
@@ -2539,6 +2548,22 @@ impl PeerConnection {
         gather_once(&[self.inner.stats_collector.clone()]).await
     }
 
+    /// Collect transport-level (UDP tx/rx) stats from all active IceConn instances.
+    pub async fn get_transport_stats(&self) -> RtcResult<StatsReport> {
+        use crate::stats::DynProvider;
+        let providers: Vec<Arc<DynProvider>> = {
+            let mut v: Vec<Arc<DynProvider>> = Vec::new();
+            if let Some(rtp) = self.inner.rtp_transport.lock().as_ref() {
+                v.push(rtp.ice_conn() as Arc<DynProvider>);
+            }
+            for rtp in self.inner.rtp_media_transports.lock().values() {
+                v.push(rtp.ice_conn() as Arc<DynProvider>);
+            }
+            v
+        };
+        gather_once(&providers).await
+    }
+
     pub async fn wait_for_gathering_complete(&self) {
         if self.config().transport_mode == TransportMode::Rtp {
             // RTP mode: no ICE gathering needed. Gathering completes
@@ -2735,10 +2760,26 @@ impl PeerConnection {
     /// or statically-unassigned PTs that have no defined clock-rate.
     fn iana_static_rtp_params(pt: u8) -> Option<RtpCodecParameters> {
         match pt {
-            0 => Some(RtpCodecParameters { payload_type: 0, clock_rate: 8000, channels: 1 }), // PCMU
-            8 => Some(RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 }), // PCMA
-            9 => Some(RtpCodecParameters { payload_type: 9, clock_rate: 8000, channels: 1 }), // G.722
-            18 => Some(RtpCodecParameters { payload_type: 18, clock_rate: 8000, channels: 1 }), // G.729
+            0 => Some(RtpCodecParameters {
+                payload_type: 0,
+                clock_rate: 8000,
+                channels: 1,
+            }), // PCMU
+            8 => Some(RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            }), // PCMA
+            9 => Some(RtpCodecParameters {
+                payload_type: 9,
+                clock_rate: 8000,
+                channels: 1,
+            }), // G.722
+            18 => Some(RtpCodecParameters {
+                payload_type: 18,
+                clock_rate: 8000,
+                channels: 1,
+            }), // G.729
             _ => None,
         }
     }
@@ -5381,7 +5422,9 @@ impl RtpReceiver {
                 // already sent the Track event before set_transport was called.
                 self.track_event_sent.store(false, Ordering::SeqCst);
                 *self.ssrc.lock() = 0;
-                tracing::debug!("RTP receiver: transport replaced — reset track_event_sent and ssrc");
+                tracing::debug!(
+                    "RTP receiver: transport replaced — reset track_event_sent and ssrc"
+                );
             }
         }
 
@@ -5770,7 +5813,7 @@ mod tests {
         let initial_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let rtp_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
         let sdp_private = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4162);
-        let conn = IceConn::new(socket_rx, initial_addr);
+        let conn = IceConn::new(socket_rx, initial_addr, None);
         conn.enable_latch_on_rtp();
 
         conn.receive(
@@ -6525,7 +6568,7 @@ a=ssrc-group:FID 12345 67890\r\n";
         // Mock transport (we just need it to not crash, though it won't actually send)
         let (_, socket_rx) = tokio::sync::watch::channel(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1234);
-        let ice_conn = IceConn::new(socket_rx, addr);
+        let ice_conn = IceConn::new(socket_rx, addr, None);
         let transport = Arc::new(RtpTransport::new(ice_conn, false));
 
         let nack = GenericNack {
@@ -6557,7 +6600,7 @@ a=ssrc-group:FID 12345 67890\r\n";
         // We can't easily check if it was sent without a mock transport that records sends,
         // but we can at least verify it doesn't panic and the logic runs.
         let (_, socket_rx2) = tokio::sync::watch::channel(None);
-        let ice_conn2 = IceConn::new(socket_rx2, addr);
+        let ice_conn2 = IceConn::new(socket_rx2, addr, None);
         let transport2 = Arc::new(RtpTransport::new(ice_conn2, false));
         handler
             .on_rtcp_received(&RtcpPacket::GenericNack(nack_old), transport2)
@@ -6704,7 +6747,7 @@ a=mid:0
         let (_socket_tx, socket_rx) =
             tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
         let ice_conn =
-            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap());
+            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap(), None);
         let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
         receiver.set_transport(transport, None, None);
 
@@ -6780,7 +6823,7 @@ a=mid:0
         let (_socket_tx, socket_rx) =
             tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
         let ice_conn =
-            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap());
+            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap(), None);
         let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
         receiver.set_transport(transport, None, None);
         tokio::task::yield_now().await;
@@ -8421,8 +8464,7 @@ a=mid:0
 
         let pc = PeerConnection::new(config);
 
-        let (_, track, _) =
-            sample_track(crate::media::frame::MediaKind::Audio, 8000);
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
         let pcma_params = RtpCodecParameters {
             payload_type: 8,
             clock_rate: 8000,
@@ -8461,13 +8503,11 @@ a=mid:0
         );
 
         // 183 early media → Pranswer
-        let pranswer =
-            SessionDescription::parse(SdpType::Pranswer, &callee_sdp).unwrap();
+        let pranswer = SessionDescription::parse(SdpType::Pranswer, &callee_sdp).unwrap();
         pc.set_remote_description(pranswer).await.unwrap();
 
         // 200 OK → Answer
-        let answer =
-            SessionDescription::parse(SdpType::Answer, &callee_sdp).unwrap();
+        let answer = SessionDescription::parse(SdpType::Answer, &callee_sdp).unwrap();
         pc.set_remote_description(answer).await.unwrap();
 
         // Give start_dtls (spawned async) time to register the provisional
@@ -8479,7 +8519,7 @@ a=mid:0
         // RTP header: V=2, PT=8, seq=1, ts=0, SSRC=0xDEADBEEF, 20 bytes silence
         let mut rtp = vec![
             0x80u8, 0x08, // V=2 P=0 X=0 CC=0, M=0 PT=8
-            0x00, 0x01,   // sequence=1
+            0x00, 0x01, // sequence=1
             0x00, 0x00, 0x00, 0x00, // timestamp=0
             0xDE, 0xAD, 0xBE, 0xEF, // SSRC
         ];
@@ -8487,12 +8527,9 @@ a=mid:0
         fake_callee.send_to(&rtp, local_addr).await.unwrap();
 
         // ── expect Track event within 500 ms ──
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            pc.recv(),
-        )
-        .await
-        .expect("timed out waiting for PeerConnectionEvent::Track – Track event never fired");
+        let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
+            .await
+            .expect("timed out waiting for PeerConnectionEvent::Track – Track event never fired");
 
         assert!(
             matches!(event, Some(PeerConnectionEvent::Track(_))),
@@ -8515,8 +8552,7 @@ a=mid:0
 
         let pc = PeerConnection::new(config);
 
-        let (_, track, _) =
-            sample_track(crate::media::frame::MediaKind::Audio, 8000);
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
         let _ = pc
             .add_track(
                 track,
@@ -8550,31 +8586,24 @@ a=mid:0
              a=sendrecv\r\n"
         );
 
-        let pranswer =
-            SessionDescription::parse(SdpType::Pranswer, &callee_sdp).unwrap();
+        let pranswer = SessionDescription::parse(SdpType::Pranswer, &callee_sdp).unwrap();
         pc.set_remote_description(pranswer).await.unwrap();
 
-        let answer =
-            SessionDescription::parse(SdpType::Answer, &callee_sdp).unwrap();
+        let answer = SessionDescription::parse(SdpType::Answer, &callee_sdp).unwrap();
         pc.set_remote_description(answer).await.unwrap();
 
         // NO delay – send packet immediately after SDP negotiation
         let fake_callee = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut rtp = vec![
-            0x80u8, 0x08, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00,
-            0xDE, 0xAD, 0xBE, 0xEF,
+            0x80u8, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF,
         ];
         rtp.extend_from_slice(&[0xD5u8; 160]);
         fake_callee.send_to(&rtp, local_addr).await.unwrap();
 
         // Allow time for start_dtls + buffer flush + run_loop processing
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            pc.recv(),
-        )
-        .await
-        .expect("timed out – packet received before start_dtls; buffer flush must deliver it");
+        let event = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
+            .await
+            .expect("timed out – packet received before start_dtls; buffer flush must deliver it");
 
         assert!(
             matches!(event, Some(PeerConnectionEvent::Track(_))),
@@ -8600,7 +8629,11 @@ a=mid:0
 
         let pc = PeerConnection::new(config);
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
-        let pcma_params = RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 };
+        let pcma_params = RtpCodecParameters {
+            payload_type: 8,
+            clock_rate: 8000,
+            channels: 1,
+        };
         let _ = pc.add_track(track, pcma_params).unwrap();
 
         let offer = pc.create_offer().await.unwrap();
@@ -8632,10 +8665,7 @@ a=mid:0
         // This must start BEFORE the Track event fires.
         let pc_clone = pc.clone();
         let recv_handle = tokio::spawn(async move {
-            tokio::time::timeout(
-                tokio::time::Duration::from_millis(2000),
-                pc_clone.recv(),
-            ).await
+            tokio::time::timeout(tokio::time::Duration::from_millis(2000), pc_clone.recv()).await
         });
 
         // Allow 183 to be fully processed (ICE=Connected, transport set up)
@@ -8656,9 +8686,9 @@ a=mid:0
 
         // -------- Callee sends its first RTP packet after 200 OK -----------
         let mut rtp = vec![
-            0x80u8, 0x08, 0x00, 0x01,  // V=2, PT=8, seq=1
-            0x00, 0x00, 0x00, 0x00,    // timestamp=0
-            0xCA, 0xFE, 0xBA, 0xBE,    // ssrc=0xCAFEBABE
+            0x80u8, 0x08, 0x00, 0x01, // V=2, PT=8, seq=1
+            0x00, 0x00, 0x00, 0x00, // timestamp=0
+            0xCA, 0xFE, 0xBA, 0xBE, // ssrc=0xCAFEBABE
         ];
         rtp.extend_from_slice(&[0xD5u8; 160]);
         fake_callee.send_to(&rtp, local_addr).await.unwrap();
@@ -8685,7 +8715,11 @@ a=mid:0
 
         let pc = PeerConnection::new(config);
         let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 8000);
-        let pcma_params = RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 };
+        let pcma_params = RtpCodecParameters {
+            payload_type: 8,
+            clock_rate: 8000,
+            channels: 1,
+        };
         let _ = pc.add_track(track, pcma_params).unwrap();
 
         let offer = pc.create_offer().await.unwrap();
@@ -8717,10 +8751,7 @@ a=mid:0
 
         let pc_clone = pc.clone();
         let recv_handle = tokio::spawn(async move {
-            tokio::time::timeout(
-                tokio::time::Duration::from_millis(2000),
-                pc_clone.recv(),
-            ).await
+            tokio::time::timeout(tokio::time::Duration::from_millis(2000), pc_clone.recv()).await
         });
 
         // 183 phase: no audio
@@ -8739,9 +8770,7 @@ a=mid:0
 
         // Send RTP from the NEW callee address
         let mut rtp = vec![
-            0x80u8, 0x08, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00,
-            0xCA, 0xFE, 0xBA, 0xBE,
+            0x80u8, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xCA, 0xFE, 0xBA, 0xBE,
         ];
         rtp.extend_from_slice(&[0xD5u8; 160]);
         fake_callee_200.send_to(&rtp, local_addr).await.unwrap();
@@ -8808,10 +8837,7 @@ a=mid:0
             params.clock_rate, 8000,
             "PT=8 clock_rate must be 8000 Hz (PCMA RFC 3551)"
         );
-        assert_eq!(
-            params.channels, 1,
-            "PT=8 must have 1 audio channel"
-        );
+        assert_eq!(params.channels, 1, "PT=8 must have 1 audio channel");
 
         // PT=0 (PCMU) is also a well-known static type — verify it too.
         let remote_sdp2 = "v=0\r\n\
@@ -8831,8 +8857,15 @@ a=mid:0
         pc2.set_remote_description(desc2).await.unwrap();
         let t2 = pc2.get_transceivers();
         let pm2 = t2[0].get_payload_map();
-        assert!(pm2.contains_key(&0), "PT=0 (PCMU) must also be registered via iana_static_rtp_params()");
-        assert_eq!(pm2.get(&0).unwrap().clock_rate, 8000, "PT=0 clock_rate must be 8000 Hz");
+        assert!(
+            pm2.contains_key(&0),
+            "PT=0 (PCMU) must also be registered via iana_static_rtp_params()"
+        );
+        assert_eq!(
+            pm2.get(&0).unwrap().clock_rate,
+            8000,
+            "PT=0 clock_rate must be 8000 Hz"
+        );
     }
 
     /// Unit test for Bug 3 — `track_event_sent` was NOT reset when a receiver's
@@ -8858,8 +8891,8 @@ a=mid:0
         use crate::rtp::RtpHeader;
         use crate::transports::ice::conn::IceConn;
         use crate::transports::rtp::RtpTransport;
-        use std::sync::atomic::Ordering;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::Ordering;
 
         let transceiver = Arc::new(RtpTransceiver::new_for_test(
             MediaKind::Audio,
@@ -8871,21 +8904,28 @@ a=mid:0
         transceiver.set_receiver(Some(receiver.clone()));
         let _ = transceiver.update_payload_map(HashMap::from([(
             8u8,
-            RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 },
+            RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            },
         )]));
 
         // Helper: create a fresh RtpTransport backed by a dummy IceConn.
         let make_transport = || {
-            let (_, socket_rx) =
-                tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+            let (_, socket_rx) = tokio::sync::watch::channel::<
+                Option<crate::transports::ice::IceSocketWrapper>,
+            >(None);
             let ice_conn = IceConn::new(
                 socket_rx,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                None,
             );
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         // ── Phase 1: transport A — simulate 183 early media ──────────────
@@ -8899,21 +8939,20 @@ a=mid:0
         tokio::task::yield_now().await;
 
         // Inject a PT=8 packet directly into the run_loop via packet_tx.
-        let packet_tx_a = receiver.packet_tx().expect("packet_tx must be set after set_transport");
-        let pkt_a = crate::rtp::RtpPacket::new(
-            RtpHeader::new(8, 1, 0, 0xDEAD_BEEF),
-            vec![0xD5u8; 160],
-        );
+        let packet_tx_a = receiver
+            .packet_tx()
+            .expect("packet_tx must be set after set_transport");
+        let pkt_a =
+            crate::rtp::RtpPacket::new(RtpHeader::new(8, 1, 0, 0xDEAD_BEEF), vec![0xD5u8; 160]);
         packet_tx_a
             .send((pkt_a, "127.0.0.1:20000".parse().unwrap()))
             .await
             .unwrap();
 
         // First Track event must arrive (SSRC latched from first packet).
-        let first_event = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            async { event_rx.recv().await },
-        )
+        let first_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+            event_rx.recv().await
+        })
         .await
         .expect("first Track event must arrive (early-media phase)");
         assert!(
@@ -8955,27 +8994,26 @@ a=mid:0
 
         // ── Phase 3: verify second Track event fires on transport B ──────
 
-        let packet_tx_b = receiver.packet_tx().expect("packet_tx must be set after second set_transport");
+        let packet_tx_b = receiver
+            .packet_tx()
+            .expect("packet_tx must be set after second set_transport");
         // Different pointer from packet_tx_a: confirms a new run_loop was spawned.
         assert!(
             !packet_tx_a.same_channel(&packet_tx_b),
             "transport switch must create a new packet channel (new run_loop)"
         );
 
-        let pkt_b = crate::rtp::RtpPacket::new(
-            RtpHeader::new(8, 2, 160, 0xDEAD_BEEF),
-            vec![0xD5u8; 160],
-        );
+        let pkt_b =
+            crate::rtp::RtpPacket::new(RtpHeader::new(8, 2, 160, 0xDEAD_BEEF), vec![0xD5u8; 160]);
         packet_tx_b
             .send((pkt_b, "127.0.0.1:20001".parse().unwrap()))
             .await
             .unwrap();
 
         // Without Bug 3 fix this would time out (track_event_sent still true).
-        let second_event = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            async { event_rx.recv().await },
-        )
+        let second_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+            event_rx.recv().await
+        })
         .await
         .expect("second Track event must arrive after transport switch — Bug 3 regression");
         assert!(
@@ -9011,10 +9049,15 @@ a=mid:0
         transceiver.set_receiver(Some(receiver.clone()));
         let _ = transceiver.update_payload_map(HashMap::from([(
             8u8,
-            RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 },
+            RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            },
         )]));
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
@@ -9022,6 +9065,7 @@ a=mid:0
         let ice_conn = IceConn::new(
             socket_rx,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
         );
         let transport_a = Arc::new(RtpTransport::new(ice_conn, false));
 
@@ -9035,16 +9079,16 @@ a=mid:0
 
         // Send one packet → Track event fires → track_event_sent=true
         let packet_tx = receiver.packet_tx().unwrap();
-        let pkt = crate::rtp::RtpPacket::new(
-            RtpHeader::new(8, 1, 0, 0xDEAD_BEEF),
-            vec![0xD5u8; 160],
-        );
-        packet_tx.send((pkt, "127.0.0.1:20000".parse().unwrap())).await.unwrap();
+        let pkt =
+            crate::rtp::RtpPacket::new(RtpHeader::new(8, 1, 0, 0xDEAD_BEEF), vec![0xD5u8; 160]);
+        packet_tx
+            .send((pkt, "127.0.0.1:20000".parse().unwrap()))
+            .await
+            .unwrap();
 
-        let first_event = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            async { event_rx.recv().await },
-        )
+        let first_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+            event_rx.recv().await
+        })
         .await
         .expect("first Track event must arrive");
         assert!(matches!(first_event, Some(PeerConnectionEvent::Track(_))));
@@ -9096,13 +9140,18 @@ a=mid:0
         transceiver.set_receiver(Some(receiver.clone()));
         let _ = transceiver.update_payload_map(HashMap::from([(
             8u8,
-            RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 },
+            RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            },
         )]));
 
         // Precondition: starts as false
         assert!(!receiver.track_event_sent.load(Ordering::SeqCst));
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
         let transceiver_weak = Arc::downgrade(&transceiver);
 
         let (_, socket_rx) =
@@ -9110,10 +9159,15 @@ a=mid:0
         let ice_conn = IceConn::new(
             socket_rx,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
         );
         let transport = Arc::new(RtpTransport::new(ice_conn, false));
 
-        receiver.set_transport(transport, Some(event_tx.clone()), Some(transceiver_weak.clone()));
+        receiver.set_transport(
+            transport,
+            Some(event_tx.clone()),
+            Some(transceiver_weak.clone()),
+        );
         tokio::task::yield_now().await;
 
         // After first set_transport, track_event_sent must still be false
@@ -9125,16 +9179,16 @@ a=mid:0
 
         // Exactly one packet → exactly one Track event
         let packet_tx = receiver.packet_tx().unwrap();
-        let pkt = crate::rtp::RtpPacket::new(
-            RtpHeader::new(8, 1, 0, 0xAB12_3456),
-            vec![0xD5u8; 160],
-        );
-        packet_tx.send((pkt, "127.0.0.1:20002".parse().unwrap())).await.unwrap();
+        let pkt =
+            crate::rtp::RtpPacket::new(RtpHeader::new(8, 1, 0, 0xAB12_3456), vec![0xD5u8; 160]);
+        packet_tx
+            .send((pkt, "127.0.0.1:20002".parse().unwrap()))
+            .await
+            .unwrap();
 
-        let ev = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            async { event_rx.recv().await },
-        )
+        let ev = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+            event_rx.recv().await
+        })
         .await
         .expect("Track event must arrive after first packet on first transport");
         assert!(matches!(ev, Some(PeerConnectionEvent::Track(_))));
@@ -9170,20 +9224,27 @@ a=mid:0
         transceiver.set_receiver(Some(receiver.clone()));
         let _ = transceiver.update_payload_map(HashMap::from([(
             8u8,
-            RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 },
+            RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            },
         )]));
 
         let make_transport = || {
-            let (_, socket_rx) =
-                tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
+            let (_, socket_rx) = tokio::sync::watch::channel::<
+                Option<crate::transports::ice::IceSocketWrapper>,
+            >(None);
             let ice_conn = IceConn::new(
                 socket_rx,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                None,
             );
             Arc::new(RtpTransport::new(ice_conn, false))
         };
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PeerConnectionEvent>();
         let tw = Arc::downgrade(&transceiver);
 
         // Transport A — SSRC = 0xAAAA_1111
@@ -9198,10 +9259,9 @@ a=mid:0
             ))
             .await
             .unwrap();
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            async { event_rx.recv().await },
-        )
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+            event_rx.recv().await
+        })
         .await
         .expect("first Track event on transport A");
         assert_eq!(*receiver.ssrc.lock(), 0xAAAA_1111);
@@ -9209,7 +9269,11 @@ a=mid:0
         // Transport B — use a DIFFERENT SSRC (0xBBBB_2222)
         let tb = make_transport();
         receiver.set_transport(tb.clone(), Some(event_tx.clone()), Some(tw.clone()));
-        assert_eq!(*receiver.ssrc.lock(), 0, "ssrc reset to 0 on transport switch");
+        assert_eq!(
+            *receiver.ssrc.lock(),
+            0,
+            "ssrc reset to 0 on transport switch"
+        );
 
         tokio::task::yield_now().await;
         let ptx_b = receiver.packet_tx().unwrap();
@@ -9224,10 +9288,9 @@ a=mid:0
             .await
             .unwrap();
 
-        let second_event = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            async { event_rx.recv().await },
-        )
+        let second_event = tokio::time::timeout(tokio::time::Duration::from_millis(500), async {
+            event_rx.recv().await
+        })
         .await
         .expect("Track event must fire on transport B with new SSRC");
         assert!(matches!(second_event, Some(PeerConnectionEvent::Track(_))));
@@ -9344,7 +9407,11 @@ a=mid:0
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
         let _ = pc.get_transceivers()[0].update_payload_map(HashMap::from([(
             8u8,
-            RtpCodecParameters { payload_type: 8, clock_rate: 8000, channels: 1 },
+            RtpCodecParameters {
+                payload_type: 8,
+                clock_rate: 8000,
+                channels: 1,
+            },
         )]));
 
         // Init ICE: bind a loopback socket, set selected pair, send Connected.
@@ -9366,21 +9433,15 @@ a=mid:0
         // ── Phase 1: first packet on transport A → Track event ────────────────
         ptx_a
             .send((
-                crate::rtp::RtpPacket::new(
-                    RtpHeader::new(8, 1, 0, 0xAAAA_0001),
-                    vec![0xD5u8; 160],
-                ),
+                crate::rtp::RtpPacket::new(RtpHeader::new(8, 1, 0, 0xAAAA_0001), vec![0xD5u8; 160]),
                 "127.0.0.1:20010".parse().unwrap(),
             ))
             .await
             .unwrap();
 
-        let ev1 = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            pc.recv(),
-        )
-        .await
-        .expect("Track event must arrive after first packet on transport A");
+        let ev1 = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
+            .await
+            .expect("Track event must arrive after first packet on transport A");
         assert!(
             matches!(ev1, Some(PeerConnectionEvent::Track(_))),
             "Phase 1: first Track event must fire"
@@ -9432,12 +9493,9 @@ a=mid:0
             .await
             .unwrap();
 
-        let ev2 = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            pc.recv(),
-        )
-        .await
-        .expect("second Track event must arrive after ICE reconnect");
+        let ev2 = tokio::time::timeout(tokio::time::Duration::from_millis(500), pc.recv())
+            .await
+            .expect("second Track event must arrive after ICE reconnect");
         assert!(
             matches!(ev2, Some(PeerConnectionEvent::Track(_))),
             "Bug 3 fix (ICE reconnect): Track event must re-fire after ICE \
@@ -9445,4 +9503,3 @@ a=mid:0
         );
     }
 }
-

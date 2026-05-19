@@ -1,9 +1,12 @@
 use super::{IceSocketWrapper, should_drop_packet};
+use crate::errors::RtcResult;
+use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use crate::transports::PacketReceiver;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
+use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -22,20 +25,27 @@ pub struct IceConn {
     pub rtcp_latched: AtomicBool,
     pub expected_ssrc: AtomicU32,
     pub rtp_rx_count: AtomicU64,
+    pub label: Option<String>,
+    pub rx_packets: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    pub tx_packets: AtomicU64,
+    pub tx_bytes: AtomicU64,
 }
 
 impl IceConn {
     pub fn new(
         socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
         remote_addr: SocketAddr,
+        label: Option<String>,
     ) -> Arc<Self> {
-        Self::new_with_rtcp(socket_rx.clone(), socket_rx, remote_addr)
+        Self::new_with_rtcp(socket_rx.clone(), socket_rx, remote_addr, label)
     }
 
     pub(crate) fn new_with_rtcp(
         socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
         rtcp_socket_rx: watch::Receiver<Option<IceSocketWrapper>>,
         remote_addr: SocketAddr,
+        label: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
             socket_rx,
@@ -49,6 +59,11 @@ impl IceConn {
             rtcp_latched: AtomicBool::new(false),
             expected_ssrc: AtomicU32::new(0),
             rtp_rx_count: AtomicU64::new(0),
+            label,
+            rx_packets: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            tx_packets: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
         })
     }
 
@@ -105,7 +120,10 @@ impl IceConn {
                 return Err(anyhow::anyhow!("Remote address not set"));
             }
             // tracing::trace!("IceConn: sending {} bytes to {}", buf.len(), remote);
-            socket.send_to(buf, remote).await
+            let n = socket.send_to(buf, remote).await?;
+            self.tx_packets.fetch_add(1, Ordering::Relaxed);
+            self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
         } else {
             // Fallback: try to update if None
             let mut socket_rx = self.socket_rx.clone();
@@ -116,7 +134,10 @@ impl IceConn {
                     return Err(anyhow::anyhow!("Remote address not set"));
                 }
                 // tracing::trace!("IceConn: sending {} bytes to {}", buf.len(), remote);
-                socket.send_to(buf, remote).await
+                let n = socket.send_to(buf, remote).await?;
+                self.tx_packets.fetch_add(1, Ordering::Relaxed);
+                self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
             } else {
                 tracing::warn!("IceConn: send failed - no selected socket");
                 Err(anyhow::anyhow!("No selected socket"))
@@ -155,7 +176,10 @@ impl IceConn {
         }
 
         if let Some(socket) = socket_opt {
-            socket.send_to(buf, remote).await
+            let n = socket.send_to(buf, remote).await?;
+            self.tx_packets.fetch_add(1, Ordering::Relaxed);
+            self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
         } else {
             tracing::debug!("IceConn: send_rtcp failed - no selected socket");
             Err(anyhow::anyhow!("No selected socket"))
@@ -169,6 +193,10 @@ impl PacketReceiver for IceConn {
         if packet.is_empty() {
             return;
         }
+
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+        self.rx_bytes
+            .fetch_add(packet.len() as u64, Ordering::Relaxed);
 
         let first_byte = packet[0];
         // Scope for read lock
@@ -259,11 +287,13 @@ impl PacketReceiver for IceConn {
                 // Log once per connection when the first RTP packet arrives.
                 let prev = self.rtp_rx_count.fetch_add(1, Ordering::Relaxed);
                 if prev == 0 {
+                    let label_str = self.label.as_deref().unwrap_or("unknown");
                     tracing::debug!(
-                        "IceConn: first {} packet ({} bytes) from {} — forwarding to RTP receiver",
+                        "IceConn: first {} packet ({} bytes) from {} label={} — forwarding to RTP receiver",
                         if is_rtcp { "RTCP" } else { "RTP" },
                         packet.len(),
                         addr,
+                        label_str,
                     );
                 }
                 strong_rx.receive(packet, addr).await;
@@ -274,6 +304,25 @@ impl PacketReceiver for IceConn {
                 );
             }
         }
+    }
+}
+
+#[async_trait]
+impl StatsProvider for IceConn {
+    async fn collect(&self) -> RtcResult<Vec<StatsEntry>> {
+        let rx_packets = self.rx_packets.load(Ordering::Relaxed);
+        let rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
+        let tx_packets = self.tx_packets.load(Ordering::Relaxed);
+        let tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
+        let label = self.label.as_deref().unwrap_or("unknown");
+        let id = StatsId::new(format!("ice-conn-{}", label));
+        let entry = StatsEntry::new(id, StatsKind::Transport)
+            .with_value("label", json!(label))
+            .with_value("rxPackets", json!(rx_packets))
+            .with_value("rxBytes", json!(rx_bytes))
+            .with_value("txPackets", json!(tx_packets))
+            .with_value("txBytes", json!(tx_bytes));
+        Ok(vec![entry])
     }
 }
 
@@ -294,7 +343,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let receiver_addr = receiver.local_addr().unwrap();
 
-        let conn = IceConn::new(rx, receiver_addr);
+        let conn = IceConn::new(rx, receiver_addr, None);
 
         // Send RTCP (via send_rtcp) -> should go to receiver_addr (default)
         conn.send_rtcp(b"hello").await.unwrap();
@@ -322,7 +371,7 @@ mod tests {
         let rtcp_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rtcp_addr = rtcp_receiver.local_addr().unwrap();
 
-        let conn = IceConn::new_with_rtcp(rx, rtcp_rx, rtp_addr);
+        let conn = IceConn::new_with_rtcp(rx, rtcp_rx, rtp_addr, None);
         conn.set_remote_rtcp_addr(Some(rtcp_addr));
 
         // Send RTP (via send) -> should go to rtp_addr
@@ -351,7 +400,7 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let initial_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
         let latched_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
-        let conn = IceConn::new(rx, initial_addr);
+        let conn = IceConn::new(rx, initial_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
 
@@ -366,7 +415,7 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
         let rtcp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001);
-        let conn = IceConn::new(rx, rtp_addr);
+        let conn = IceConn::new(rx, rtp_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
         conn.set_remote_rtcp_addr(Some(rtcp_addr));
@@ -393,7 +442,7 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
         let initial_rtcp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001);
-        let conn = IceConn::new(rx, rtp_addr);
+        let conn = IceConn::new(rx, rtp_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
         conn.set_remote_rtcp_addr(Some(initial_rtcp_addr));
@@ -418,7 +467,7 @@ mod tests {
     async fn test_rtcp_does_not_re_latch_after_locked() {
         let (_tx, rx) = watch::channel(None);
         let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
-        let conn = IceConn::new(rx, rtp_addr);
+        let conn = IceConn::new(rx, rtp_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
         conn.set_remote_rtcp_addr(Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4001)));
@@ -450,7 +499,7 @@ mod tests {
     async fn test_rtcp_ignored_in_mux_mode() {
         let (_tx, rx) = watch::channel(None);
         let rtp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
-        let conn = IceConn::new(rx, rtp_addr);
+        let conn = IceConn::new(rx, rtp_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
 
@@ -478,7 +527,7 @@ mod tests {
         let real_addr: SocketAddr = "112.96.43.157:17687".parse().unwrap();
         let expected_ssrc: u32 = 787_088_145;
 
-        let conn = IceConn::new(rx, sdp_addr);
+        let conn = IceConn::new(rx, sdp_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_expected_ssrc(expected_ssrc);
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
@@ -509,7 +558,7 @@ mod tests {
         let expected_ssrc: u32 = 787_088_145;
         let wrong_ssrc: u32 = 99_999_999;
 
-        let conn = IceConn::new(rx, sdp_addr);
+        let conn = IceConn::new(rx, sdp_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_expected_ssrc(expected_ssrc);
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
@@ -538,7 +587,7 @@ mod tests {
         let initial_addr: SocketAddr = "10.0.0.1:4000".parse().unwrap();
         let new_addr: SocketAddr = "10.0.0.2:5000".parse().unwrap();
 
-        let conn = IceConn::new(rx, initial_addr);
+        let conn = IceConn::new(rx, initial_addr, None);
         conn.enable_latch_on_rtp();
         conn.set_rtp_receiver(Arc::new(NoopReceiver));
         // expected_ssrc stays 0 — no SDP SSRC hint
