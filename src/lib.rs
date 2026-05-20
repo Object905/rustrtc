@@ -7,12 +7,14 @@ pub mod sdp;
 pub mod srtp;
 pub mod stats;
 pub mod stats_collector;
+pub mod t38;
 pub mod transports;
 
 pub use config::{
     AudioCapability, BundlePolicy, CertificateConfig, IceCredentialType, IceServer,
     IceTransportPolicy, RtcConfiguration, RtcConfigurationBuilder, RtcpMuxPolicy,
-    SdpCompatibilityMode, TransportMode, VideoCapability,
+    SdpCompatibilityMode, T38Capability, T38FaxRateManagement, T38UdpEC, TransportMode,
+    VideoCapability,
 };
 pub use errors::{RtcError, RtcResult, SdpError, SdpResult};
 pub use peer_connection::{
@@ -36,3 +38,4 @@ pub use transports::ice::{
 };
 pub use transports::rtp::RtpRewriteBridgeParams;
 pub use transports::sctp::{DataChannelEvent, DataChannelState};
+pub use transports::udptl::{UdtlConfig, UdtlReceiveBuffer, UdtlTransport};

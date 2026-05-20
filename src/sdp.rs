@@ -199,6 +199,13 @@ impl SessionDescription {
             .filter(|s| s.kind == MediaKind::Audio)
     }
 
+    /// Returns all image (T.38 fax) media sections.
+    pub fn image_sections(&self) -> impl Iterator<Item = &MediaSection> {
+        self.media_sections
+            .iter()
+            .filter(|s| s.kind == MediaKind::Image)
+    }
+
     /// Returns the first video media section, if any.
     pub fn first_video_section(&self) -> Option<&MediaSection> {
         self.media_sections
@@ -213,6 +220,13 @@ impl SessionDescription {
             .find(|s| s.kind == MediaKind::Audio)
     }
 
+    /// Returns the first image (T.38 fax) media section, if any.
+    pub fn first_image_section(&self) -> Option<&MediaSection> {
+        self.media_sections
+            .iter()
+            .find(|s| s.kind == MediaKind::Image)
+    }
+
     /// Extracts all video capabilities from all video media sections.
     pub fn to_video_capabilities(&self) -> Vec<crate::config::VideoCapability> {
         self.video_sections()
@@ -224,6 +238,13 @@ impl SessionDescription {
     pub fn to_audio_capabilities(&self) -> Vec<crate::config::AudioCapability> {
         self.audio_sections()
             .flat_map(|s| s.to_audio_capabilities())
+            .collect()
+    }
+
+    /// Extracts all T.38 fax capabilities from all image media sections.
+    pub fn to_image_capabilities(&self) -> Vec<crate::config::T38Capability> {
+        self.image_sections()
+            .flat_map(|s| s.to_image_capabilities())
             .collect()
     }
 }
@@ -602,6 +623,7 @@ pub enum MediaKind {
     Audio,
     Video,
     Application,
+    Image,
 }
 
 impl MediaKind {
@@ -610,6 +632,7 @@ impl MediaKind {
             MediaKind::Audio => "audio",
             MediaKind::Video => "video",
             MediaKind::Application => "application",
+            MediaKind::Image => "image",
         }
     }
 }
@@ -622,6 +645,7 @@ impl FromStr for MediaKind {
             "audio" => Ok(MediaKind::Audio),
             "video" => Ok(MediaKind::Video),
             "application" => Ok(MediaKind::Application),
+            "image" => Ok(MediaKind::Image),
             other => Err(SdpError::Unsupported(format!("media kind {other}"))),
         }
     }
@@ -981,6 +1005,7 @@ impl MediaSection {
             MediaKind::Audio => self.apply_audio_config(config),
             MediaKind::Video => self.apply_video_config(config),
             MediaKind::Application => self.apply_application_config(config),
+            MediaKind::Image => self.apply_image_config(config),
         }
     }
 
@@ -1089,6 +1114,117 @@ impl MediaSection {
         self.formats = vec!["webrtc-datachannel".into()];
         self.attributes
             .push(Attribute::new("sctp-port", Some(port.to_string())));
+    }
+
+    pub fn to_image_capabilities(&self) -> Vec<crate::config::T38Capability> {
+        if self.kind != MediaKind::Image {
+            return Vec::new();
+        }
+
+        let mut capabilities = Vec::new();
+
+        for fmt in &self.formats {
+            let payload_type: u8 = fmt.parse().unwrap_or(98);
+
+            let mut version = 0u8;
+            let mut max_bitrate = 14400u32;
+            let mut rate_management = crate::config::T38FaxRateManagement::TransferredTCF;
+            let mut max_buffer = 1024u16;
+            let mut max_datagram = 238u16;
+            let mut udp_ec = crate::config::T38UdpEC::T38UDPRedundancy;
+
+            for attr in &self.attributes {
+                if let Some(value) = &attr.value {
+                    match attr.key.as_str() {
+                        "T38FaxVersion" => {
+                            if let Ok(v) = value.parse::<u8>() {
+                                version = v;
+                            }
+                        }
+                        "T38MaxBitRate" => {
+                            if let Ok(r) = value.parse::<u32>() {
+                                max_bitrate = r;
+                            }
+                        }
+                        "T38FaxRateManagement" => {
+                            rate_management = match value.as_str() {
+                                "localTCF" => crate::config::T38FaxRateManagement::LocalTCF,
+                                _ => crate::config::T38FaxRateManagement::TransferredTCF,
+                            };
+                        }
+                        "T38FaxMaxBuffer" => {
+                            if let Ok(b) = value.parse::<u16>() {
+                                max_buffer = b;
+                            }
+                        }
+                        "T38FaxMaxDatagram" => {
+                            if let Ok(d) = value.parse::<u16>() {
+                                max_datagram = d;
+                            }
+                        }
+                        "T38FaxUdpEC" => {
+                            udp_ec = match value.as_str() {
+                                "t38UDPFEC" => crate::config::T38UdpEC::T38UDPFEC,
+                                _ => crate::config::T38UdpEC::T38UDPRedundancy,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            capabilities.push(crate::config::T38Capability {
+                payload_type,
+                version,
+                max_bitrate,
+                rate_management,
+                max_buffer,
+                max_datagram,
+                udp_ec,
+                fmtp: None,
+            });
+        }
+
+        capabilities
+    }
+
+    fn apply_image_config(&mut self, config: &RtcConfiguration) {
+        let default_caps = crate::config::T38Capability::default();
+        let caps = if let Some(c) = &config.media_capabilities {
+            if c.image.is_empty() {
+                vec![default_caps]
+            } else {
+                c.image.clone()
+            }
+        } else {
+            vec![default_caps]
+        };
+
+        self.protocol = "udptl".into();
+        self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
+
+        for t38 in &caps {
+            self.attributes
+                .push(Attribute::new("T38FaxVersion", Some(t38.version.to_string())));
+            self.attributes.push(Attribute::new(
+                "T38MaxBitRate",
+                Some(t38.max_bitrate.to_string()),
+            ));
+            self.attributes.push(Attribute::new(
+                "T38FaxRateManagement",
+                Some(t38.rate_management.to_string()),
+            ));
+            self.attributes.push(Attribute::new(
+                "T38FaxMaxBuffer",
+                Some(t38.max_buffer.to_string()),
+            ));
+            self.attributes.push(Attribute::new(
+                "T38FaxMaxDatagram",
+                Some(t38.max_datagram.to_string()),
+            ));
+            self.attributes
+                .push(Attribute::new("T38FaxUdpEC", Some(t38.udp_ec.to_string())));
+        }
     }
 
     pub fn add_dtls_attributes(&mut self, fingerprint_hash: &str, setup: &str) {
@@ -1340,6 +1476,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![],
             video: vec![video],
             application: None,
+            image: vec![],
         };
 
         let mut section = MediaSection::new(MediaKind::Video, "0");
@@ -1369,6 +1506,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![],
             video: vec![video],
             application: None,
+            image: vec![],
         };
 
         let mut section = MediaSection::new(MediaKind::Video, "0");
@@ -1388,6 +1526,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![],
             video: vec![VideoCapability::h264()],
             application: None,
+            image: vec![],
         };
 
         let mut section = MediaSection::new(MediaKind::Video, "0");
@@ -1424,6 +1563,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![],
             video: vec![video],
             application: None,
+            image: vec![],
         };
 
         let mut section = MediaSection::new(MediaKind::Video, "0");
@@ -1461,6 +1601,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![audio],
             video: vec![],
             application: None,
+            image: vec![],
         };
 
         let mut section = MediaSection::new(MediaKind::Audio, "0");
@@ -1484,6 +1625,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![AudioCapability::pcma()],
             video: vec![],
             application: None,
+            image: vec![],
         };
         let mut config = make_config(caps, SdpCompatibilityMode::LegacySip);
         config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Require;
@@ -1505,6 +1647,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![],
             video: vec![VideoCapability::default()],
             application: None,
+            image: vec![],
         };
         let mut config = make_config(caps, SdpCompatibilityMode::LegacySip);
         config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Require;
@@ -1526,6 +1669,7 @@ a=fingerprint:sha-256 AA:BB:CC:EE\r\n";
             audio: vec![AudioCapability::pcma()],
             video: vec![],
             application: None,
+            image: vec![],
         };
         let mut config = make_config(caps, SdpCompatibilityMode::Standard);
         config.rtcp_mux_policy = crate::config::RtcpMuxPolicy::Require;
@@ -1934,5 +2078,151 @@ a=mid:as\r\n";
         let sdp = "v=0\r\na=extmap:1 urn:ietf:params:rtp-hdrext:sdes:mid\r\nm=audio 10000 RTP/AVP 0\r\na=mid:as\r\nm=video 10002 RTP/AVP 96\r\na=mid:vs\r\n";
         let result = parse_bundle_mid_info(sdp);
         assert_eq!(result, Some((1u8, "as".to_string(), "vs".to_string())));
+    }
+
+    // ── T.38 / MediaKind::Image tests ───────────────────────────────────────
+
+    #[test]
+    fn test_parse_t38_image_sdp() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=image 12345 udptl t38\r\n\
+a=mid:0\r\n\
+a=T38FaxVersion:0\r\n\
+a=T38MaxBitRate:14400\r\n\
+a=T38FaxRateManagement:transferredTCF\r\n\
+a=T38FaxMaxBuffer:1024\r\n\
+a=T38FaxMaxDatagram:238\r\n\
+a=T38FaxUdpEC:t38UDPRedundancy\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let sections: Vec<_> = desc.image_sections().collect();
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section.kind, MediaKind::Image);
+        assert_eq!(section.port, 12345);
+        assert_eq!(section.protocol, "udptl");
+        assert_eq!(section.formats, vec!["t38"]);
+    }
+
+    #[test]
+    fn test_media_kind_image_str() {
+        assert_eq!(MediaKind::Image.as_str(), "image");
+    }
+
+    #[test]
+    fn test_media_kind_image_from_str() {
+        assert_eq!("image".parse::<MediaKind>().unwrap(), MediaKind::Image);
+        assert!("invalid".parse::<MediaKind>().is_err());
+    }
+
+    #[test]
+    fn test_apply_image_config_normal() {
+        use crate::config::{MediaCapabilities, T38Capability};
+
+        let t38 = T38Capability::default_t38();
+        let caps = MediaCapabilities {
+            audio: vec![],
+            video: vec![],
+            application: None,
+            image: vec![t38],
+        };
+        let mut config = RtcConfiguration::default();
+        config.media_capabilities = Some(caps);
+
+        let mut section = MediaSection::new(MediaKind::Image, "0");
+        section.apply_config(&config);
+
+        assert_eq!(section.protocol, "udptl");
+        assert_eq!(section.formats, vec!["98"]);
+
+        let version = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "T38FaxVersion")
+            .expect("T38FaxVersion should exist");
+        assert_eq!(version.value.as_deref().unwrap(), "0");
+
+        let bitrate = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "T38MaxBitRate")
+            .expect("T38MaxBitRate should exist");
+        assert_eq!(bitrate.value.as_deref().unwrap(), "14400");
+
+        let rm = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "T38FaxRateManagement")
+            .expect("T38FaxRateManagement should exist");
+        assert_eq!(rm.value.as_deref().unwrap(), "transferredTCF");
+
+        let ec = section
+            .attributes
+            .iter()
+            .find(|a| a.key == "T38FaxUdpEC")
+            .expect("T38FaxUdpEC should exist");
+        assert_eq!(ec.value.as_deref().unwrap(), "t38UDPRedundancy");
+    }
+
+    #[test]
+    fn test_to_image_capabilities_from_sdp() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=image 12345 udptl t38\r\n\
+a=mid:0\r\n\
+a=T38FaxVersion:0\r\n\
+a=T38MaxBitRate:14400\r\n\
+a=T38FaxRateManagement:transferredTCF\r\n\
+a=T38FaxMaxBuffer:1024\r\n\
+a=T38FaxMaxDatagram:238\r\n\
+a=T38FaxUdpEC:t38UDPRedundancy\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_image_capabilities();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].version, 0);
+        assert_eq!(caps[0].max_bitrate, 14400);
+        assert_eq!(
+            caps[0].rate_management,
+            crate::config::T38FaxRateManagement::TransferredTCF
+        );
+        assert_eq!(caps[0].max_buffer, 1024);
+        assert_eq!(caps[0].max_datagram, 238);
+        assert_eq!(caps[0].udp_ec, crate::config::T38UdpEC::T38UDPRedundancy);
+    }
+
+    #[test]
+    fn test_to_image_capabilities_empty_for_non_image() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        let caps = desc.to_image_capabilities();
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn test_first_image_section() {
+        let sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+m=image 12345 udptl t38\r\n\
+a=mid:1\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
+        assert!(desc.first_image_section().is_some());
+        assert_eq!(desc.first_image_section().unwrap().mid, "1");
     }
 }

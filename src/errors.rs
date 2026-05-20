@@ -13,6 +13,10 @@ pub enum RtcError {
     InvalidState(String),
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("transport error: {0}")]
+    Transport(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

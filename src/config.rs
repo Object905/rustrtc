@@ -235,10 +235,96 @@ impl Default for ApplicationCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum T38FaxRateManagement {
+    #[serde(rename = "transferredTCF")]
+    TransferredTCF,
+    #[serde(rename = "localTCF")]
+    LocalTCF,
+}
+
+impl Default for T38FaxRateManagement {
+    fn default() -> Self {
+        Self::TransferredTCF
+    }
+}
+
+impl std::fmt::Display for T38FaxRateManagement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransferredTCF => write!(f, "transferredTCF"),
+            Self::LocalTCF => write!(f, "localTCF"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum T38UdpEC {
+    #[serde(rename = "t38UDPRedundancy")]
+    T38UDPRedundancy,
+    #[serde(rename = "t38UDPFEC")]
+    T38UDPFEC,
+}
+
+impl Default for T38UdpEC {
+    fn default() -> Self {
+        Self::T38UDPRedundancy
+    }
+}
+
+impl std::fmt::Display for T38UdpEC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::T38UDPRedundancy => write!(f, "t38UDPRedundancy"),
+            Self::T38UDPFEC => write!(f, "t38UDPFEC"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct T38Capability {
+    pub payload_type: u8,
+    /// T.38 version (0-3)
+    pub version: u8,
+    /// Max bit rate in bps (e.g. 14400, 9600, 4800, 2400)
+    pub max_bitrate: u32,
+    /// Rate management method
+    pub rate_management: T38FaxRateManagement,
+    /// Max buffer size in bytes
+    pub max_buffer: u16,
+    /// Max datagram size in bytes
+    pub max_datagram: u16,
+    /// UDP error correction method
+    pub udp_ec: T38UdpEC,
+    pub fmtp: Option<String>,
+}
+
+impl Default for T38Capability {
+    fn default() -> Self {
+        Self {
+            payload_type: 98,
+            version: 0,
+            max_bitrate: 14400,
+            rate_management: T38FaxRateManagement::default(),
+            max_buffer: 1024,
+            max_datagram: 238,
+            udp_ec: T38UdpEC::default(),
+            fmtp: None,
+        }
+    }
+}
+
+impl T38Capability {
+    pub fn default_t38() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaCapabilities {
     pub audio: Vec<AudioCapability>,
     pub video: Vec<VideoCapability>,
     pub application: Option<ApplicationCapability>,
+    pub image: Vec<T38Capability>,
 }
 
 impl Default for MediaCapabilities {
@@ -247,6 +333,7 @@ impl Default for MediaCapabilities {
             audio: vec![AudioCapability::opus(), AudioCapability::pcmu()],
             video: vec![VideoCapability::default()],
             application: Some(ApplicationCapability::default()),
+            image: vec![],
         }
     }
 }

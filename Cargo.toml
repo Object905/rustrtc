@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.3.63"
+version = "0.3.64"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -49,6 +49,7 @@ rcgen = { version = "0.14.8", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+spandsp-sys = "0.1.5"
 axum = { version = "0.8", features = ["multipart"] }
 turn = "0.17.1"
 webrtc = "0.17.1"

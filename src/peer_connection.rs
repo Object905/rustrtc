@@ -12,6 +12,9 @@ use crate::transports::ice::stun::random_u32;
 use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn::IceConn};
 use crate::transports::rtp::{RtpRewriteBridgeParams, RtpTransport};
 use crate::transports::sctp::SctpTransport;
+use crate::transports::udptl::UdtlTransport;
+use crate::t38::endpoint::FaxEndpoint;
+use crate::t38::t30::{T30FaxConfig, T30Session};
 use crate::{
     Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
     RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
@@ -560,6 +563,7 @@ impl PeerConnection {
                     .iter()
                     .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
                 MediaKind::Application => false,
+                MediaKind::Image => false,
             }
         } else {
             match kind {
@@ -570,6 +574,7 @@ impl PeerConnection {
                     .rtcp_fbs
                     .contains(&"nack".to_string()),
                 MediaKind::Application => false,
+                MediaKind::Image => false,
             }
         };
 
@@ -613,6 +618,7 @@ impl PeerConnection {
             crate::media::frame::MediaKind::Audio => MediaKind::Audio,
             crate::media::frame::MediaKind::Video => MediaKind::Video,
         };
+        // Track-based transceivers always use Audio or Video media kinds
         let transceiver = self.add_transceiver(kind, TransceiverDirection::SendRecv);
         let ssrc = (*transceiver.sender_ssrc.lock())
             .unwrap_or_else(|| self.inner.ssrc_generator.fetch_add(1, Ordering::Relaxed));
@@ -633,6 +639,7 @@ impl PeerConnection {
                     .iter()
                     .any(|c| c.rtcp_fbs.contains(&"nack".to_string())),
                 MediaKind::Application => false,
+                MediaKind::Image => false,
             }
         } else {
             match kind {
@@ -643,6 +650,7 @@ impl PeerConnection {
                     .rtcp_fbs
                     .contains(&"nack".to_string()),
                 MediaKind::Application => false,
+                MediaKind::Image => false,
             }
         };
 
@@ -1901,7 +1909,7 @@ impl PeerConnection {
         let mut matched = Vec::new();
 
         for (section_idx, section) in desc.media_sections.iter().enumerate() {
-            if section.kind == MediaKind::Application {
+            if section.kind == MediaKind::Application || section.kind == MediaKind::Image {
                 continue;
             }
 
@@ -2443,6 +2451,76 @@ impl PeerConnection {
     pub async fn recv(&self) -> Option<PeerConnectionEvent> {
         let mut rx = self.inner.event_rx.lock().await;
         rx.recv().await
+    }
+
+    /// Initialize a T.38 fax endpoint for the Image transceiver.
+    ///
+    /// Must be called after SDP negotiation is complete (both local and remote
+    /// descriptions are set). Returns a `FaxEndpoint` ready for sending/receiving
+    /// T.38 IFP packets.
+    ///
+    /// The UDPTL transport is also stored on the Image transceiver and can be
+    /// retrieved via `transceiver.udtl_transport()`.
+    pub async fn init_t38_fax(&self) -> RtcResult<FaxEndpoint> {
+        use std::net::IpAddr;
+
+        // Get Image transceiver
+        let transceiver = {
+            let transceivers = self.inner.transceivers.lock();
+            transceivers
+                .iter()
+                .find(|t| t.kind() == MediaKind::Image)
+                .cloned()
+                .ok_or_else(|| {
+                    RtcError::InvalidState("no Image transceiver for T.38 fax".into())
+                })?
+        };
+
+        // Get local address from local SDP
+        let local_addr = {
+            let desc = self.inner.local_description.lock();
+            let section = desc
+                .as_ref()
+                .and_then(|d| d.media_sections.iter().find(|s| s.kind == MediaKind::Image))
+                .ok_or_else(|| RtcError::InvalidState("no m=image in local SDP".into()))?;
+            let ip: IpAddr = section
+                .connection
+                .as_deref()
+                .and_then(|c| c.strip_prefix("IN IP4 "))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            std::net::SocketAddr::new(ip, section.port)
+        };
+
+        // Get remote address from remote SDP
+        let remote_addr = {
+            let desc = self.inner.remote_description.lock();
+            let section = desc
+                .as_ref()
+                .and_then(|d| d.media_sections.iter().find(|s| s.kind == MediaKind::Image))
+                .ok_or_else(|| RtcError::InvalidState("no m=image in remote SDP".into()))?;
+            let ip: IpAddr = section
+                .connection
+                .as_deref()
+                .and_then(|c| c.strip_prefix("IN IP4 "))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            std::net::SocketAddr::new(ip, section.port)
+        };
+
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind(local_addr)
+                .await
+                .map_err(|e| RtcError::Transport(format!("T.38 bind({local_addr}): {e}")))?,
+        );
+
+        let transport = Arc::new(crate::transports::udptl::UdtlTransport::new(
+            socket, remote_addr,
+        ));
+        transceiver.set_udtl_transport(transport.clone());
+
+        let fax = FaxEndpoint::new(transport, T30Session::new(T30FaxConfig::default()));
+        Ok(fax)
     }
 
     pub fn create_data_channel(
@@ -3628,6 +3706,7 @@ impl PeerConnectionInner {
                 && sender_info.is_none()
                 && !has_sender_ssrc
                 && transceiver.kind() != MediaKind::Application
+                && transceiver.kind() != MediaKind::Image
                 && !remote_expects_media
             {
                 direction = match direction {
@@ -3640,7 +3719,7 @@ impl PeerConnectionInner {
             let mut section = MediaSection::new(transceiver.kind(), mid);
             section.direction = direction.into();
 
-            if mode == TransportMode::Rtp {
+            if mode == TransportMode::Rtp && transceiver.kind() != MediaKind::Image {
                 section.protocol = "RTP/AVP".to_string();
             }
 
@@ -4458,6 +4537,7 @@ pub struct RtpTransceiver {
     sender: Mutex<Option<Arc<RtpSender>>>,
     receiver: Mutex<Option<Arc<RtpReceiver>>>,
     rtp_transport: Mutex<Option<Weak<RtpTransport>>>,
+    udtl_transport: Mutex<Option<Arc<UdtlTransport>>>,
     sender_ssrc: Mutex<Option<u32>>,
     sender_stream_id: Mutex<Option<String>>,
     sender_track_id: Mutex<Option<String>>,
@@ -4478,6 +4558,7 @@ impl RtpTransceiver {
             sender: Mutex::new(None),
             receiver: Mutex::new(None),
             rtp_transport: Mutex::new(None),
+            udtl_transport: Mutex::new(None),
             sender_ssrc: Mutex::new(None),
             sender_stream_id: Mutex::new(None),
             sender_track_id: Mutex::new(None),
@@ -4540,6 +4621,16 @@ impl RtpTransceiver {
         {
             transport.register_mid_listener(mid, tx);
         }
+    }
+
+    /// Get the UDPTL transport for T.38 fax, if available.
+    pub fn udtl_transport(&self) -> Option<Arc<UdtlTransport>> {
+        self.udtl_transport.lock().clone()
+    }
+
+    /// Set the UDPTL transport for T.38 fax.
+    pub fn set_udtl_transport(&self, transport: Arc<UdtlTransport>) {
+        *self.udtl_transport.lock() = Some(transport);
     }
 
     pub fn sender(&self) -> Option<Arc<RtpSender>> {
@@ -7468,6 +7559,7 @@ a=mid:0
             ],
             video: vec![],
             application: None,
+            image: vec![],
         });
 
         let pc = PeerConnection::new(config);
@@ -7995,6 +8087,7 @@ a=mid:0
             audio: vec![],
             video: vec![VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
@@ -8042,6 +8135,7 @@ a=mid:0
             audio: vec![],
             video: vec![vp8],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
@@ -8068,6 +8162,7 @@ a=mid:0
             audio: vec![],
             video: vec![VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
@@ -8106,6 +8201,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -8144,6 +8240,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::default()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -8175,6 +8272,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -8211,6 +8309,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -8252,6 +8351,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
@@ -8323,6 +8423,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
@@ -8424,6 +8525,7 @@ a=mid:0
             audio: vec![AudioCapability::pcma()],
             video: vec![crate::config::VideoCapability::h264()],
             application: None,
+            image: vec![],
         });
         let pc = PeerConnection::new(config);
         pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
