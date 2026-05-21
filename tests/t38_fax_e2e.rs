@@ -1,3 +1,5 @@
+#![cfg(feature = "t38")]
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -135,7 +137,9 @@ async fn test_fax_cng_ced_exchange() {
 
     // Callee receives CNG
     let recv_cng = callee.recv_ifp(Duration::from_secs(2)).await;
-    assert!(matches!(recv_cng, Some(IfpPacket::T30Indicator(ref v)) if v.contains(&T30Indicator::Cng)));
+    assert!(
+        matches!(recv_cng, Some(IfpPacket::T30Indicator(ref v)) if v.contains(&T30Indicator::Cng))
+    );
 
     // Callee sends CED
     callee.session.start_called();
@@ -143,7 +147,9 @@ async fn test_fax_cng_ced_exchange() {
 
     // Caller receives CED
     let recv_ced = caller.recv_ifp(Duration::from_secs(2)).await;
-    assert!(matches!(recv_ced, Some(IfpPacket::T30Indicator(ref v)) if v.contains(&T30Indicator::Ced)));
+    assert!(
+        matches!(recv_ced, Some(IfpPacket::T30Indicator(ref v)) if v.contains(&T30Indicator::Ced))
+    );
 }
 
 #[tokio::test]
@@ -159,7 +165,9 @@ async fn test_fax_dis_dcs_exchange() {
 
     // Callee sends DIS
     callee.session.start_called();
-    callee.send_data(vec![hdlc_field(0x01, &[0x00, 0x00])]).await;
+    callee
+        .send_data(vec![hdlc_field(0x01, &[0x00, 0x00])])
+        .await;
 
     // Caller receives DIS
     let recv_dis = caller.recv_ifp(Duration::from_secs(2)).await;
@@ -193,11 +201,15 @@ async fn test_fax_complete_session() {
     let _ = caller.recv_ifp(Duration::from_secs(2)).await;
 
     // Phase 3: DIS (called station capabilities)
-    callee.send_data(vec![hdlc_field(0x01, &[0x00, 0x00])]).await;
+    callee
+        .send_data(vec![hdlc_field(0x01, &[0x00, 0x00])])
+        .await;
     let _ = caller.recv_ifp(Duration::from_secs(2)).await;
 
     // Phase 4: DCS from caller
-    caller.send_data(vec![hdlc_field(0x02, &[0x00, 0x00])]).await;
+    caller
+        .send_data(vec![hdlc_field(0x02, &[0x00, 0x00])])
+        .await;
     let _ = callee.recv_ifp(Duration::from_secs(2)).await;
 
     // Phase 5: TCF (training check field)
@@ -247,9 +259,13 @@ async fn test_fax_multi_page_transfer() {
     callee.session.start_called();
     callee.send_indicator(T30Indicator::Ced).await;
     let _ = caller.recv_ifp(Duration::from_secs(2)).await;
-    callee.send_data(vec![hdlc_field(0x01, &[0x00, 0x00])]).await;
+    callee
+        .send_data(vec![hdlc_field(0x01, &[0x00, 0x00])])
+        .await;
     let _ = caller.recv_ifp(Duration::from_secs(2)).await;
-    caller.send_data(vec![hdlc_field(0x02, &[0x00, 0x00])]).await;
+    caller
+        .send_data(vec![hdlc_field(0x02, &[0x00, 0x00])])
+        .await;
     let _ = callee.recv_ifp(Duration::from_secs(2)).await;
 
     // Send 3 pages
@@ -295,7 +311,10 @@ async fn test_fax_t30_sm_event_logging() {
         _ => panic!("unexpected first event"),
     }
     match events[1] {
-        rustrtc::t38::T30Event::PhaseChange(T30Phase::CallingToneSent, T30Phase::CalledToneReceived) => {}
+        rustrtc::t38::T30Event::PhaseChange(
+            T30Phase::CallingToneSent,
+            T30Phase::CalledToneReceived,
+        ) => {}
         _ => panic!("unexpected second event"),
     }
 }

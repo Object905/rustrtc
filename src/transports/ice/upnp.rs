@@ -6,8 +6,8 @@
 
 use crate::transports::ice::IceCandidate;
 use anyhow::{Result, anyhow};
-use igd::aio::Gateway;
 use igd::PortMappingProtocol;
+use igd::aio::Gateway;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
@@ -118,17 +118,15 @@ impl UpnpPortMapper {
     /// and attempts to connect to the first one found.
     /// Uses DEFAULT_UPNP_DISCOVERY_TIMEOUT (2 seconds) to avoid blocking.
     pub async fn discover(&mut self) -> Result<()> {
-        self.discover_with_timeout(DEFAULT_UPNP_DISCOVERY_TIMEOUT).await
+        self.discover_with_timeout(DEFAULT_UPNP_DISCOVERY_TIMEOUT)
+            .await
     }
 
     /// Discover and connect to a UPnP IGD gateway with custom timeout
     ///
     /// This method searches for UPnP IGD devices on the local network
     /// and attempts to connect to the first one found.
-    pub async fn discover_with_timeout(
-        &mut self,
-        timeout_duration: Duration,
-    ) -> Result<()> {
+    pub async fn discover_with_timeout(&mut self, timeout_duration: Duration) -> Result<()> {
         if !self.enabled {
             return Err(anyhow!("UPnP is disabled"));
         }
@@ -143,15 +141,18 @@ impl UpnpPortMapper {
             timeout_duration
         );
 
-        let gateway = timeout(timeout_duration, igd::aio::search_gateway(Default::default()))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "UPnP gateway discovery timed out after {:?}",
-                    timeout_duration
-                )
-            })?
-            .map_err(|e| anyhow!("UPnP gateway discovery failed: {}", e))?;
+        let gateway = timeout(
+            timeout_duration,
+            igd::aio::search_gateway(Default::default()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "UPnP gateway discovery timed out after {:?}",
+                timeout_duration
+            )
+        })?
+        .map_err(|e| anyhow!("UPnP gateway discovery failed: {}", e))?;
 
         debug!("Found UPnP gateway");
         self.gateway = Some(gateway);
@@ -263,7 +264,8 @@ impl UpnpPortMapper {
                         requested_port, e
                     );
                     // Avoid recursion by manually trying a random port
-                    self.add_mapping_random_port(gateway, external_ip, local_ip).await
+                    self.add_mapping_random_port(gateway, external_ip, local_ip)
+                        .await
                 } else {
                     Err(anyhow!("Failed to add UPnP port mapping: {}", e))
                 }
@@ -511,7 +513,7 @@ mod tests {
 
         // Should not be expired immediately (70 > 60)
         assert!(!mapping.is_expired_or_stale());
-        
+
         // Verify remaining lifetime is close to 70
         let remaining = mapping.remaining_lifetime();
         assert!(remaining >= 69 && remaining <= 70);
@@ -534,7 +536,12 @@ mod tests {
         // After sleeping, remaining should decrease
         std::thread::sleep(std::time::Duration::from_millis(100));
         let new_remaining = mapping.remaining_lifetime();
-        assert!(new_remaining <= remaining, "remaining={}, new_remaining={}", remaining, new_remaining);
+        assert!(
+            new_remaining <= remaining,
+            "remaining={}, new_remaining={}",
+            remaining,
+            new_remaining
+        );
     }
 
     #[test]
@@ -609,10 +616,7 @@ mod tests {
         // Should fail because discover() wasn't called
         let result = mapper.add_mapping(12345).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No UPnP gateway"));
+        assert!(result.unwrap_err().to_string().contains("No UPnP gateway"));
     }
 
     #[test]

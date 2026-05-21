@@ -178,101 +178,103 @@ struct IceTransportRunner {
 impl IceTransportRunner {
     fn run(mut self) -> impl std::future::Future<Output = ()> + Send {
         async move {
-        let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            Duration::from_secs(1),
-        );
-        // TURN refresh interval: every 120s (well under 300s permission timeout)
-        let mut turn_refresh_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(120),
-            Duration::from_secs(120),
-        );
-        let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
-        let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
-        let mut turn_refresh_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Duration::from_secs(1),
+            );
+            // TURN refresh interval: every 120s (well under 300s permission timeout)
+            let mut turn_refresh_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(120),
+                Duration::from_secs(120),
+            );
+            let mut read_futures: FuturesUnordered<BoxFuture<'static, ()>> =
+                FuturesUnordered::new();
+            let mut gathering_future: BoxFuture<'static, ()> = Box::pin(futures::future::pending());
+            let mut turn_refresh_future: BoxFuture<'static, ()> =
+                Box::pin(futures::future::pending());
 
-        loop {
-            tokio::select! {
-                res = self.state_rx.changed() => {
-                    if res.is_err() {
-                        break;
-                    }
-                    if matches!(*self.state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
-                        break;
-                    }
-                }
-                Some(socket) = self.socket_rx.recv() => {
-                    match socket {
-                        IceSocketWrapper::Udp(s) => {
-                            read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
+            loop {
+                tokio::select! {
+                    res = self.state_rx.changed() => {
+                        if res.is_err() {
+                            break;
                         }
-                        IceSocketWrapper::Turn(c, addr) => {
-                            read_futures.push(Box::pin(Self::run_turn_read_loop(c, addr, self.inner.clone())));
+                        if matches!(*self.state_rx.borrow(), IceTransportState::Closed | IceTransportState::Failed) {
+                            break;
                         }
                     }
-                }
-                res = self.candidate_rx.recv() => {
-                    match res {
-                        Ok(_) => {
-                            let inner = self.inner.clone();
-                            read_futures.push(Box::pin(async move {
-                                perform_connectivity_checks_async(inner).await;
-                            }));
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    }
-                }
-                Some(cmd) = self.cmd_rx.recv() => {
-                    trace!("Runner received command: {:?}", cmd);
-                    match cmd {
-                        IceCommand::StartGathering => {
-                            let inner = self.inner.clone();
-                            gathering_future = Box::pin(async move {
-                                if let Err(e) = inner.gatherer.gather().await {
-                                    debug!("Gathering failed: {}", e);
-                                }
-                                {
-                                    let mut buffer = inner.local_candidates.lock().await;
-                                    *buffer = inner.gatherer.local_candidates();
-                                }
-                                *inner.gather_state.lock() = IceGathererState::Complete;
-                                let _ = inner.gathering_state.send(IceGathererState::Complete);
-                            });
-                        }
-                        IceCommand::RunChecks => {
-                            let inner = self.inner.clone();
-                            read_futures.push(Box::pin(async move {
-                                perform_connectivity_checks_async(inner).await;
-                            }));
+                    Some(socket) = self.socket_rx.recv() => {
+                        match socket {
+                            IceSocketWrapper::Udp(s) => {
+                                read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
+                            }
+                            IceSocketWrapper::Turn(c, addr) => {
+                                read_futures.push(Box::pin(Self::run_turn_read_loop(c, addr, self.inner.clone())));
+                            }
                         }
                     }
-                }
-                _ = interval.tick() => {
-                    if let Some(f) = Self::run_keepalive_tick(&self.inner).await {
-                        read_futures.push(f);
+                    res = self.candidate_rx.recv() => {
+                        match res {
+                            Ok(_) => {
+                                let inner = self.inner.clone();
+                                read_futures.push(Box::pin(async move {
+                                    perform_connectivity_checks_async(inner).await;
+                                }));
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        }
                     }
-                }
-                _ = turn_refresh_interval.tick() => {
-                    // Only start a new refresh if the previous one has completed.
-                    // If still running (e.g. server slow), skip this tick rather than
-                    // stacking up concurrent refreshes.
-                    let inner = self.inner.clone();
-                    turn_refresh_future = Box::pin(async move {
-                        Self::run_turn_refresh(&inner).await;
-                    });
-                }
-                _ = &mut turn_refresh_future => {
-                    turn_refresh_future = Box::pin(futures::future::pending());
-                }
-                Some(_) = read_futures.next() => {
-                    // Read loop finished
-                }
-                _ = &mut gathering_future => {
-                    gathering_future = Box::pin(futures::future::pending());
+                    Some(cmd) = self.cmd_rx.recv() => {
+                        trace!("Runner received command: {:?}", cmd);
+                        match cmd {
+                            IceCommand::StartGathering => {
+                                let inner = self.inner.clone();
+                                gathering_future = Box::pin(async move {
+                                    if let Err(e) = inner.gatherer.gather().await {
+                                        debug!("Gathering failed: {}", e);
+                                    }
+                                    {
+                                        let mut buffer = inner.local_candidates.lock().await;
+                                        *buffer = inner.gatherer.local_candidates();
+                                    }
+                                    *inner.gather_state.lock() = IceGathererState::Complete;
+                                    let _ = inner.gathering_state.send(IceGathererState::Complete);
+                                });
+                            }
+                            IceCommand::RunChecks => {
+                                let inner = self.inner.clone();
+                                read_futures.push(Box::pin(async move {
+                                    perform_connectivity_checks_async(inner).await;
+                                }));
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if let Some(f) = Self::run_keepalive_tick(&self.inner).await {
+                            read_futures.push(f);
+                        }
+                    }
+                    _ = turn_refresh_interval.tick() => {
+                        // Only start a new refresh if the previous one has completed.
+                        // If still running (e.g. server slow), skip this tick rather than
+                        // stacking up concurrent refreshes.
+                        let inner = self.inner.clone();
+                        turn_refresh_future = Box::pin(async move {
+                            Self::run_turn_refresh(&inner).await;
+                        });
+                    }
+                    _ = &mut turn_refresh_future => {
+                        turn_refresh_future = Box::pin(futures::future::pending());
+                    }
+                    Some(_) = read_futures.next() => {
+                        // Read loop finished
+                    }
+                    _ = &mut gathering_future => {
+                        gathering_future = Box::pin(futures::future::pending());
+                    }
                 }
             }
-        }
         }
     }
 

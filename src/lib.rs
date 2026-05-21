@@ -7,6 +7,7 @@ pub mod sdp;
 pub mod srtp;
 pub mod stats;
 pub mod stats_collector;
+#[cfg(feature = "t38")]
 pub mod t38;
 pub mod transports;
 

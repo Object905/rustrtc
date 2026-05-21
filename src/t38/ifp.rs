@@ -201,10 +201,9 @@ impl IfpPacket {
                 let mut indicators = Vec::with_capacity(count);
                 for _ in 0..count {
                     let val = PerCodec::decode_small_int(&mut buf, 0, T30Indicator::MAX_VAL);
-                    indicators.push(
-                        T30Indicator::from_u8(val)
-                            .ok_or_else(|| RtcError::Protocol(format!("invalid T30Indicator: {}", val)))?,
-                    );
+                    indicators.push(T30Indicator::from_u8(val).ok_or_else(|| {
+                        RtcError::Protocol(format!("invalid T30Indicator: {}", val))
+                    })?);
                 }
                 Ok(Self::T30Indicator(indicators))
             }
@@ -368,10 +367,17 @@ mod tests {
     #[test]
     fn test_encode_spandsp_all_indicators() {
         for val in 0..=19 {
-            let Some(ind) = T30Indicator::from_u8(val) else { continue };
+            let Some(ind) = T30Indicator::from_u8(val) else {
+                continue;
+            };
             let packet = IfpPacket::T30Indicator(vec![ind]);
             let encoded = packet.encode_spandsp().unwrap();
-            assert_eq!(encoded.len(), 1, "spandsp format should be 1 byte for {:?}", ind);
+            assert_eq!(
+                encoded.len(),
+                1,
+                "spandsp format should be 1 byte for {:?}",
+                ind
+            );
             assert_eq!(encoded[0], val << 1, "mismatch for indicator {:?}", ind);
         }
     }

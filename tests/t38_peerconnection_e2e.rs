@@ -1,5 +1,7 @@
-use rustrtc::*;
+#![cfg(feature = "t38")]
+
 use rustrtc::config::MediaCapabilities;
+use rustrtc::*;
 
 /// Helper: create a configuration with T.38 fax capabilities.
 fn make_t38_config() -> RtcConfiguration {
@@ -47,8 +49,16 @@ async fn test_t38_offer_contains_image_section() {
     let offer = pc.create_offer().await.unwrap();
     let sdp = offer.to_sdp_string();
 
-    assert!(sdp.contains("m=image"), "SDP should contain m=image:\n{}", sdp);
-    assert!(sdp.contains("udptl"), "SDP should contain udptl protocol:\n{}", sdp);
+    assert!(
+        sdp.contains("m=image"),
+        "SDP should contain m=image:\n{}",
+        sdp
+    );
+    assert!(
+        sdp.contains("udptl"),
+        "SDP should contain udptl protocol:\n{}",
+        sdp
+    );
 }
 
 #[tokio::test]
@@ -61,14 +71,26 @@ async fn test_t38_offer_contains_t38_attributes() {
     let offer = pc.create_offer().await.unwrap();
     let sdp = offer.to_sdp_string();
 
-    assert!(sdp.contains("T38FaxVersion:0"), "SDP should contain T38FaxVersion:\n{}", sdp);
-    assert!(sdp.contains("T38MaxBitRate:14400"), "SDP should contain T38MaxBitRate:\n{}", sdp);
+    assert!(
+        sdp.contains("T38FaxVersion:0"),
+        "SDP should contain T38FaxVersion:\n{}",
+        sdp
+    );
+    assert!(
+        sdp.contains("T38MaxBitRate:14400"),
+        "SDP should contain T38MaxBitRate:\n{}",
+        sdp
+    );
     assert!(
         sdp.contains("T38FaxRateManagement:transferredTCF"),
         "SDP should contain T38FaxRateManagement:\n{}",
         sdp
     );
-    assert!(sdp.contains("T38FaxMaxBuffer:1024"), "SDP should contain T38FaxMaxBuffer:\n{}", sdp);
+    assert!(
+        sdp.contains("T38FaxMaxBuffer:1024"),
+        "SDP should contain T38FaxMaxBuffer:\n{}",
+        sdp
+    );
     assert!(
         sdp.contains("T38FaxMaxDatagram:238"),
         "SDP should contain T38FaxMaxDatagram:\n{}",
@@ -169,8 +191,16 @@ async fn test_t38_offer_media_section_listing() {
     let sdp = offer.to_sdp_string();
 
     // Both sections should be present
-    assert!(sdp.contains("m=audio"), "Should have audio section:\n{}", sdp);
-    assert!(sdp.contains("m=image"), "Should have image section:\n{}", sdp);
+    assert!(
+        sdp.contains("m=audio"),
+        "Should have audio section:\n{}",
+        sdp
+    );
+    assert!(
+        sdp.contains("m=image"),
+        "Should have image section:\n{}",
+        sdp
+    );
 
     // Audio should use RTP/AVP protocol (in RTP mode)
     assert!(sdp.contains("m=audio"), "Audio section present");
@@ -178,7 +208,10 @@ async fn test_t38_offer_media_section_listing() {
     // Verify the order (audio should come before image based on transceiver ordering)
     let audio_pos = sdp.find("m=audio").unwrap();
     let image_pos = sdp.find("m=image").unwrap();
-    assert!(audio_pos < image_pos, "audio should come before image in SDP");
+    assert!(
+        audio_pos < image_pos,
+        "audio should come before image in SDP"
+    );
 }
 
 #[tokio::test]
@@ -194,5 +227,9 @@ async fn test_t38_default_config_without_t38_caps() {
     let offer = pc.create_offer().await.unwrap();
     let sdp = offer.to_sdp_string();
 
-    assert!(sdp.contains("m=image"), "SDP should contain m=image even with defaults:\n{}", sdp);
+    assert!(
+        sdp.contains("m=image"),
+        "SDP should contain m=image even with defaults:\n{}",
+        sdp
+    );
 }

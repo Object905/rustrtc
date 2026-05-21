@@ -1204,8 +1204,10 @@ impl MediaSection {
         self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
 
         for t38 in &caps {
-            self.attributes
-                .push(Attribute::new("T38FaxVersion", Some(t38.version.to_string())));
+            self.attributes.push(Attribute::new(
+                "T38FaxVersion",
+                Some(t38.version.to_string()),
+            ));
             self.attributes.push(Attribute::new(
                 "T38MaxBitRate",
                 Some(t38.max_bitrate.to_string()),

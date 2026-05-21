@@ -64,7 +64,11 @@ impl PerCodec {
     /// Decode an octet string with length prefix.
     pub fn decode_octet_string(buf: &mut BitReader, max_len: u16) -> RtcResult<Vec<u8>> {
         let len_bits = bits_needed(max_len as u64 + 1);
-        let len = if len_bits > 0 { buf.read_bits(len_bits)? } else { 0 } as usize;
+        let len = if len_bits > 0 {
+            buf.read_bits(len_bits)?
+        } else {
+            0
+        } as usize;
         buf.align();
         let mut data = Vec::with_capacity(len);
         for _ in 0..len {
@@ -74,7 +78,11 @@ impl PerCodec {
     }
 
     /// Encode a choice index (0-based) with the given number of choices.
-    pub fn encode_choice_index(idx: usize, num_choices: usize, buf: &mut BitWriter) -> RtcResult<()> {
+    pub fn encode_choice_index(
+        idx: usize,
+        num_choices: usize,
+        buf: &mut BitWriter,
+    ) -> RtcResult<()> {
         if idx >= num_choices {
             return Err(crate::errors::RtcError::Protocol(format!(
                 "PER choice index {} out of range [0, {})",
@@ -91,7 +99,11 @@ impl PerCodec {
     /// Decode a choice index (0-based).
     pub fn decode_choice_index(buf: &mut BitReader, num_choices: usize) -> RtcResult<usize> {
         let bits = bits_needed(num_choices as u64);
-        let idx = if bits > 0 { buf.read_bits(bits)? as usize } else { 0 };
+        let idx = if bits > 0 {
+            buf.read_bits(bits)? as usize
+        } else {
+            0
+        };
         Ok(idx)
     }
 
@@ -115,7 +127,11 @@ impl PerCodec {
     pub fn decode_length(buf: &mut BitReader, max: Option<usize>) -> RtcResult<usize> {
         let limit = max.unwrap_or(65535);
         let bits = bits_needed((limit + 1) as u64);
-        let len = if bits > 0 { buf.read_bits(bits)? as usize } else { 0 };
+        let len = if bits > 0 {
+            buf.read_bits(bits)? as usize
+        } else {
+            0
+        };
         Ok(len)
     }
 
@@ -234,7 +250,9 @@ impl BitReader {
         let byte_idx = self.pos >> 3;
         let bit_idx = 7 - (self.pos & 7);
         if byte_idx >= self.data.len() {
-            return Err(crate::errors::RtcError::Protocol("PER: unexpected end of data".into()));
+            return Err(crate::errors::RtcError::Protocol(
+                "PER: unexpected end of data".into(),
+            ));
         }
         let bit = (self.data[byte_idx] >> bit_idx) & 1 == 1;
         self.pos += 1;

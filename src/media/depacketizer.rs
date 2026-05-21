@@ -3,8 +3,8 @@ use crate::media::frame::{MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
 use crate::rtp::RtpPacket;
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub trait Depacketizer: Send + Sync {
     fn push(
@@ -405,7 +405,11 @@ mod tests {
         let res = depacketizer
             .push(packet1, 90000, dummy_addr(), MediaKind::Video)
             .unwrap();
-        assert_eq!(res.len(), 1, "default video depacketizer should pass RTP payload through");
+        assert_eq!(
+            res.len(),
+            1,
+            "default video depacketizer should pass RTP payload through"
+        );
         match &res[0] {
             MediaSample::Video(v) => {
                 assert_eq!(v.data, Bytes::from_static(&[0x7C, 0x85, 0x01]));
@@ -453,7 +457,11 @@ mod tests {
     #[test]
     fn test_drop_count_fu_a_loss() {
         let mut depacketizer = H264Depacketizer::new();
-        assert_eq!(depacketizer.drop_count(), 0, "Initial drop count should be 0");
+        assert_eq!(
+            depacketizer.drop_count(),
+            0,
+            "Initial drop count should be 0"
+        );
 
         let timestamp = 55555;
 
@@ -462,7 +470,11 @@ mod tests {
         let _ = depacketizer
             .push(packet1, 90000, dummy_addr(), MediaKind::Video)
             .unwrap();
-        assert_eq!(depacketizer.drop_count(), 0, "FU-A start should not increment drop count");
+        assert_eq!(
+            depacketizer.drop_count(),
+            0,
+            "FU-A start should not increment drop count"
+        );
 
         // Skip Middle (Seq 11 missing) - send End (Seq 12)
         let packet3 = create_packet(vec![0x7C, 0x45, 0x02], 12, timestamp, true);
@@ -496,14 +508,18 @@ mod tests {
     #[test]
     fn test_drop_count_stap_a_corrupt() {
         let mut depacketizer = H264Depacketizer::new();
-        assert_eq!(depacketizer.drop_count(), 0, "Initial drop count should be 0");
+        assert_eq!(
+            depacketizer.drop_count(),
+            0,
+            "Initial drop count should be 0"
+        );
 
         // STAP-A with malformed NAL length (claims size > packet)
         // STAP-A header (nal_type=24), then NAL length of 0xFFFF (65535 bytes), but only 3 bytes remain
         let payload = vec![
-            24,        // STAP-A header
+            24, // STAP-A header
             0xFF, 0xFF, // NAL length = 65535 (impossible, packet is only 3 bytes)
-            0x01,      // barely enough for the length field but no room for NAL data
+            0x01, // barely enough for the length field but no room for NAL data
         ];
         let packet = create_packet(payload, 1, 100, true);
         let _ = depacketizer
@@ -547,6 +563,10 @@ mod tests {
         let p2 = create_packet(vec![0x7C, 0x45, 0x02], 13, timestamp, true);
         let _ = d.push(p2, 90000, dummy_addr(), MediaKind::Video).unwrap();
 
-        assert_eq!(d.drop_count(), 1, "Trait method should reflect incremented count");
+        assert_eq!(
+            d.drop_count(),
+            1,
+            "Trait method should reflect incremented count"
+        );
     }
 }

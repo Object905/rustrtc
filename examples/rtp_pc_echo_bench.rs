@@ -5,8 +5,7 @@ use rustrtc::peer_connection::RtpSender;
 use rustrtc::rtp::{RtpHeader, RtpPacket};
 use rustrtc::{
     PeerConnection, RtcConfiguration, RtpRewriteBridgeParams, SdpType, SessionDescription,
-    TransceiverDirection,
-    TransportMode,
+    TransceiverDirection, TransportMode,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -246,7 +245,8 @@ async fn process_offer(
     pc.set_local_description(answer.clone())?;
 
     if bridge_mode {
-        pc.wait_for_rtp_transport_ready(Duration::from_secs(2)).await?;
+        pc.wait_for_rtp_transport_ready(Duration::from_secs(2))
+            .await?;
         pc.bridge_rtp_with_rewrite_to_self(RtpRewriteBridgeParams {
             ssrc_offset: 10_000,
             payload_type: Some(0),
@@ -559,11 +559,7 @@ async fn run_client_raw(raw_addr: SocketAddr, config: BenchConfig) -> Result<()>
 
     println!(
         "client (raw) target={} tracks={} pps_per_track={} duration={}s payload={}B",
-        raw_addr,
-        config.tracks,
-        config.pps_per_track,
-        config.duration_secs,
-        config.payload_bytes
+        raw_addr, config.tracks, config.pps_per_track, config.duration_secs, config.payload_bytes
     );
 
     let counters = Arc::new(ClientCounters::default());
@@ -720,7 +716,9 @@ fn print_usage() {
         "  rtp_pc_echo_bench client [server_addr] [tracks] [pps_per_track] [duration_secs] [payload_bytes]"
     );
     println!("  rtp_pc_echo_bench all [tracks] [pps_per_track] [duration_secs] [payload_bytes]");
-    println!("  rtp_pc_echo_bench bridge_all [tracks] [pps_per_track] [duration_secs] [payload_bytes]");
+    println!(
+        "  rtp_pc_echo_bench bridge_all [tracks] [pps_per_track] [duration_secs] [payload_bytes]"
+    );
     println!("  rtp_pc_echo_bench raw_server [udp_addr]");
     println!(
         "  rtp_pc_echo_bench raw_all [tracks] [pps_per_track] [duration_secs] [payload_bytes]"

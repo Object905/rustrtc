@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::net::UdpSocket;
 
 /// Configuration for UDPTL transport.
@@ -105,9 +105,10 @@ impl UdtlTransport {
             data: ifp_data.to_vec(),
         });
 
-        self.socket.send_to(&packet, self.remote_addr).await.map_err(
-            |e| crate::errors::RtcError::Transport(format!("UDPTL send failed: {e}")),
-        )?;
+        self.socket
+            .send_to(&packet, self.remote_addr)
+            .await
+            .map_err(|e| crate::errors::RtcError::Transport(format!("UDPTL send failed: {e}")))?;
 
         Ok(())
     }
@@ -119,11 +120,10 @@ impl UdtlTransport {
         recv_buf: &mut UdtlReceiveBuffer,
     ) -> Result<Option<Vec<u8>>, crate::errors::RtcError> {
         let mut buf = vec![0u8; self.config.max_datagram as usize];
-        let (n, _from) = self
-            .socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(|e| crate::errors::RtcError::Transport(format!("UDPTL recv failed: {e}")))?;
+        let (n, _from) =
+            self.socket.recv_from(&mut buf).await.map_err(|e| {
+                crate::errors::RtcError::Transport(format!("UDPTL recv failed: {e}"))
+            })?;
 
         if n < 2 {
             return Ok(None);

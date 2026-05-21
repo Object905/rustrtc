@@ -184,6 +184,11 @@ async fn test_udptl_out_of_order_reordering() {
 
     for (i, expected) in payloads.iter().enumerate() {
         let result = recv_timeout(&tb, &mut buf_b, Duration::from_secs(3)).await;
-        assert_eq!(result.as_deref(), Some(expected.as_slice()), "payload {} mismatch", i);
+        assert_eq!(
+            result.as_deref(),
+            Some(expected.as_slice()),
+            "payload {} mismatch",
+            i
+        );
     }
 }

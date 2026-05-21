@@ -1,12 +1,12 @@
 [package]
 name = "rustrtc"
-version = "0.3.64"
+version = "0.3.65"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
-description = "A high-performance implementation of WebRTC"
+description = "A high-performance real-time communication library — WebRTC, RTP/SRTP, T.38 Fax, and RTP Latching"
 readme = "README.md"
-keywords = ["rtp", "srtp", "webrtc"]
+keywords = ["rtp", "srtp", "webrtc", "t38", "fax", "upnp", "stun", "turn"]
 categories = ["network-programming"]
 license = "MIT"
 
@@ -47,9 +47,9 @@ rcgen = { version = "0.14.8", default-features = false, features = [
     "pem",
     "ring",
 ] }
+spandsp-sys = { version = "0.1.5", optional = true }
 
 [dev-dependencies]
-spandsp-sys = "0.1.5"
 axum = { version = "0.8", features = ["multipart"] }
 turn = "0.17.1"
 webrtc = "0.17.1"
@@ -66,3 +66,4 @@ tower-http = { version = "0.6", features = ["fs"] }
 [features]
 default = []
 simulator = []
+t38 = ["dep:spandsp-sys"]

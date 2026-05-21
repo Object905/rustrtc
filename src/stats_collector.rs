@@ -3,9 +3,9 @@ use crate::peer_connection::{RtpReceiverInterceptor, RtpSenderInterceptor};
 use crate::rtp::{ReceiverReport, RtcpPacket, RtpPacket, SenderReport};
 use crate::stats::{StatsEntry, StatsId, StatsKind, StatsProvider};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
-use parking_lot::Mutex;
 
 #[derive(Debug, Clone)]
 struct RemoteInboundStats {

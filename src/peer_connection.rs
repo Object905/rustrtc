@@ -6,6 +6,10 @@ use crate::rtp::{
 };
 use crate::stats::{StatsReport, gather_once};
 use crate::stats_collector::StatsCollector;
+#[cfg(feature = "t38")]
+use crate::t38::endpoint::FaxEndpoint;
+#[cfg(feature = "t38")]
+use crate::t38::t30::{T30FaxConfig, T30Session};
 use crate::transports::dtls::{self, DtlsTransport};
 use crate::transports::get_local_ip;
 use crate::transports::ice::stun::random_u32;
@@ -13,8 +17,6 @@ use crate::transports::ice::{IceCandidate, IceGathererState, IceTransport, conn:
 use crate::transports::rtp::{RtpRewriteBridgeParams, RtpTransport};
 use crate::transports::sctp::SctpTransport;
 use crate::transports::udptl::UdtlTransport;
-use crate::t38::endpoint::FaxEndpoint;
-use crate::t38::t30::{T30FaxConfig, T30Session};
 use crate::{
     Attribute, AudioCapability, Direction, MediaKind, MediaSection, Origin, RtcConfiguration,
     RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
@@ -2461,6 +2463,7 @@ impl PeerConnection {
     ///
     /// The UDPTL transport is also stored on the Image transceiver and can be
     /// retrieved via `transceiver.udtl_transport()`.
+    #[cfg(feature = "t38")]
     pub async fn init_t38_fax(&self) -> RtcResult<FaxEndpoint> {
         use std::net::IpAddr;
 
@@ -2471,9 +2474,7 @@ impl PeerConnection {
                 .iter()
                 .find(|t| t.kind() == MediaKind::Image)
                 .cloned()
-                .ok_or_else(|| {
-                    RtcError::InvalidState("no Image transceiver for T.38 fax".into())
-                })?
+                .ok_or_else(|| RtcError::InvalidState("no Image transceiver for T.38 fax".into()))?
         };
 
         // Get local address from local SDP
@@ -2515,7 +2516,8 @@ impl PeerConnection {
         );
 
         let transport = Arc::new(crate::transports::udptl::UdtlTransport::new(
-            socket, remote_addr,
+            socket,
+            remote_addr,
         ));
         transceiver.set_udtl_transport(transport.clone());
 
@@ -4250,11 +4252,11 @@ impl PeerConnectionInner {
             self.disconnect_reason.borrow().clone().unwrap()
         };
 
-        tracing::info!("PeerConnection closing: reason={}", final_reason);
+        tracing::debug!("PeerConnection closing: reason={}", final_reason);
 
         // Log SCTP diagnostic info for debugging network issues
         if let Some(sctp) = self.sctp_transport.lock().as_ref() {
-            tracing::info!("SCTP diagnostics: {}", sctp.diagnostic_info());
+            tracing::debug!("SCTP diagnostics: {}", sctp.diagnostic_info());
         }
 
         let _ = self.signaling_state.send(SignalingState::Closed);
@@ -6844,8 +6846,11 @@ a=mid:0
 
         let (_socket_tx, socket_rx) =
             tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
-        let ice_conn =
-            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap(), None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_rx,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+        );
         let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
         receiver.set_transport(transport, None, None);
 
@@ -6920,8 +6925,11 @@ a=mid:0
         let receiver = transceiver.receiver().unwrap();
         let (_socket_tx, socket_rx) =
             tokio::sync::watch::channel::<Option<crate::transports::ice::IceSocketWrapper>>(None);
-        let ice_conn =
-            crate::transports::ice::conn::IceConn::new(socket_rx, "127.0.0.1:0".parse().unwrap(), None);
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_rx,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+        );
         let transport = Arc::new(crate::transports::rtp::RtpTransport::new(ice_conn, false));
         receiver.set_transport(transport, None, None);
         tokio::task::yield_now().await;

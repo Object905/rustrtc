@@ -3,14 +3,22 @@
 [![Crates.io](https://img.shields.io/crates/v/rustrtc.svg)](https://crates.io/crates/rustrtc)
 [![Documentation](https://docs.rs/rustrtc/badge.svg)](https://docs.rs/rustrtc)
 
-A high-performance implementation of WebRTC.
+A high-performance, full-featured real-time communication library — **WebRTC, RTP/SRTP, T.38 Fax**, and **RTP Latching** — all through a **unified `PeerConnection` API**.
 
 ## Features
 
-- **🚀High performance:** ~2.8x faster than `pion` (go version).
-- **🍡WebRTC Compliant**: Full compliance with webrtc/chrome.
-- **📺Media Support**: RTP/SRTP handling for audio and video.
-- **👌ICE/STUN**: Interactive Connectivity Establishment and STUN protocol support.
+- ** Unified API** — A single `PeerConnection` interface for all transport modes: WebRTC (ICE/DTLS/SRTP), raw RTP, SRTP-only, and T.38 fax. No fragmented APIs.
+- ** High performance** — ~2.8x faster than `pion` (Go) and ~2.8x faster than `webrtc-rs` in throughput benchmarks. ~48% less memory than `webrtc-rs`.
+- ** WebRTC Compliant** — Full compliance with Chrome/WebRTC. Supports offer/answer, renegotiation, and all standard SDP attributes.
+- ** Media Support** — RTP/SRTP handling for audio and video with packetizer, depacketizer, jitter buffer, NACK/FIR/PLI, TWCC, and REMB.
+- ** ICE/STUN/TURN** — Full ICE implementation with STUN, TURN (UDP + TCP), ICE Lite, and nominated pair management.
+- ** T.38 Fax** — Fax over IP via T.38 (UDPTL, IFP ASN.1 PER encoding, T.30 state machine). Gated behind `features = ["t38"]`.
+- ** RTP Latching** — Dynamic remote address detection for RTP-only NAT traversal. Probation-based candidate selection with configurable observation window.
+- ** Transport Modes** — `TransportMode::WebRtc` (full ICE/DTLS), `TransportMode::Srtp` (SRTP without ICE), `TransportMode::Rtp` (raw RTP without encryption).
+- ** UPnP IGD** — Automatic port mapping via UPnP for NAT traversal without STUN/TURN.
+- ** Port Range Control** — Restrict RTP/ICE ports to a specific range (`rtp_start_port`/`rtp_end_port`) for firewall-friendly deployment.
+- ** RTP Rewrite Bridge** — Transparent RTP proxy/rewrite between `PeerConnection` instances (SSRC offset, PT remap, sequence rewriting).
+- ** Built-in Stats** — WebRTC-compatible stats model: inbound/outbound RTP, transport, candidate pair, and data channel stats.
 
 ## Benchmark game (rustrtc vs webrtc-rs & pion) in 0.2.28
 
@@ -107,32 +115,64 @@ async fn main() {
 
 ## Configuration
 
-`rustrtc` allows customizing the WebRTC session via `RtcConfiguration`:
+All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurationBuilder`):
 
-- **ice_servers**: Configure STUN/TURN servers.
-- **ice_transport_policy**: Control ICE candidate gathering (e.g., `All`, `Relay`).
-- **ssrc_start**: Set the starting SSRC value for local tracks.
-- **media_capabilities**: Configure supported codecs (payload types, names) and SCTP ports.
+### Transport & Network
+- **`transport_mode`** — `TransportMode::WebRtc` (default), `TransportMode::Srtp`, or `TransportMode::Rtp`.
+- **`ice_servers`** — STUN/TURN server list.
+- **`ice_transport_policy`** — `All` or `Relay`.
+- **`rtp_start_port` / `rtp_end_port`** — Restrict RTP/ICE to a port range.
+- **`external_ip`** — Override the external IP for ICE candidates (NAT scenarios).
+- **`bind_ip`** — Bind to a specific local IP.
+- **`disable_ipv6`** — Disable IPv6 candidate gathering.
+- **`enable_ice_lite`** — Enable ICE Lite mode.
+
+### UPnP
+- **`enable_upnp`** — Auto-map ports via UPnP IGD.
+- **`upnp_lease_duration`** — UPnP port mapping lease duration in seconds (default: 3600).
+
+### RTP Latching
+- **`enable_latching`** — Enable dynamic remote address detection for RTP-only mode.
+- **`probation_max_packets`** — Number of packets to observe before committing a latched address.
+
+### Media Capabilities
+- **`media_capabilities`** — Configure audio/video/image (T.38) codecs and SCTP port via `MediaCapabilities`.
+- **`ssrc_start`** — Starting SSRC value for local tracks.
+
+### SCTP (Data Channels)
+- `sctp_rto_initial`, `sctp_rto_min`, `sctp_rto_max`, `sctp_max_association_retransmits`, `sctp_receive_window`, `sctp_heartbeat_interval`, `sctp_max_heartbeat_failures`, `sctp_max_burst`, `sctp_max_cwnd`
+
+### RTP Buffer
+- `rtp_buffer_capacity` — Per-SSRC receive buffer capacity.
+- `buffer_drop_strategy` — `DropNew` or `DropOldest` when buffer is full.
 
 ```rust
-use rustrtc::{PeerConnection, RtcConfiguration, IceServer, IceTransportPolicy, config::MediaCapabilities};
+use rustrtc::{
+    PeerConnection, RtcConfiguration, RtcConfigurationBuilder,
+    IceServer, TransportMode, config::T38Capability,
+};
 
-let mut config = RtcConfiguration::default();
-
-// Configure ICE servers
-config.ice_servers.push(IceServer::new(vec!["stun:stun.l.google.com:19302"]));
-
-// Set ICE transport policy (optional)
-config.ice_transport_policy = IceTransportPolicy::All;
-
-config.ssrc_start = 10000;
-
-// Customize media capabilities
-let mut caps = MediaCapabilities::default();
-// ... configure audio/video/application caps ...
-config.media_capabilities = Some(caps);
+// Using builder
+let config = RtcConfigurationBuilder::new()
+    .transport_mode(TransportMode::Rtp)
+    .enable_latching(true)
+    .probation_max_packets(Some(5))
+    .rtp_port_range(50000, 50100)
+    .enable_upnp(true)
+    .ice_server(IceServer::new(vec!["stun:stun.l.google.com:19302"]))
+    .build();
 
 let pc = PeerConnection::new(config);
+```
+
+```rust
+// Direct field access
+let mut config = RtcConfiguration::default();
+config.transport_mode = TransportMode::WebRtc;
+config.enable_latching = true;
+config.rtp_start_port = Some(50000);
+config.rtp_end_port = Some(50100);
+config.enable_upnp = true;
 ```
 
 ## Examples

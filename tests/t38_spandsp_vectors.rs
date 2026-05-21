@@ -1,3 +1,5 @@
+#![cfg(feature = "t38")]
+
 //! Cross-validate T.38 IFP encoding against spandsp (reference implementation).
 //!
 //! KEY FINDING: spandsp uses a SIMPLIFIED binary format, NOT standard T.38 PER.
@@ -61,7 +63,10 @@ impl SpandspSession {
             spandsp_sys::t38_core_rx_ifp_packet(self.ptr, bytes.as_ptr(), bytes.len() as c_int, seq)
         };
         if ret < 0 {
-            Err(format!("rx_ifp_packet returned {} (bytes={:02x?})", ret, bytes))
+            Err(format!(
+                "rx_ifp_packet returned {} (bytes={:02x?})",
+                ret, bytes
+            ))
         } else {
             Ok(())
         }
@@ -126,7 +131,12 @@ fn test_our_spandsp_encoder_produces_correct_format() {
         ss.decode(&encoded, val as u16 + 1)
             .unwrap_or_else(|e| panic!("IND {} encode_spandsp: {}", val, e));
         let decoded = ss.decoded_indicator();
-        assert_eq!(decoded, Some(val as c_int), "IND {} via encode_spandsp", val);
+        assert_eq!(
+            decoded,
+            Some(val as c_int),
+            "IND {} via encode_spandsp",
+            val
+        );
     }
 }
 

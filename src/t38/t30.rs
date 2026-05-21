@@ -121,20 +121,10 @@ pub struct T30Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum T30Event {
     PhaseChange(T30Phase, T30Phase),
-    RemoteIdentification {
-        id: String,
-    },
-    LocalIdentification {
-        id: String,
-    },
-    PageTransferred {
-        page: u32,
-        size: usize,
-    },
-    PageReceived {
-        page: u32,
-        size: usize,
-    },
+    RemoteIdentification { id: String },
+    LocalIdentification { id: String },
+    PageTransferred { page: u32, size: usize },
+    PageReceived { page: u32, size: usize },
     Disconnected,
     Error(String),
 }
@@ -213,11 +203,10 @@ impl T30Session {
             self.change_phase(T30Phase::ReadyToTransmit);
             let page_size = self.page_data.len();
             self.page_number += 1;
-            self.events
-                .push_back(T30Event::PageTransferred {
-                    page: self.page_number,
-                    size: page_size,
-                });
+            self.events.push_back(T30Event::PageTransferred {
+                page: self.page_number,
+                size: page_size,
+            });
         }
     }
 
@@ -271,8 +260,7 @@ impl T30Session {
         if self.phase != new_phase {
             let old = self.phase;
             self.phase = new_phase;
-            self.events
-                .push_back(T30Event::PhaseChange(old, new_phase));
+            self.events.push_back(T30Event::PhaseChange(old, new_phase));
         }
     }
 

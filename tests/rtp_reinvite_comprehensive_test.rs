@@ -503,8 +503,7 @@ async fn test_reinvite_updates_remote_addr() {
         a=rtpmap:0 PCMU/8000\r\n\
         a=sendrecv\r\n";
 
-    let initial_offer_desc =
-        SessionDescription::parse(SdpType::Offer, initial_offer).unwrap();
+    let initial_offer_desc = SessionDescription::parse(SdpType::Offer, initial_offer).unwrap();
     pc.set_remote_description(initial_offer_desc).await.unwrap();
 
     let initial_answer = pc.create_answer().await.unwrap();
@@ -516,7 +515,10 @@ async fn test_reinvite_updates_remote_addr() {
     assert!(initial_pair.is_some());
     assert_eq!(
         initial_pair.unwrap().remote.address,
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)), 8000)
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            8000
+        )
     );
 
     // Reinvite with changed address
@@ -541,7 +543,10 @@ async fn test_reinvite_updates_remote_addr() {
     assert!(updated_pair.is_some());
     assert_eq!(
         updated_pair.unwrap().remote.address,
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)), 9000),
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)),
+            9000
+        ),
         "reinvite should update RTP remote address"
     );
 }
