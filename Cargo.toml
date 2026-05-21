@@ -6,7 +6,7 @@ authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
 description = "A high-performance real-time communication library — WebRTC, RTP/SRTP, T.38 Fax, and RTP Latching"
 readme = "README.md"
-keywords = ["rtp", "srtp", "webrtc", "t38", "fax", "upnp", "stun", "turn"]
+keywords = ["rtp", "srtp", "webrtc", "fax", "turn"]
 categories = ["network-programming"]
 license = "MIT"
 
