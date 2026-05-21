@@ -4,9 +4,9 @@ use tokio::net::UdpSocket;
 
 use crate::errors::RtcResult;
 use crate::t38::ifp::{DataField, IfpPacket, T30Indicator};
-use crate::t38::t30::{T30Event, T30Session};
 #[cfg(test)]
 use crate::t38::t30::T30FaxConfig;
+use crate::t38::t30::{T30Event, T30Session};
 use crate::transports::udptl::{UdtlConfig, UdtlReceiveBuffer, UdtlTransport};
 
 /// High-level fax endpoint that ties together T.30 session, IFP codec,
@@ -163,8 +163,8 @@ impl FaxEndpoint {
     // ── Drain events ──────────────────────────────────────────────
 
     /// Drain T.30 session events.
-    pub fn drain_events(&self) -> Vec<T30Event> {
-        let mut session = self.session.blocking_lock();
+    pub async fn drain_events(&self) -> Vec<T30Event> {
+        let mut session = self.session.lock().await;
         let events: Vec<_> = session.events.drain(..).collect();
         events
     }
@@ -211,7 +211,9 @@ mod tests {
         let recv = tokio::time::timeout(std::time::Duration::from_secs(1), fax_b.recv())
             .await
             .unwrap();
-        assert!(matches!(recv, Some(IfpPacket::T30Indicator(ref v)) if v.contains(&T30Indicator::Cng)));
+        assert!(
+            matches!(recv, Some(IfpPacket::T30Indicator(ref v)) if v.contains(&T30Indicator::Cng))
+        );
     }
 
     #[tokio::test]
@@ -232,7 +234,11 @@ mod tests {
             T30Session::new(T30FaxConfig::default()),
         );
 
-        for ind in &[T30Indicator::Cng, T30Indicator::Ced, T30Indicator::V21Preamble] {
+        for ind in &[
+            T30Indicator::Cng,
+            T30Indicator::Ced,
+            T30Indicator::V21Preamble,
+        ] {
             fax_a.send_indicator(*ind).await.unwrap();
             let recv = tokio::time::timeout(std::time::Duration::from_millis(500), fax_b.recv())
                 .await
@@ -295,9 +301,17 @@ mod tests {
     async fn test_fax_endpoint_bind() {
         let session = T30Session::new(T30FaxConfig::default());
         let remote = "127.0.0.1:9999".parse().unwrap();
-        let fax = FaxEndpoint::bind("127.0.0.1:0".parse().unwrap(), remote, session, UdtlConfig::default())
-            .await
-            .unwrap();
-        assert_eq!(fax.transport.local_addr().unwrap().ip().to_string(), "127.0.0.1");
+        let fax = FaxEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            remote,
+            session,
+            UdtlConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fax.transport.local_addr().unwrap().ip().to_string(),
+            "127.0.0.1"
+        );
     }
 }
