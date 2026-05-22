@@ -630,6 +630,10 @@ impl PeerConnection {
             .params(params)
             .interceptor(self.inner.stats_collector.clone());
 
+        if let Some(ref cname) = self.inner.config.cname {
+            builder = builder.cname(cname.clone());
+        }
+
         let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
             match kind {
                 MediaKind::Audio => caps
@@ -3853,7 +3857,11 @@ impl PeerConnectionInner {
                 );
             } else if direction.sends() {
                 if let Some(ssrc) = *transceiver.sender_ssrc.lock() {
-                    let cname = format!("rustrtc-cname-{ssrc}");
+                    let cname = self
+                        .config
+                        .cname
+                        .clone()
+                        .unwrap_or_else(|| format!("rustrtc-cname-{ssrc}"));
                     let stream_id = transceiver
                         .sender_stream_id
                         .lock()
@@ -4822,6 +4830,7 @@ pub struct RtpSenderBuilder {
     stream_id: String,
     params: RtpCodecParameters,
     interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
+    cname: Option<String>,
 }
 
 impl RtpSenderBuilder {
@@ -4832,6 +4841,7 @@ impl RtpSenderBuilder {
             stream_id: "stream".to_string(),
             params: RtpCodecParameters::default(),
             interceptors: Vec::new(),
+            cname: None,
         }
     }
 
@@ -4862,6 +4872,11 @@ impl RtpSenderBuilder {
         self
     }
 
+    pub fn cname(mut self, cname: String) -> Self {
+        self.cname = Some(cname);
+        self
+    }
+
     pub fn build(self) -> Arc<RtpSender> {
         Arc::new(RtpSender::new_internal(
             self.track,
@@ -4869,6 +4884,7 @@ impl RtpSenderBuilder {
             self.stream_id,
             self.params,
             self.interceptors,
+            self.cname,
         ))
     }
 }
@@ -4885,7 +4901,7 @@ impl RtpSender {
         params: RtpCodecParameters,
         interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     ) -> Self {
-        Self::new_internal(track, ssrc, stream_id, params, interceptors)
+        Self::new_internal(track, ssrc, stream_id, params, interceptors, None)
     }
 
     fn new_internal(
@@ -4894,11 +4910,14 @@ impl RtpSender {
         stream_id: String,
         params: RtpCodecParameters,
         interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
+        cname_override: Option<String>,
     ) -> Self {
         let track_label = track.id().to_string();
         let track_id = Arc::<str>::from(track_label.clone());
         let stream_id = Arc::<str>::from(stream_id);
-        let cname = Arc::<str>::from(format!("rustrtc-cname-{ssrc}"));
+        let cname = Arc::<str>::from(
+            cname_override.unwrap_or_else(|| format!("rustrtc-cname-{ssrc}")),
+        );
         let (rtcp_tx, _) = broadcast::channel(100);
         let (transport_change_tx, _) = watch::channel(0);
 

@@ -448,6 +448,8 @@ pub struct RtcConfiguration {
     pub sdp_compatibility: SdpCompatibilityMode,
     #[serde(skip, default)]
     pub label: Option<String>,
+    #[serde(skip, default)]
+    pub cname: Option<String>,
 }
 
 impl Default for RtcConfiguration {
@@ -491,6 +493,7 @@ impl Default for RtcConfiguration {
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
+            cname: None,
         }
     }
 }
@@ -686,6 +689,11 @@ impl RtcConfigurationBuilder {
 
     pub fn sdp_compatibility(mut self, mode: SdpCompatibilityMode) -> Self {
         self.inner.sdp_compatibility = mode;
+        self
+    }
+
+    pub fn cname(mut self, cname: String) -> Self {
+        self.inner.cname = Some(cname);
         self
     }
 
