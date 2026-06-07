@@ -421,6 +421,7 @@ pub struct RtcConfiguration {
     pub sctp_receive_window: usize,
     pub sctp_heartbeat_interval: std::time::Duration,
     pub sctp_max_heartbeat_failures: u32,
+    pub sctp_max_tsn_retransmits: u32,
     pub sctp_max_burst: usize,
     pub sctp_max_cwnd: usize,
     pub dtls_buffer_size: usize,
@@ -477,6 +478,7 @@ impl Default for RtcConfiguration {
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
             sctp_heartbeat_interval: std::time::Duration::from_secs(15),
             sctp_max_heartbeat_failures: 4,
+            sctp_max_tsn_retransmits: 8,
             sctp_max_burst: 0,         // 0 = use default heuristic
             sctp_max_cwnd: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,

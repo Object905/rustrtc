@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.3.66"
+version = "0.3.67"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -26,8 +26,8 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 async-trait = "0.1"
 bytes = { version = "1", features = ["serde"] }
-aes = "0.9.0"
-ctr = "0.10.0"
+aes = "0.9"
+ctr = "0.10"
 hmac = "0.13.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
@@ -53,7 +53,7 @@ spandsp-sys = { version = "0.1.5", optional = true }
 axum = { version = "0.8", features = ["multipart"] }
 turn = "0.17.1"
 webrtc = "0.17.1"
-reqwest = { version = "0.13.3", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 webrtc-util = "0.17.1"
 env_logger = "0.11.10"
 dtls = "0.17.1"
