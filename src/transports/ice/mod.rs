@@ -948,6 +948,16 @@ impl IceTransport {
                 }
             }
         }
+
+        // Apply external_port override (for NAT port forwarding)
+        if upnp_external_addr.is_none() {
+            if let Some(ext_port) = self.inner.config.external_port {
+                if !bind_ip.is_loopback() {
+                    cand_addr.set_port(ext_port);
+                }
+            }
+        }
+
         let mut local_candidate = IceCandidate::host(cand_addr, 1);
         if cand_addr != local_addr {
             local_candidate.related_address = Some(local_addr);
@@ -1060,6 +1070,16 @@ impl IceTransport {
                 }
             }
         }
+
+        // Apply external_port override (for NAT port forwarding)
+        if upnp_external_addr.is_none() {
+            if let Some(ext_port) = self.inner.config.external_port {
+                if !bind_ip.is_loopback() {
+                    cand_addr.set_port(ext_port);
+                }
+            }
+        }
+
         let mut local_candidate = IceCandidate::host(cand_addr, 1);
         if cand_addr != local_addr {
             local_candidate.related_address = Some(local_addr);

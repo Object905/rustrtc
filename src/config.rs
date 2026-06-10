@@ -404,7 +404,23 @@ pub struct RtcConfiguration {
     pub transport_mode: TransportMode,
     pub nack_buffer_size: usize,
     pub media_capabilities: Option<MediaCapabilities>,
+    /// Override the advertised IP address in SDP (for NAT traversal).
+    /// When set, the `c=`, `o=`, and candidate addresses in the SDP will
+    /// use this IP instead of the local bind IP. The local bind address is
+    /// stored in `related_address` on the candidate.
     pub external_ip: Option<String>,
+    /// Override the advertised port in SDP `m=` line and candidates
+    /// (for NAT port forwarding).
+    ///
+    /// When set, the SDP will advertise this port instead of the local
+    /// bind port. This is useful when you have configured NAT port
+    /// forwarding (e.g. external port 30000 → local port 20000) and need
+    /// the remote peer to send RTP to the external port.
+    ///
+    /// Works independently or combined with `external_ip`.
+    /// Only applies in RTP/SRTP direct mode (`TransportMode::Rtp` /
+    /// `TransportMode::Srtp`). Not used in WebRTC mode.
+    pub external_port: Option<u16>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
@@ -465,6 +481,7 @@ impl Default for RtcConfiguration {
             nack_buffer_size: 200,
             media_capabilities: None,
             external_ip: None,
+            external_port: None,
             bind_ip: None,
             disable_ipv6: false,
             ssrc_start: 10000,
@@ -579,6 +596,11 @@ impl RtcConfigurationBuilder {
 
     pub fn external_ip(mut self, ip: String) -> Self {
         self.inner.external_ip = Some(ip);
+        self
+    }
+
+    pub fn external_port(mut self, port: u16) -> Self {
+        self.inner.external_port = Some(port);
         self
     }
 
@@ -805,6 +827,30 @@ mod tests {
         );
         assert!(config.sctp_max_heartbeat_failures > defaults.sctp_max_heartbeat_failures);
         assert!(config.sctp_max_burst > 0); // Explicit burst limit vs. heuristic
+    }
+
+    #[test]
+    fn test_external_port_defaults() {
+        let config = RtcConfiguration::default();
+        assert_eq!(config.external_port, None);
+    }
+
+    #[test]
+    fn test_external_port_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .external_port(30000)
+            .build();
+        assert_eq!(config.external_port, Some(30000));
+    }
+
+    #[test]
+    fn test_external_port_with_external_ip_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .external_ip("203.0.113.5".to_string())
+            .external_port(30000)
+            .build();
+        assert_eq!(config.external_ip, Some("203.0.113.5".to_string()));
+        assert_eq!(config.external_port, Some(30000));
     }
 
     #[test]
