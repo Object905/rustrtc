@@ -3155,10 +3155,11 @@ async fn run_ice_dtls_loop(
                     return;
                 };
 
-                // If nomination is already done (value is Some), this resolves immediately.
+                // Wait for ICE nomination to complete before starting DTLS.
+                // ICE now tries candidate pairs in priority order (host → srflx → relay).
+                // Each pair gets `nomination_timeout` for its STUN retransmissions.
                 if nomination_complete_rx.borrow().is_none() {
                     let wait_result = tokio::select! {
-                        // Wait for nomination to complete (success or failure).
                         changed = nomination_complete_rx.changed() => {
                             changed.ok().and_then(|_| *nomination_complete_rx.borrow())
                         }
@@ -3178,21 +3179,36 @@ async fn run_ice_dtls_loop(
                                 }
                             }
                         } => None,
-                        // Safety timeout: if nomination takes longer than configured, proceed anyway.
-                        _ = tokio::time::sleep(nomination_timeout) => None,
+                        // Allow time for multiple candidate pairs to be tried.
+                        _ = tokio::time::sleep(nomination_timeout.saturating_mul(6)) => None,
                     };
 
-                    // Log the outcome but always proceed — a nomination failure doesn't
-                    // mean the path is unusable; DTLS may still succeed.
-                    match wait_result {
-                        Some(true) => {
-                            debug!("ICE nomination completed successfully, starting DTLS")
-                        }
-                        Some(false) => debug!("ICE nomination failed, proceeding to DTLS anyway"),
-                        None => debug!(
-                            "ICE nomination wait timed-out or ICE changed state, proceeding to DTLS"
-                        ),
+                    if wait_result != Some(true) {
+                        debug!("ICE nomination did not succeed, skipping DTLS");
+                        continue;
                     }
+                    debug!("ICE nomination completed successfully, starting DTLS");
+                }
+
+                // Bail out if nomination was already completed with failure
+                // (re-entry after continue above).  Wait for ICE to transition
+                // away from Connected (should go to Failed) to avoid busy-looping.
+                if *nomination_complete_rx.borrow() == Some(false) {
+                    debug!("ICE nomination failed, waiting for ICE to transition");
+                    loop {
+                        if ice_state_rx.changed().await.is_err() {
+                            return;
+                        }
+                        let s = *ice_state_rx.borrow();
+                        if !matches!(
+                            s,
+                            crate::transports::ice::IceTransportState::Connected
+                                | crate::transports::ice::IceTransportState::Completed
+                        ) {
+                            break;
+                        }
+                    }
+                    continue;
                 }
 
                 // For RTP/SRTP mode, we don't need DTLS role to start

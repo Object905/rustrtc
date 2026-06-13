@@ -1905,6 +1905,151 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
+    // Very short nomination_timeout — on CI/slow systems the nomination should
+    // fail (timeout fires before response arrives).  On fast localhost it may
+    // still succeed because the STUN round-trip can be < 100µs.
+    let mut config1 = RtcConfiguration::default();
+    config1.nomination_timeout = Duration::from_micros(10);
+    config1.stun_timeout = Duration::from_secs(5);
+    let mut config2 = RtcConfiguration::default();
+    config2.nomination_timeout = Duration::from_micros(10);
+    config2.stun_timeout = Duration::from_secs(5);
+
+    let (controlling, _controlled) = setup_host_pair(config1, config2).await;
+
+    let mut ctrl_state = controlling.subscribe_state();
+    let ctrl_nom_rx = controlling.subscribe_nomination_complete();
+
+    // Wait for ICE Connected (connectivity check succeeds)
+    assert!(
+        wait_ice_connected(ctrl_state.clone(), Duration::from_secs(10)).await,
+        "ICE should connect"
+    );
+
+    // Wait for nomination_complete to fire (Some(true) or Some(false),
+    // depending on whether the STUN response beat the timeout).
+    let nom_fired = timeout(Duration::from_secs(30), async {
+        if ctrl_nom_rx.borrow().is_some() {
+            return;
+        }
+        loop {
+            if ctrl_state.changed().await.is_err() {
+                return;
+            }
+            if ctrl_nom_rx.borrow().is_some() {
+                return;
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        nom_fired.is_ok(),
+        "nomination_complete must fire (Some(true) or Some(false)), \
+         it should never hang"
+    );
+
+    let nom = *ctrl_nom_rx.borrow();
+    match nom {
+        Some(true) => {
+            // Nomination succeeded (fast localhost) — ICE should stay Connected
+            debug!("Nomination succeeded (fast path) – all good");
+        }
+        Some(false) => {
+            // Nomination failed — verify ICE transitions to Failed
+            debug!("Nomination failed – verifying ICE transitions to Failed");
+            let failed = timeout(Duration::from_secs(30), async {
+                loop {
+                    let s = *ctrl_state.borrow_and_update();
+                    if s == IceTransportState::Failed {
+                        return;
+                    }
+                    if ctrl_state.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                failed.is_ok(),
+                "ICE should transition to Failed after all pairs fail nomination"
+            );
+        }
+        None => {
+            panic!("nomination_complete value should be Some(_), got None");
+        }
+    }
+
+    // Selected pair should exist regardless
+    let pair = controlling.get_selected_pair().await;
+    assert!(
+        pair.is_some(),
+        "selected pair should exist even after nomination outcome"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_nomination_fallback_controlled_side_works() -> Result<()> {
+    // Controlled side should still receive USE-CANDIDATE and signal
+    // nomination_complete = Some(true), even when the controlling side
+    // goes to Failed after nomination timeout.
+    let mut config1 = RtcConfiguration::default();
+    config1.nomination_timeout = Duration::ZERO;
+    config1.stun_timeout = Duration::from_secs(5);
+    let mut config2 = RtcConfiguration::default();
+    config2.nomination_timeout = Duration::ZERO;
+    config2.stun_timeout = Duration::from_secs(5);
+
+    let (controlling, controlled) = setup_host_pair(config1, config2).await;
+
+    let ctrl_state = controlling.subscribe_state();
+    let ctrd_state = controlled.subscribe_state();
+    let mut ctrd_nom_rx = controlled.subscribe_nomination_complete();
+
+    // Both sides should connect
+    assert!(
+        wait_ice_connected(ctrl_state.clone(), Duration::from_secs(10)).await,
+        "Controlling ICE should connect"
+    );
+    assert!(
+        wait_ice_connected(ctrd_state.clone(), Duration::from_secs(10)).await,
+        "Controlled ICE should connect"
+    );
+
+    // Controlled side should get nomination_complete = Some(true)
+    // because it receives the controlling side's USE-CANDIDATE STUN request
+    // (the single request sent before the controlling side's timeout fires)
+    let ctrd_nom = timeout(Duration::from_secs(10), async {
+        if ctrd_nom_rx.borrow().is_some() {
+            return *ctrd_nom_rx.borrow();
+        }
+        ctrd_nom_rx.changed().await.ok()?;
+        *ctrd_nom_rx.borrow()
+    })
+    .await;
+
+    assert_eq!(
+        ctrd_nom,
+        Ok(Some(true)),
+        "Controlled side should receive USE-CANDIDATE and set nomination_complete = Some(true)"
+    );
+
+    // Controlled side should have a selected pair
+    let ctrd_pair = controlled.get_selected_pair().await;
+    assert!(
+        ctrd_pair.is_some(),
+        "Controlled side should have a selected pair"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_nomination_race_under_high_packet_loss() -> Result<()> {
     struct ScopeGuard {
         prev: u32,

@@ -1474,84 +1474,97 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     }
 
     use futures::stream::StreamExt;
-    let mut success = false;
+    let mut successful_pairs: Vec<IceCandidatePair> = Vec::new();
+
     while let Some(res) = checks.next().await {
         if let Some(pair) = res {
-            // Check if another concurrent check already selected a pair
-            {
-                let existing = inner.selected_pair.lock();
-                if existing.is_some() {
-                    debug!(
-                        "ICE: Ignoring pair {} -> {} (already have selected pair)",
-                        pair.local.address, pair.remote.address
-                    );
-                    success = true;
-                    break;
-                }
+            // Skip duplicates (same local+remote already collected)
+            let key = (pair.local.address, pair.remote.address);
+            if successful_pairs.iter().any(|p| (p.local.address, p.remote.address) == key) {
+                continue;
             }
+            successful_pairs.push(pair);
+        }
+    }
+
+    if successful_pairs.is_empty() {
+        let state = *inner.state.borrow();
+        let has_selected_pair = inner.selected_pair.lock().is_some();
+        if state != IceTransportState::Connected && !has_selected_pair {
+            let _ = inner.state.send(IceTransportState::Failed);
+        }
+        return;
+    }
+
+    // Sort by priority: host > srflx > relay.  P2P first, relay last.
+    successful_pairs.sort_by(|a, b| b.priority(role).cmp(&a.priority(role)));
+
+    if role == IceRole::Controlling {
+        // Try nomination on each successful pair in priority order.
+        // First successful nomination wins; fall through to next pair on failure.
+        let mut nominated = false;
+        for pair in &successful_pairs {
             *inner.selected_pair.lock() = Some(pair.clone());
             let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-            if let Some(socket) = resolve_socket(&inner, &pair) {
+            if let Some(socket) = resolve_socket(&inner, pair) {
                 let _ = inner.selected_socket.send(Some(socket.clone()));
                 publish_selected_rtcp_socket(&inner, Some(socket));
             }
             let _ = inner.state.send(IceTransportState::Connected);
-            success = true;
             debug!(
                 "ICE checks complete. Selected pair: {} -> {}",
                 pair.local.address, pair.remote.address
             );
+            debug!(
+                "Controlling agent nominating pair: {} -> {}",
+                pair.local.address, pair.remote.address
+            );
 
-            if role == IceRole::Controlling {
-                debug!(
-                    "Controlling agent nominating pair: {} -> {}",
-                    pair.local.address, pair.remote.address
-                );
-                let inner_clone = inner.clone();
-                let pair_clone = pair.clone();
-                tokio::spawn(async move {
-                    let result = perform_binding_check(
-                        &pair_clone.local,
-                        &pair_clone.remote,
-                        &inner_clone,
-                        role,
-                        true,
-                    )
-                    .await;
-                    match &result {
-                        Ok(_) => {
-                            debug!(
-                                "Nomination succeeded: {} -> {}",
-                                pair_clone.local.address, pair_clone.remote.address
-                            );
-                            let _ = inner_clone.nomination_complete.send(Some(true));
-                        }
-                        Err(e) => {
-                            debug!("Failed to send nomination: {}", e);
-                            let _ = inner_clone.nomination_complete.send(Some(false));
-                        }
-                    }
-                });
-            } else {
-                // Controlled side: nomination_complete is signalled when we
-                // receive USE-CANDIDATE from the controlling agent (see the
-                // handle_stun_binding_request path below).  Do NOT signal here —
-                // firing early causes DTLS to start before the controlling side
-                // has finished its nomination binding check, creating a timing
-                // gap that can exceed `nomination_timeout` (10 s in production).
+            let result =
+                perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await;
+            match &result {
+                Ok(_) => {
+                    debug!(
+                        "Nomination succeeded: {} -> {}",
+                        pair.local.address, pair.remote.address
+                    );
+                    let _ = inner.nomination_complete.send(Some(true));
+                    nominated = true;
+                    break;
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to send nomination for {} -> {}: {}",
+                        pair.local.address, pair.remote.address, e
+                    );
+                    // Fall through to next pair
+                }
             }
-
-            break;
         }
-    }
-
-    if !success {
-        let state = *inner.state.borrow();
-        let has_selected_pair = inner.selected_pair.lock().is_some();
-        // Only set Failed if we're not already connected AND we don't have a working pair
-        if state != IceTransportState::Connected && !has_selected_pair {
+        if !nominated {
+            debug!(
+                "All nomination attempts failed ({} pairs tried)",
+                successful_pairs.len()
+            );
+            let _ = inner.nomination_complete.send(Some(false));
             let _ = inner.state.send(IceTransportState::Failed);
         }
+    } else {
+        // Controlled side: select best pair but don't nominate.
+        // nomination_complete is signalled when we receive USE-CANDIDATE
+        // from the controlling agent.
+        let pair = &successful_pairs[0];
+        *inner.selected_pair.lock() = Some(pair.clone());
+        let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+        if let Some(socket) = resolve_socket(&inner, pair) {
+            let _ = inner.selected_socket.send(Some(socket.clone()));
+            publish_selected_rtcp_socket(&inner, Some(socket));
+        }
+        let _ = inner.state.send(IceTransportState::Connected);
+        debug!(
+            "ICE checks complete. Selected pair: {} -> {}",
+            pair.local.address, pair.remote.address
+        );
     }
 }
 
