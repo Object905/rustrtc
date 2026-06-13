@@ -279,6 +279,7 @@ struct SctpInner {
     // Configurable parameters from RtcConfiguration
     heartbeat_interval: Duration,
     max_heartbeat_failures: u32,
+    max_tsn_retransmits: u32,
     max_burst_packets: usize, // 0 = use default heuristic
     max_cwnd: usize,
 
@@ -690,6 +691,7 @@ impl SctpTransport {
             max_association_retransmits: config.sctp_max_association_retransmits,
             heartbeat_interval: config.sctp_heartbeat_interval,
             max_heartbeat_failures: config.sctp_max_heartbeat_failures,
+            max_tsn_retransmits: config.sctp_max_tsn_retransmits,
             max_burst_packets: config.sctp_max_burst,
             max_cwnd: config.sctp_max_cwnd,
             association_error_count: AtomicU32::new(0),
@@ -1209,8 +1211,6 @@ impl SctpInner {
         // The connection is only closed when ALL chunks are abandoned, or via heartbeat timeout.
         // This is critical for TURN relay scenarios where SACK packets may be lost.
 
-        const MAX_PER_TSN_T3_RETRANSMITS: u32 = 8;
-
         {
             let mut sent_queue = self.sent_queue.lock();
             let mut retransmitted_tsn = None;
@@ -1224,7 +1224,7 @@ impl SctpInner {
 
                     if retransmitted_tsn.is_none() {
                         // Check if this TSN has exceeded per-packet retransmit limit
-                        if record.transmit_count >= MAX_PER_TSN_T3_RETRANSMITS {
+                        if record.transmit_count >= self.max_tsn_retransmits {
                             // Abandon this TSN and try the next one
                             record.abandoned = true;
                             debug!(
@@ -3617,7 +3617,7 @@ mod tests {
         // Set state to Connecting
         *sctp.inner.state.lock() = SctpState::Connecting;
 
-        // Add a chunk to sent queue with transmit_count already at 8 (the limit)
+        // Add a chunk to sent queue with transmit_count already at the limit
         {
             let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
@@ -3625,7 +3625,7 @@ mod tests {
                 ChunkRecord {
                     payload: Bytes::from_static(b"test"),
                     sent_time: Instant::now() - Duration::from_secs(10),
-                    transmit_count: 8, // At the MAX_PER_TSN_T3_RETRANSMITS limit
+                    transmit_count: config.sctp_max_tsn_retransmits, // At the TSN retransmit limit
                     missing_reports: 0,
                     abandoned: false,
                     fast_retransmit: false,

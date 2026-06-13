@@ -61,6 +61,18 @@ pub enum IceTransportPolicy {
     Relay,
 }
 
+/// Controls ICE TCP candidate support (RFC 6544).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum IceTcpPolicy {
+    /// Do not gather or use TCP candidates.
+    #[default]
+    Disabled,
+    /// Gather and use TCP candidates (both active and passive).
+    Enabled,
+    /// Only gather and use passive TCP candidates.
+    PassiveOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum BundlePolicy {
     #[default]
@@ -404,7 +416,23 @@ pub struct RtcConfiguration {
     pub transport_mode: TransportMode,
     pub nack_buffer_size: usize,
     pub media_capabilities: Option<MediaCapabilities>,
+    /// Override the advertised IP address in SDP (for NAT traversal).
+    /// When set, the `c=`, `o=`, and candidate addresses in the SDP will
+    /// use this IP instead of the local bind IP. The local bind address is
+    /// stored in `related_address` on the candidate.
     pub external_ip: Option<String>,
+    /// Override the advertised port in SDP `m=` line and candidates
+    /// (for NAT port forwarding).
+    ///
+    /// When set, the SDP will advertise this port instead of the local
+    /// bind port. This is useful when you have configured NAT port
+    /// forwarding (e.g. external port 30000 → local port 20000) and need
+    /// the remote peer to send RTP to the external port.
+    ///
+    /// Works independently or combined with `external_ip`.
+    /// Only applies in RTP/SRTP direct mode (`TransportMode::Rtp` /
+    /// `TransportMode::Srtp`). Not used in WebRTC mode.
+    pub external_port: Option<u16>,
     pub bind_ip: Option<String>,
     pub disable_ipv6: bool,
     pub ssrc_start: u32,
@@ -421,6 +449,7 @@ pub struct RtcConfiguration {
     pub sctp_receive_window: usize,
     pub sctp_heartbeat_interval: std::time::Duration,
     pub sctp_max_heartbeat_failures: u32,
+    pub sctp_max_tsn_retransmits: u32,
     pub sctp_max_burst: usize,
     pub sctp_max_cwnd: usize,
     pub dtls_buffer_size: usize,
@@ -454,6 +483,10 @@ pub struct RtcConfiguration {
     pub buffer_drop_strategy: BufferDropStrategy,
     #[serde(default = "default_buffer_stats_log_interval")]
     pub buffer_stats_log_interval: std::time::Duration,
+    /// Controls ICE TCP candidate support (RFC 6544).
+    /// Default: Disabled — only UDP candidates are gathered and used.
+    #[serde(default)]
+    pub ice_tcp_policy: IceTcpPolicy,
     /// SDP generation compatibility mode.
     #[serde(default)]
     pub sdp_compatibility: SdpCompatibilityMode,
@@ -475,6 +508,7 @@ impl Default for RtcConfiguration {
             nack_buffer_size: 200,
             media_capabilities: None,
             external_ip: None,
+            external_port: None,
             bind_ip: None,
             disable_ipv6: false,
             ssrc_start: 10000,
@@ -488,6 +522,7 @@ impl Default for RtcConfiguration {
             sctp_receive_window: 128 * 1024, // 128KB - reduced for lower memory footprint
             sctp_heartbeat_interval: std::time::Duration::from_secs(15),
             sctp_max_heartbeat_failures: 4,
+            sctp_max_tsn_retransmits: 8,
             sctp_max_burst: 0,         // 0 = use default heuristic
             sctp_max_cwnd: 256 * 1024, // 256 KB
             dtls_buffer_size: 2048,
@@ -506,6 +541,7 @@ impl Default for RtcConfiguration {
             rtp_buffer_capacity: default_rtp_buffer_capacity(),
             buffer_drop_strategy: BufferDropStrategy::default(),
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
+            ice_tcp_policy: IceTcpPolicy::default(),
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
@@ -597,6 +633,11 @@ impl RtcConfigurationBuilder {
 
     pub fn external_ip(mut self, ip: String) -> Self {
         self.inner.external_ip = Some(ip);
+        self
+    }
+
+    pub fn external_port(mut self, port: u16) -> Self {
+        self.inner.external_port = Some(port);
         self
     }
 
@@ -718,6 +759,11 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    pub fn ice_tcp_policy(mut self, policy: IceTcpPolicy) -> Self {
+        self.inner.ice_tcp_policy = policy;
+        self
+    }
+
     pub fn sdp_compatibility(mut self, mode: SdpCompatibilityMode) -> Self {
         self.inner.sdp_compatibility = mode;
         self
@@ -834,6 +880,30 @@ mod tests {
         );
         assert!(config.sctp_max_heartbeat_failures > defaults.sctp_max_heartbeat_failures);
         assert!(config.sctp_max_burst > 0); // Explicit burst limit vs. heuristic
+    }
+
+    #[test]
+    fn test_external_port_defaults() {
+        let config = RtcConfiguration::default();
+        assert_eq!(config.external_port, None);
+    }
+
+    #[test]
+    fn test_external_port_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .external_port(30000)
+            .build();
+        assert_eq!(config.external_port, Some(30000));
+    }
+
+    #[test]
+    fn test_external_port_with_external_ip_builder() {
+        let config = RtcConfigurationBuilder::new()
+            .external_ip("203.0.113.5".to_string())
+            .external_port(30000)
+            .build();
+        assert_eq!(config.external_ip, Some("203.0.113.5".to_string()));
+        assert_eq!(config.external_port, Some(30000));
     }
 
     #[test]

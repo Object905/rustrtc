@@ -7037,6 +7037,166 @@ a=mid:0
     }
 
     #[tokio::test]
+    async fn rtp_mode_external_port_in_sdp() {
+        use crate::TransportMode;
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.external_ip = Some("203.0.113.5".to_string());
+        config.external_port = Some(30000);
+
+        let pc = PeerConnection::new(config);
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 8,
+            clock_rate: 8000,
+            channels: 1,
+        };
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("s".to_string())
+            .params(params)
+            .build();
+        transceiver.set_sender(Some(sender));
+
+        let offer = pc.create_offer().await.unwrap();
+        let sdp_text = offer.to_sdp_string();
+
+        // m= line must use the external port (not the local bind port)
+        assert!(
+            sdp_text.contains("m=audio 30000 RTP/AVP"),
+            "SDP m= line should use external_port=30000, got:\n{}",
+            sdp_text
+        );
+
+        // SDP c= line must use the external IP
+        assert!(
+            sdp_text.contains("c=IN IP4 203.0.113.5"),
+            "SDP c= line should use external_ip"
+        );
+
+        // Verify local candidate uses external port
+        let candidates = pc.ice_transport().local_candidates();
+        let cand = candidates.iter().find(|c| c.component == 1).unwrap();
+        assert_eq!(
+            cand.address.port(),
+            30000,
+            "Candidate address port should be external_port"
+        );
+        assert_eq!(
+            cand.address.ip().to_string(),
+            "203.0.113.5",
+            "Candidate address IP should be external_ip"
+        );
+        assert!(
+            cand.related_address.is_some(),
+            "Candidate should have related_address when external_port is set"
+        );
+        if let Some(related) = cand.related_address {
+            assert_ne!(
+                related.port(),
+                30000,
+                "related_address port should differ from external port (local bind port)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rtp_mode_external_port_only_no_ip() {
+        // Test external_port without external_ip — only the port is overridden.
+        use crate::TransportMode;
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.external_port = Some(31000);
+
+        let pc = PeerConnection::new(config);
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 8,
+            clock_rate: 8000,
+            channels: 1,
+        };
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("s".to_string())
+            .params(params)
+            .build();
+        transceiver.set_sender(Some(sender));
+
+        let offer = pc.create_offer().await.unwrap();
+        let sdp_text = offer.to_sdp_string();
+
+        assert!(
+            sdp_text.contains("m=audio 31000 RTP/AVP"),
+            "SDP m= line should use external_port=31000, got:\n{}",
+            sdp_text
+        );
+
+        let candidates = pc.ice_transport().local_candidates();
+        let cand = candidates.iter().find(|c| c.component == 1).unwrap();
+        assert_eq!(cand.address.port(), 31000);
+        assert!(cand.related_address.is_some());
+    }
+
+    #[tokio::test]
+    async fn rtp_mode_external_port_offerer_connects() {
+        // Verify external_port works through the full offer/answer exchange.
+        use crate::TransportMode;
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        config.external_ip = Some("203.0.113.5".to_string());
+        config.external_port = Some(30000);
+        let pc = PeerConnection::new(config);
+
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 8,
+            clock_rate: 8000,
+            channels: 1,
+        };
+        let sender = RtpSender::builder(track, 12345)
+            .stream_id("s".to_string())
+            .params(params)
+            .build();
+        transceiver.set_sender(Some(sender));
+
+        let offer = pc.create_offer().await.unwrap();
+        pc.set_local_description(offer).unwrap();
+
+        // Remote answer with a different remote port
+        let remote_sdp = "v=0\r\n\
+                          o=- 1 1 IN IP4 10.0.0.2\r\n\
+                          s=-\r\n\
+                          t=0 0\r\n\
+                          c=IN IP4 10.0.0.2\r\n\
+                          m=audio 6000 RTP/AVP 8\r\n\
+                          a=rtpmap:8 PCMA/8000\r\n\
+                          a=recvonly\r\n";
+        let answer = SessionDescription::parse(SdpType::Answer, remote_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+
+        // Should reach Connected
+        let mut state_rx = pc.subscribe_peer_state();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if *state_rx.borrow() == PeerConnectionState::Connected {
+                    return;
+                }
+                let _ = state_rx.changed().await;
+            }
+        })
+        .await
+        .expect("PC should connect with external_port in RTP mode");
+
+        let pair = pc.ice_transport().get_selected_pair().await.unwrap();
+        // Local candidate should still have external port
+        assert_eq!(pair.local.address.port(), 30000);
+        assert_eq!(pair.remote.address.port(), 6000);
+    }
+
+    #[tokio::test]
     async fn rtp_mode_gathering_completes_immediately() {
         use crate::TransportMode;
         let mut config = RtcConfiguration::default();
