@@ -383,9 +383,9 @@ impl IceTransportRunner {
                             trace!("TCP accepted connection from {}", peer_addr);
                             stream.set_nodelay(true).ok();
                             let stream = Arc::new(tokio::sync::Mutex::new(stream));
-                            let _ = inner.gatherer.socket_tx.send(
-                                IceSocketWrapper::TcpStream(stream, peer_addr)
-                            );
+                            let wrapper = IceSocketWrapper::TcpStream(stream.clone(), peer_addr);
+                            inner.gatherer.tcp_streams.lock().push(wrapper.clone());
+                            let _ = inner.gatherer.socket_tx.send(wrapper);
                         }
                         Err(e) => {
                             debug!("TCP accept error: {}", e);
@@ -1385,6 +1385,15 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             if local.address.is_ipv4() != remote.address.is_ipv4() {
                 continue;
             }
+            // For Controlled role with TCP passive candidates, skip connectivity checks.
+            // The pair will be selected when the Controlling side connects via TCP
+            // and sends USE-CANDIDATE.
+            if role == IceRole::Controlled
+                && local.transport == "tcp"
+                && local.tcptype.as_deref() == Some("passive")
+            {
+                continue;
+            }
             pairs.push(IceCandidatePair::new(local.clone(), remote.clone()));
         }
     }
@@ -1553,9 +1562,15 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
             .get(&pair.local.address)
             .map(|c| IceSocketWrapper::Turn(c.clone(), pair.local.address))
     } else if pair.local.transport == "tcp" {
-        // For TCP transport, look for a matching TcpStream in the gatherer's socket list
-        // This is primarily used by the Controlled (passive) side where the remote
-        // has already connected to us.
+        // Find a matching accepted TCP stream for this pair
+        let streams = inner.gatherer.tcp_streams.lock();
+        for stream in streams.iter() {
+            if let IceSocketWrapper::TcpStream(_, peer) = stream {
+                if *peer == pair.remote.address {
+                    return Some(stream.clone());
+                }
+            }
+        }
         None
     } else {
         let socket = inner.gatherer.get_socket(pair.local.base_address());
@@ -2539,6 +2554,7 @@ struct IceGatherer {
     state: Arc<parking_lot::Mutex<IceGathererState>>,
     local_candidates: Arc<parking_lot::Mutex<Vec<IceCandidate>>>,
     sockets: Arc<parking_lot::Mutex<Vec<Arc<UdpSocket>>>>,
+    tcp_streams: Arc<parking_lot::Mutex<Vec<IceSocketWrapper>>>,
     turn_clients: Arc<parking_lot::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
     upnp_mappers: Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>>,
     config: RtcConfiguration,
@@ -2556,6 +2572,7 @@ impl IceGatherer {
             state: Arc::new(parking_lot::Mutex::new(IceGathererState::New)),
             local_candidates: Arc::new(parking_lot::Mutex::new(Vec::new())),
             sockets: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            tcp_streams: Arc::new(parking_lot::Mutex::new(Vec::new())),
             turn_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             upnp_mappers: Arc::new(parking_lot::Mutex::new(Vec::new())),
             config,
