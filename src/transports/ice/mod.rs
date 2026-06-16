@@ -2633,13 +2633,19 @@ impl IceCandidate {
             parts.push("tcptype".into());
             parts.push(tcp_type.as_str().into());
         }
-        if let Some(addr) = self.related_address {
-            if self.typ != IceCandidateType::Host {
-                parts.push("raddr".into());
-                parts.push(addr.ip().to_string());
-                parts.push("rport".into());
-                parts.push(addr.port().to_string());
-            }
+        // srflx/prflx/relay candidates MUST carry raddr/rport (RFC 8839 §5.1).
+        // Relay candidates are built with related_address=None, so emit the
+        // standard 0.0.0.0:0 placeholder; otherwise strict parsers (Firefox)
+        // reject the whole candidate with "Error parsing attribute".
+        if self.typ != IceCandidateType::Host {
+            let (rip, rport) = match self.related_address {
+                Some(addr) => (addr.ip().to_string(), addr.port().to_string()),
+                None => ("0.0.0.0".into(), "0".into()),
+            };
+            parts.push("raddr".into());
+            parts.push(rip);
+            parts.push("rport".into());
+            parts.push(rport);
         }
         parts.join(" ")
     }

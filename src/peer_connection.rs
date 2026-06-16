@@ -3624,7 +3624,7 @@ impl PeerConnectionInner {
             SdpType::Offer => true,
             SdpType::Answer => remote_offered_bundle,
             _ => false,
-        } && ordered_transceivers.len() > 1
+        } && !ordered_transceivers.is_empty()
             && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
         let local_offers_rtcp_mux = self.config.rtcp_mux_policy
             == crate::config::RtcpMuxPolicy::Require
