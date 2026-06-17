@@ -3172,9 +3172,20 @@ impl IceGatherer {
                         debug!("Host gathering failed: {}", e);
                     }
                 } else if self.config.ice_tcp_policy == crate::config::IceTcpPolicy::Enabled {
-                    // Controlling ICE-TCP clients (no UDP): advertise active TCP locals.
-                    if let Err(e) = self.gather_tcp_active_candidates().await {
-                        debug!("TCP active gathering failed: {}", e);
+                    // Outbound controlling peers with no TCP listen range advertise active locals.
+                    // WHEP/answerer setups configure tcp_port_range_* for passive listeners;
+                    // skip active placeholders so SDP does not contain invalid port 0 candidates.
+                    let has_tcp_listen_range = match (
+                        self.config.tcp_port_range_start,
+                        self.config.tcp_port_range_end,
+                    ) {
+                        (Some(s), Some(e)) => s > 0 && e > 0 && s <= e,
+                        _ => false,
+                    };
+                    if !has_tcp_listen_range {
+                        if let Err(e) = self.gather_tcp_active_candidates().await {
+                            debug!("TCP active gathering failed: {}", e);
+                        }
                     }
                 }
             }
@@ -3337,8 +3348,12 @@ impl IceGatherer {
     }
 
     /// Advertise ICE-TCP active host candidates for controlling clients (no UDP gather).
+    ///
+    /// RFC 6544 uses port 9 in SDP for active candidates (not 0 — browsers reject port 0).
     async fn gather_tcp_active_candidates(&self) -> Result<()> {
         use std::net::{IpAddr, Ipv4Addr};
+
+        const ACTIVE_PLACEHOLDER_PORT: u16 = 9;
 
         let mut bind_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
         if let Ok(local_ip) = get_local_ip() {
@@ -3348,10 +3363,14 @@ impl IceGatherer {
         }
 
         for ip in bind_ips {
-            self.push_candidate(IceCandidate::tcp(SocketAddr::new(ip, 0), 1, "active"));
+            self.push_candidate(IceCandidate::tcp(
+                SocketAddr::new(ip, ACTIVE_PLACEHOLDER_PORT),
+                1,
+                "active",
+            ));
         }
         self.push_candidate(IceCandidate::tcp(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ACTIVE_PLACEHOLDER_PORT),
             1,
             "active",
         ));
