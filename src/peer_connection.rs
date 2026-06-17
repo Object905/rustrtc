@@ -3646,12 +3646,20 @@ impl PeerConnectionInner {
         };
 
         let mode = self.config.transport_mode.clone();
-        let will_bundle = match sdp_type {
-            SdpType::Offer => true,
-            SdpType::Answer => remote_offered_bundle,
-            _ => false,
-        } && ordered_transceivers.len() > 1
-            && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
+        // BUNDLE (RFC 8843): a group may contain a single m-section.  When we
+        // are answering an offer that already established a BUNDLE group we
+        // MUST echo it back -- even with only one media section -- otherwise
+        // strict agents such as Chrome reject the answer with
+        // "Answer cannot remove m= section ... from already-established BUNDLE
+        // group".  For offers we only group when there is more than one section
+        // to stay compatible with plain-RTP/SIP peers.
+        let will_bundle = self.config.sdp_compatibility
+            != crate::config::SdpCompatibilityMode::LegacySip
+            && match sdp_type {
+                SdpType::Offer => ordered_transceivers.len() > 1,
+                SdpType::Answer => remote_offered_bundle,
+                _ => false,
+            };
         let local_offers_rtcp_mux = self.config.rtcp_mux_policy
             == crate::config::RtcpMuxPolicy::Require
             && self.config.sdp_compatibility != crate::config::SdpCompatibilityMode::LegacySip;
@@ -8803,6 +8811,56 @@ a=mid:0
         assert!(
             !sdp.contains("a=mid:"),
             "answer to non-BUNDLE offer must not have a=mid in any section, got:\n{sdp}"
+        );
+    }
+
+    /// Regression for issue #27: Chrome rejects an answer that drops the
+    /// `a=group:BUNDLE` the offerer established, even when there is only a
+    /// single m-section.  Chrome's single-audio offer carries
+    /// `a=group:BUNDLE 0`; our answer must echo it (RFC 8843 allows a
+    /// single-member BUNDLE group).
+    #[tokio::test]
+    async fn answer_echoes_bundle_for_single_section_offer() {
+        use crate::sdp::SessionDescription;
+
+        // Minimal Chrome-style offer: one audio m-section, mid 0, BUNDLE 0.
+        let remote_sdp = "\
+v=0\r\n\
+o=- 3572571646755393356 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic: WMS stream\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 0 8\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:IIjZ\r\n\
+a=ice-pwd:h/NG2DkTNsPwhU0swhrzWbLD\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 A9:96:C7:D5:20:2D:17:06:CC:7E:94:0D:89:AA:DE:47:8F:21:3F:97:B1:D5:C5:A2:41:48:E1:A5:8A:D5:BB:B1\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:8 PCMA/8000\r\n";
+
+        let pc = PeerConnection::new(RtcConfiguration::default());
+        pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+        let remote = SessionDescription::parse(SdpType::Offer, remote_sdp).unwrap();
+        pc.set_remote_description(remote).await.unwrap();
+
+        let answer = pc.create_answer().await.unwrap();
+        let sdp = answer.to_sdp_string();
+
+        assert!(
+            sdp.contains("a=group:BUNDLE 0"),
+            "answer to a single-section BUNDLE offer MUST echo a=group:BUNDLE 0 (issue #27), got:\n{sdp}"
+        );
+        assert!(
+            sdp.contains("a=mid:0"),
+            "answer must keep a=mid:0 for the BUNDLED section, got:\n{sdp}"
         );
     }
 
