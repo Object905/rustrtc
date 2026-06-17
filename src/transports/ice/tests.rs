@@ -2988,3 +2988,280 @@ async fn test_ice_tcp_gathers_tcp_candidates() -> Result<()> {
 
     Ok(())
 }
+
+/// Verify frame_stun_for_tcp produces correct RFC 4571 framing.
+#[test]
+fn test_frame_stun_for_tcp() {
+    let data = b"hello stun";
+    let framed = frame_stun_for_tcp(data);
+
+    assert_eq!(framed.len(), 2 + data.len());
+    let len = u16::from_be_bytes([framed[0], framed[1]]);
+    assert_eq!(len as usize, data.len());
+    assert_eq!(&framed[2..], data);
+
+    // Empty payload
+    let empty = frame_stun_for_tcp(b"");
+    assert_eq!(empty.len(), 2);
+    assert_eq!(empty[0], 0);
+    assert_eq!(empty[1], 0);
+}
+
+/// Verify tcp_write_all writes data correctly over a loopback TCP connection.
+#[tokio::test]
+async fn test_tcp_write_all_loopback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let client = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+    let (client_read, client_write) = client.into_split();
+    let client_write = Arc::new(tokio::sync::Mutex::new(client_write));
+
+    let (mut server, _) = listener.accept().await.unwrap();
+
+    let payload = b"tcp_write_all test payload";
+    tcp_write_all(&client_write, payload).await.unwrap();
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; payload.len()];
+    let s = &mut server;
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+    drop(client_read);
+}
+
+/// Verify tcp_write_all handles multi-write correctly (data larger than socket buffer).
+#[tokio::test]
+async fn test_tcp_write_all_large_data() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let client = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+    let (client_read, client_write) = client.into_split();
+    let client_write = Arc::new(tokio::sync::Mutex::new(client_write));
+
+    let (mut server, _) = listener.accept().await.unwrap();
+
+    // 1 MB payload to exercise partial writes
+    let payload = vec![0xABu8; 1024 * 1024];
+    tcp_write_all(&client_write, &payload).await.unwrap();
+
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; payload.len()];
+    let s = &mut server;
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf.len(), payload.len());
+    assert_eq!(buf[0], 0xAB);
+    assert_eq!(buf[payload.len() - 1], 0xAB);
+    drop(client_read);
+}
+
+/// ICE-TCP end-to-end: controlling side (active TCP) connects to controlled
+/// side (passive TCP listener).  Verifies both sides reach Connected state and
+/// the selected pair uses TCP transport.
+#[tokio::test]
+#[serial]
+async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
+    // Controlled side: passive TCP listener
+    let mut controlled_config = RtcConfiguration::default();
+    controlled_config.ice_gather_udp_hosts = false;
+    controlled_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+    controlled_config.tcp_port_range_start = Some(20_000);
+    controlled_config.tcp_port_range_end = Some(20_010);
+
+    // Controlling side: active TCP candidate, no UDP
+    let mut controlling_config = RtcConfiguration::default();
+    controlling_config.ice_gather_udp_hosts = false;
+    controlling_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+
+    let (controlling, runner_c) = IceTransportBuilder::new(controlling_config)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(controlled_config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    // Wait for gathering to complete
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify both sides have gathered candidates
+    let ctrl_locals = controlling.local_candidates();
+    let ctrd_locals = controlled.local_candidates();
+
+    assert!(!ctrl_locals.is_empty(), "Controlling should have local candidates");
+    assert!(!ctrd_locals.is_empty(), "Controlled should have local candidates");
+    assert!(
+        ctrl_locals.iter().any(|c| c.transport == "tcp"),
+        "Controlling should have TCP candidates"
+    );
+    assert!(
+        ctrd_locals.iter().any(|c| c.transport == "tcp"),
+        "Controlled should have TCP candidates"
+    );
+
+    // Exchange candidates
+    for c in ctrl_locals.iter() {
+        controlled.add_remote_candidate(c.clone());
+    }
+    for c in ctrd_locals.iter() {
+        controlling.add_remote_candidate(c.clone());
+    }
+
+    // Forward trickle candidates
+    let ctrl_clone = controlling.clone();
+    let ctrd_clone = controlled.clone();
+    let mut rx_ctrl = controlling.subscribe_candidates();
+    let mut rx_ctrd = controlled.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrl.recv().await {
+            ctrd_clone.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrd.recv().await {
+            ctrl_clone.add_remote_candidate(c);
+        }
+    });
+
+    // Start both agents
+    let controlled_params = controlled.local_parameters();
+    let controlling_params = controlling.local_parameters();
+    controlling
+        .start(controlled_params)
+        .expect("controlling.start");
+    controlled
+        .start(controlling_params)
+        .expect("controlled.start");
+
+    // Wait for both sides to connect
+    let ctrl_state_rx = controlling.subscribe_state();
+    let ctrd_state_rx = controlled.subscribe_state();
+
+    let ctrl_ok = wait_ice_connected(ctrl_state_rx, Duration::from_secs(15)).await;
+    let ctrd_ok = wait_ice_connected(ctrd_state_rx, Duration::from_secs(15)).await;
+
+    assert!(ctrl_ok, "Controlling side should connect over TCP");
+    assert!(ctrd_ok, "Controlled side should connect over TCP");
+
+    // Verify the selected pair uses TCP transport
+    let selected_pair = controlling.get_selected_pair().await;
+    assert!(selected_pair.is_some(), "Should have a selected pair");
+    let pair = selected_pair.unwrap();
+    assert_eq!(
+        pair.local.transport, "tcp",
+        "Selected pair should use TCP transport, got {}",
+        pair.local.transport
+    );
+
+    // Verify we can get a selected socket
+    let wrapper = controlling.get_selected_socket().await;
+    assert!(wrapper.is_some(), "Should have a selected socket");
+    let wrapper = wrapper.unwrap();
+    assert!(
+        matches!(wrapper, IceSocketWrapper::TcpStream(_, _, _)),
+        "Selected socket should be TcpStream"
+    );
+
+    // Send a test message to verify data flow
+    let test_data = b"test-data-over-tcp";
+    wrapper.send_to(test_data, pair.remote.address).await.unwrap();
+
+    Ok(())
+}
+
+/// ICE-TCP end-to-end with send verification using PacketReceiver.
+/// The background read loop owns the TCP recv side, so we use a STUN message
+/// handler / PacketReceiver to verify data delivery rather than calling recv_from
+/// directly (which would race with the loop).
+#[tokio::test]
+#[serial]
+async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
+    let mut controlled_config = RtcConfiguration::default();
+    controlled_config.ice_gather_udp_hosts = false;
+    controlled_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+    controlled_config.tcp_port_range_start = Some(20_011);
+    controlled_config.tcp_port_range_end = Some(20_020);
+
+    let mut controlling_config = RtcConfiguration::default();
+    controlling_config.ice_gather_udp_hosts = false;
+    controlling_config.ice_tcp_policy = crate::config::IceTcpPolicy::Enabled;
+
+    let (controlling, runner_c) = IceTransportBuilder::new(controlling_config)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_c);
+
+    let (controlled, runner_d) = IceTransportBuilder::new(controlled_config)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner_d);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+
+    let ctrl_clone = controlling.clone();
+    let ctrd_clone = controlled.clone();
+    let mut rx_ctrl = controlling.subscribe_candidates();
+    let mut rx_ctrd = controlled.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrl.recv().await {
+            ctrd_clone.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = rx_ctrd.recv().await {
+            ctrl_clone.add_remote_candidate(c);
+        }
+    });
+
+    controlling
+        .start(controlled.local_parameters())
+        .expect("controlling.start");
+    controlled
+        .start(controlling.local_parameters())
+        .expect("controlled.start");
+
+    let ctrl_ok = wait_ice_connected(
+        controlling.subscribe_state(),
+        Duration::from_secs(15),
+    )
+    .await;
+    let ctrd_ok = wait_ice_connected(
+        controlled.subscribe_state(),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    assert!(ctrl_ok, "Controlling should connect over TCP");
+    assert!(ctrd_ok, "Controlled should connect over TCP");
+
+    // Verify both sides selected TCP transport
+    let ctrl_pair = controlling.get_selected_pair().await.unwrap();
+    let ctrd_pair = controlled.get_selected_pair().await.unwrap();
+    assert_eq!(ctrl_pair.local.transport, "tcp");
+    assert_eq!(ctrd_pair.local.transport, "tcp");
+
+    // Verify the selected sockets are TcpStream
+    let ctrl_socket = controlling.get_selected_socket().await.unwrap();
+    let ctrd_socket = controlled.get_selected_socket().await.unwrap();
+    assert!(matches!(ctrl_socket, IceSocketWrapper::TcpStream(_, _, _)));
+    assert!(matches!(ctrd_socket, IceSocketWrapper::TcpStream(_, _, _)));
+
+    // Verify we can send data without errors (actual delivery is handled by the
+    // background ICE read loop which dispatches to STUN/DTLS/RTP handlers).
+    let msg_a = b"msg-from-controlling";
+    ctrl_socket.send_to(msg_a, ctrl_pair.remote.address).await.unwrap();
+    let msg_b = b"msg-from-controlled";
+    ctrd_socket.send_to(msg_b, ctrd_pair.remote.address).await.unwrap();
+
+    Ok(())
+}

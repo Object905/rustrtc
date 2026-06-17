@@ -9869,4 +9869,145 @@ a=mid:0
              reconnect so that the media bridge can be re-wired"
         );
     }
+
+    // WHEP answerer path: add_track_with_stream_id reuses the offer-created
+    // transceiver (which has a MID) instead of creating a second same-kind
+    // transceiver without a MID.
+    #[tokio::test]
+    async fn test_add_track_reuses_offer_transceiver_whep_answerer() {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+
+        let pc = PeerConnection::new(config);
+
+        // Remote offer with a single audio section
+        let offer_sdp = "\
+v=0
+o=- 12345 12345 IN IP4 192.168.1.100
+s=-
+c=IN IP4 192.168.1.100
+t=0 0
+m=audio 4000 RTP/AVP 111
+a=rtpmap:111 opus/48000/2
+a=mid:0
+";
+        let remote_offer = SessionDescription::parse(SdpType::Offer, offer_sdp).unwrap();
+        pc.set_remote_description(remote_offer).await.unwrap();
+
+        // Verify one transceiver was created from the offer
+        let transceiver_count = pc.inner.transceivers.lock().len();
+        assert_eq!(
+            transceiver_count, 1,
+            "Offer should create exactly one transceiver"
+        );
+
+        let offer_transceiver = pc.inner.transceivers.lock()[0].clone();
+        assert!(
+            offer_transceiver.mid().is_some(),
+            "Offer-created transceiver should have a MID"
+        );
+        assert!(
+            offer_transceiver.sender.lock().is_none(),
+            "Offer-created transceiver should not have a sender yet"
+        );
+
+        // Now call add_track_with_stream_id with an audio track
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 111,
+            clock_rate: 48000,
+            channels: 2,
+        };
+        let sender = pc
+            .add_track_with_stream_id(track, "stream1".to_string(), params)
+            .unwrap();
+
+        // Verify transceiver count is still 1 (reused, not duplicated)
+        let t_count = pc.inner.transceivers.lock().len();
+        assert_eq!(
+            t_count, 1,
+            "add_track_with_stream_id must reuse the offer transceiver, not create a new one"
+        );
+
+        // Verify the existing transceiver now has the sender
+        let transceiver = &pc.inner.transceivers.lock()[0];
+        let t_sender = transceiver.sender.lock();
+        assert!(
+            t_sender.is_some(),
+            "The reused transceiver should now have a sender"
+        );
+        if let Some(s) = t_sender.as_ref() {
+            assert_eq!(s.ssrc(), sender.ssrc(), "Sender SSRC should match");
+        }
+
+        // Also verify mid is preserved
+        assert_eq!(
+            transceiver.mid(),
+            Some("0".to_string()),
+            "MID should be preserved from offer"
+        );
+    }
+
+    // Same as above but with video — ensures the reuse works for both kinds.
+    #[tokio::test]
+    async fn test_add_track_reuses_offer_transceiver_video() {
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+
+        let pc = PeerConnection::new(config);
+
+        let offer_sdp = "\
+v=0
+o=- 12345 12345 IN IP4 192.168.1.100
+s=-
+c=IN IP4 192.168.1.100
+t=0 0
+m=video 4000 RTP/AVP 96
+a=rtpmap:96 VP8/90000
+a=mid:0
+";
+        let remote_offer = SessionDescription::parse(SdpType::Offer, offer_sdp).unwrap();
+        pc.set_remote_description(remote_offer).await.unwrap();
+
+        assert_eq!(pc.inner.transceivers.lock().len(), 1);
+
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Video, 90000);
+        let params = RtpCodecParameters {
+            payload_type: 96,
+            clock_rate: 90000,
+            channels: 0,
+        };
+        pc.add_track_with_stream_id(track, "stream1".to_string(), params)
+            .unwrap();
+
+        assert_eq!(
+            pc.inner.transceivers.lock().len(),
+            1,
+            "Should reuse the offer transceiver, not create a second one"
+        );
+    }
+
+    // If no offer transceiver exists, add_track_with_stream_id should fall
+    // back to creating a new transceiver (backward compat).
+    #[tokio::test]
+    async fn test_add_track_creates_new_transceiver_if_no_offer() {
+        let pc = PeerConnection::new(RtcConfiguration::default());
+
+        let (_, track, _) = sample_track(crate::media::frame::MediaKind::Audio, 48000);
+        let params = RtpCodecParameters {
+            payload_type: 111,
+            clock_rate: 48000,
+            channels: 2,
+        };
+        let _sender = pc
+            .add_track_with_stream_id(track, "stream1".to_string(), params)
+            .unwrap();
+
+        // Should have created a new transceiver (no offer exists)
+        assert_eq!(
+            pc.inner.transceivers.lock().len(),
+            1,
+            "Should create a new transceiver when no offer transceiver exists"
+        );
+    }
 }

@@ -662,6 +662,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UdpSocket;
     use tokio::sync::watch;
 
@@ -1168,5 +1170,157 @@ mod tests {
             second_src,
             "Should re-latch to new source after reset_latch()"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // TCP / RFC 4571 framing tests
+    // ---------------------------------------------------------------------------
+
+    /// Helper: bind a TCP listener and connect to it, returning the server-side
+    /// stream and a split client-side IceSocketWrapper::TcpStream.
+    async fn tcp_loopback_pair() -> (tokio::net::TcpStream, IceSocketWrapper) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let client_stream = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let (server_stream, _) = listener.accept().await.unwrap();
+
+        let wrapper = {
+            let (read, write) = client_stream.into_split();
+            IceSocketWrapper::TcpStream(
+                Arc::new(tokio::sync::Mutex::new(read)),
+                Arc::new(tokio::sync::Mutex::new(write)),
+                server_addr,
+            )
+        };
+
+        (server_stream, wrapper)
+    }
+
+    /// RFC 4571 framing round-trip: write framed data via IceSocketWrapper::TcpStream
+    /// and read it back on the raw server-side TCP socket.
+    #[tokio::test]
+    async fn test_tcp_rfc4571_framing_roundtrip() {
+        let (mut server_stream, wrapper) = tcp_loopback_pair().await;
+
+        let payload = b"hello rfc4571";
+        let len = payload.len() as u16;
+        let mut expected_frame = Vec::with_capacity(2 + payload.len());
+        expected_frame.extend_from_slice(&len.to_be_bytes());
+        expected_frame.extend_from_slice(payload);
+
+        // Send via wrapper
+        wrapper.send_to(payload, server_stream.local_addr().unwrap()).await.unwrap();
+
+        // Read framed data on server side
+        let mut len_buf = [0u8; 2];
+        let s = &mut server_stream;
+        s.read_exact(&mut len_buf).await.unwrap();
+        let frame_len = u16::from_be_bytes(len_buf) as usize;
+        let mut frame = vec![0u8; frame_len];
+        s.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, payload);
+    }
+
+    /// Send multiple messages via IceSocketWrapper::TcpStream; verify they arrive
+    /// correctly as separate RFC 4571 frames.
+    #[tokio::test]
+    async fn test_tcp_rfc4571_multiple_writes() {
+        let (mut server_stream, wrapper) = tcp_loopback_pair().await;
+
+        let msgs: &[&[u8]] = &[b"msg-a", b"msg-bb", b"msg-ccc"];
+        for msg in msgs {
+            wrapper.send_to(msg, server_stream.local_addr().unwrap()).await.unwrap();
+        }
+
+        let s = &mut server_stream;
+        for expected in msgs {
+            let mut len_buf = [0u8; 2];
+            s.read_exact(&mut len_buf).await.unwrap();
+            let frame_len = u16::from_be_bytes(len_buf) as usize;
+            let mut frame = vec![0u8; frame_len];
+            s.read_exact(&mut frame).await.unwrap();
+            assert_eq!(&frame, expected);
+        }
+    }
+
+    /// recv_from on IceSocketWrapper::TcpStream: write a valid RFC 4571 frame
+    /// to the server stream, then read it back via the wrapper.
+    #[tokio::test]
+    async fn test_tcp_recv_from_rfc4571() {
+        let (mut server_stream, wrapper) = tcp_loopback_pair().await;
+        let server_addr = server_stream.local_addr().unwrap();
+
+        let payload = b"recv-test-payload";
+        let len = payload.len() as u16;
+        let mut frame = Vec::with_capacity(2 + payload.len());
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(payload);
+
+        // Write from server side
+        server_stream.writable().await.unwrap();
+        let s = &mut server_stream;
+        s.write_all(&frame).await.unwrap();
+
+        // Read via wrapper recv_from
+        let mut buf = [0u8; 2048];
+        let (n, addr) = wrapper.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], payload);
+        assert_eq!(addr, server_addr);
+    }
+
+    /// send_dtls_record_batch over TCP sends RFC 4571-framed records in a single
+    /// syscall; verify all records arrive correctly on the server side.
+    #[tokio::test]
+    async fn test_send_dtls_record_batch_tcp() {
+        let (mut server_stream, wrapper) = tcp_loopback_pair().await;
+        let server_addr = server_stream.local_addr().unwrap();
+
+        let (socket_tx, socket_rx) = watch::channel(Some(wrapper));
+        let conn = IceConn::new(socket_rx, server_addr, Some("test-tcp".into()));
+        drop(socket_tx);
+
+        let records: Vec<Vec<u8>> = vec![
+            b"dtls-record-1".to_vec(),
+            b"dtls-record-22".to_vec(),
+            b"dtls-record-333".to_vec(),
+        ];
+
+        conn.send_dtls_record_batch(&records).await.unwrap();
+
+        let s = &mut server_stream;
+        for expected in &records {
+            let mut len_buf = [0u8; 2];
+            s.read_exact(&mut len_buf).await.unwrap();
+            let frame_len = u16::from_be_bytes(len_buf) as usize;
+            let mut frame = vec![0u8; frame_len];
+            s.read_exact(&mut frame).await.unwrap();
+            assert_eq!(&frame, expected.as_slice());
+        }
+    }
+
+    /// send_dtls_record_batch on a UDP socket should fall through to individual
+    /// send calls.  Verify all records arrive.
+    #[tokio::test]
+    async fn test_send_dtls_record_batch_udp_fallback() {
+        let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let wrapper = IceSocketWrapper::Udp(udp.clone());
+        let (socket_tx, socket_rx) = watch::channel(Some(wrapper));
+
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+
+        let conn = IceConn::new(socket_rx, receiver_addr, None);
+        drop(socket_tx);
+
+        let records: Vec<Vec<u8>> = vec![b"rec-a".to_vec(), b"rec-b".to_vec()];
+        conn.send_dtls_record_batch(&records).await.unwrap();
+
+        // Read all datagrams (may arrive as separate UDP packets)
+        let mut buf = [0u8; 2048];
+        for expected in &records {
+            let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..len], expected.as_slice());
+        }
     }
 }

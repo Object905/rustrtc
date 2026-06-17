@@ -2481,7 +2481,7 @@ fn split_tcp_stream(stream: TcpStream, peer: SocketAddr) -> IceSocketWrapper {
 pub(crate) async fn tcp_write_all(write: &Arc<Mutex<TcpWriteHalf>>, data: &[u8]) -> Result<()> {
     let mut offset = 0;
     while offset < data.len() {
-        let mut guard = write.lock().await;
+        let guard = write.lock().await;
         loop {
             match guard.try_write(&data[offset..]) {
                 Ok(0) => guard.writable().await?,
