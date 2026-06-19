@@ -408,6 +408,7 @@ fn apply_sack_to_sent_queue(
     gap_blocks: &[(u16, u16)],
     now: Instant,
     count_missing_reports: bool,
+    max_tsn_retransmits: u32,
 ) -> SackOutcome {
     let before_head = sent_queue.keys().next().cloned();
 
@@ -543,11 +544,10 @@ fn apply_sack_to_sent_queue(
                         record.fast_retransmit
                     );
                 }
-                const MAX_FAST_RETRANSMIT_COUNT: u32 = 5;
                 const MIN_FAST_RETRANSMIT_COOLDOWN_MS: u64 = 50; // Minimum 50ms between fast retransmits
 
                 let can_fast_retransmit = if record.fast_retransmit {
-                    if record.transmit_count >= MAX_FAST_RETRANSMIT_COUNT {
+                    if record.transmit_count >= max_tsn_retransmits {
                         false
                     } else if let Some(fr_time) = record.fast_retransmit_time {
                         let elapsed = now.duration_since(fr_time);
@@ -1688,6 +1688,7 @@ impl SctpInner {
                     &gap_blocks,
                     now,
                     count_missing_reports,
+                    self.max_tsn_retransmits,
                 )
             };
 
@@ -3488,7 +3489,7 @@ mod tests {
         );
 
         // Ack cumulative 10 and gap-ack 12, leaving 11 outstanding.
-        let outcome = apply_sack_to_sent_queue(&mut sent, 10, &[(2, 2)], Instant::now(), true);
+        let outcome = apply_sack_to_sent_queue(&mut sent, 10, &[(2, 2)], Instant::now(), true, 8);
 
         assert_eq!(outcome.flight_reduction, 2); // a cumulative-acked + c gap-acked
         assert_eq!(outcome.rtt_samples.len(), 2);
@@ -3532,14 +3533,14 @@ mod tests {
         let sack_gap = [(2u16, 2u16)];
         let mut outcome;
 
-        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true);
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true, 8);
         assert_eq!(outcome.retransmit.len(), 0);
         assert_eq!(sent.len(), 2); // 21 removed, 22 and 23 remain (23 acked)
 
-        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true);
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true, 8);
         assert_eq!(outcome.retransmit.len(), 0);
 
-        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true);
+        outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now(), true, 8);
         assert_eq!(outcome.retransmit.len(), 1);
         assert_eq!(outcome.retransmit[0].0, 22);
         let rec = sent.get(&22).unwrap();
@@ -5425,7 +5426,7 @@ mod tests {
             .store(12345, Ordering::SeqCst);
         sctp.inner.cumulative_tsn_ack.store(100, Ordering::SeqCst);
 
-        // Simulate a packet that has been fast retransmitted 5 times (at the limit)
+        // Simulate a packet that has been retransmitted up to the max_tsn_retransmits limit (8 by default)
         {
             let mut sent_queue = sctp.inner.sent_queue.lock();
             sent_queue.insert(
@@ -5433,7 +5434,7 @@ mod tests {
                 ChunkRecord {
                     payload: Bytes::from(vec![0u8; 1200]),
                     sent_time: Instant::now() - Duration::from_millis(500),
-                    transmit_count: 5, // At the MAX_FAST_RETRANSMIT_COUNT limit
+                    transmit_count: 8, // At the max_tsn_retransmits limit
                     missing_reports: 0,
                     needs_retransmit: false,
                     abandoned: false,
@@ -5498,10 +5499,10 @@ mod tests {
             sent_queue.get(&101).unwrap().transmit_count
         };
 
-        // transmit_count should NOT have increased because we're at MAX_FAST_RETRANSMIT_COUNT
+        // transmit_count should NOT have increased because we're at max_tsn_retransmits limit
         assert_eq!(
             initial_transmit_count, final_transmit_count,
-            "Fast retransmit should be blocked after MAX_FAST_RETRANSMIT_COUNT (5) attempts. initial={}, final={}",
+            "Fast retransmit should be blocked after max_tsn_retransmits (8) attempts. initial={}, final={}",
             initial_transmit_count, final_transmit_count
         );
 
@@ -5690,14 +5691,14 @@ mod tests {
         }
 
         // Third SACK triggers fast retransmit for TSN 10
-        let outcome = apply_sack_to_sent_queue(&mut sent, 9, &[(2, 4)], Instant::now(), true);
+        let outcome = apply_sack_to_sent_queue(&mut sent, 9, &[(2, 4)], Instant::now(), true, 8);
         assert!(
             !outcome.retransmit.is_empty(),
             "Should trigger fast retransmit for TSN 10"
         );
 
         // Now simulate: cumulative ACK advances past the exit TSN (all acked)
-        let outcome2 = apply_sack_to_sent_queue(&mut sent, 13, &[], Instant::now(), true);
+        let outcome2 = apply_sack_to_sent_queue(&mut sent, 13, &[], Instant::now(), true, 8);
         assert!(outcome2.bytes_acked_by_cum_tsn > 0);
 
         // The key verification: after processing the SACK that exits fast recovery,
@@ -5792,7 +5793,7 @@ mod tests {
 
         // Three SACKs to trigger fast retransmit (DUP_THRESH = 3)
         for i in 0..3 {
-            apply_sack_to_sent_queue(&mut sent, 19, &[(2, 2 + i as u16)], Instant::now(), true);
+            apply_sack_to_sent_queue(&mut sent, 19, &[(2, 2 + i as u16)], Instant::now(), true, 8);
         }
 
         // After fast retransmit triggers in apply_sack_to_sent_queue,
@@ -8331,7 +8332,7 @@ mod tests {
 
         // SACK with cumulative=99 (even older than lowest=100)
         // This should be filtered out as stale
-        let outcome = apply_sack_to_sent_queue(&mut sent, 99, &[], Instant::now(), true);
+        let outcome = apply_sack_to_sent_queue(&mut sent, 99, &[], Instant::now(), true, 8);
 
         // All packets should still be present (stale SACK ignored)
         assert_eq!(sent.len(), 6, "Stale SACK should not modify sent queue");
@@ -8842,10 +8843,10 @@ mod tests {
         }
 
         // First SACK
-        let _ = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), true);
+        let _ = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), true, 8);
 
         // Second SACK with same signature (count_missing_reports = false)
-        let outcome2 = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), false);
+        let outcome2 = apply_sack_to_sent_queue(&mut sent, 102, &[(3, 3)], Instant::now(), false, 8);
 
         // Missing reports should NOT have increased on duplicate SACK
         let rec_105 = sent.get(&105).unwrap();
