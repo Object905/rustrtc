@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Per-source-address state tracked during the latching probation period.
 ///
@@ -215,25 +215,8 @@ impl IceConn {
                 return Err(anyhow::anyhow!("Remote address not set"));
             }
             let n = socket.send_to(buf, remote).await?;
-            let tx_pkts = self.tx_packets.fetch_add(1, Ordering::Relaxed) + 1;
-            let tx_bytes = self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-            let is_rtp = buf.first().is_some_and(|b| (128..192).contains(b));
-            // RTP/RTCP might not be easy to identify reliably from the first byte.
-            // For TCP ICE debugging we log the first few outbound packets from the RTP
-            // path so we can confirm on-wire packet layout.
-            if tx_pkts <= 50 || (is_rtp && tx_pkts % 50 == 0) {
-                info!(
-                    label = ?self.label,
-                    socket = %socket.diag(),
-                    remote = %remote,
-                    len = buf.len(),
-                    is_rtp,
-                    first_byte = buf.first().copied().unwrap_or(0),
-                    tx_pkts,
-                    tx_bytes,
-                    "IceConn: sent outbound packet"
-                );
-            }
+            self.tx_packets.fetch_add(1, Ordering::Relaxed);
+            self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             Ok(n)
         } else {
             // Fallback: try to update if None
@@ -245,23 +228,8 @@ impl IceConn {
                     return Err(anyhow::anyhow!("Remote address not set"));
                 }
                 let n = socket.send_to(buf, remote).await?;
-                let tx_pkts = self.tx_packets.fetch_add(1, Ordering::Relaxed) + 1;
-                let tx_bytes = self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-                let is_rtp = buf.first().is_some_and(|b| (128..192).contains(b));
-                if tx_pkts <= 50 || (is_rtp && tx_pkts % 50 == 0) {
-                    info!(
-                        label = ?self.label,
-                        socket = %socket.diag(),
-                        remote = %remote,
-                        len = buf.len(),
-                        is_rtp,
-                        first_byte = buf.first().copied().unwrap_or(0),
-                        tx_pkts,
-                        tx_bytes,
-                        fallback_socket = true,
-                        "IceConn: sent outbound packet"
-                    );
-                }
+                self.tx_packets.fetch_add(1, Ordering::Relaxed);
+                self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(n)
             } else {
                 tracing::warn!("IceConn: send failed - no selected socket");
@@ -298,8 +266,8 @@ impl IceConn {
         };
 
         let total_payload: usize = records.iter().map(|r| r.len()).sum();
-        let prev_tx_pkts = self.tx_packets.load(Ordering::Relaxed);
-        let tx_pkts = self.tx_packets.fetch_add(records.len() as u64, Ordering::Relaxed) + records.len() as u64;
+        self.tx_packets
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
 
         match &socket {
             IceSocketWrapper::TcpStream(_, write, _) => {
@@ -312,19 +280,8 @@ impl IceConn {
                     framed.extend_from_slice(record);
                 }
                 super::tcp_write_all(write, &framed).await?;
-                let tx_bytes = self.tx_bytes.fetch_add(framed.len() as u64, Ordering::Relaxed) + framed.len() as u64;
-                if prev_tx_pkts < 5 {
-                    info!(
-                        label = ?self.label,
-                        socket = %socket.diag(),
-                        remote = %remote,
-                        records = records.len(),
-                        framed_len = framed.len(),
-                        tx_pkts,
-                        tx_bytes,
-                        "IceConn: sent outbound DTLS record batch"
-                    );
-                }
+                self.tx_bytes
+                    .fetch_add(framed.len() as u64, Ordering::Relaxed);
                 Ok(total_payload)
             }
             _ => {
@@ -389,7 +346,6 @@ impl PacketReceiver for IceConn {
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
         self.rx_bytes
             .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        let rx_pkts = self.rx_packets.load(Ordering::Relaxed);
 
         let first_byte = packet[0];
         // Scope for read lock
@@ -425,15 +381,6 @@ impl PacketReceiver for IceConn {
 
         if (20..64).contains(&first_byte) {
             // DTLS
-            if rx_pkts <= 3 {
-                info!(
-                    label = ?self.label,
-                    from = %addr,
-                    len = packet.len(),
-                    rx_pkts,
-                    "IceConn: received DTLS packet"
-                );
-            }
             let receiver = {
                 let rx_lock = self.dtls_receiver.read();
                 if let Some(rx) = &*rx_lock {
@@ -452,15 +399,6 @@ impl PacketReceiver for IceConn {
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
             let is_rtcp = packet.len() >= 2 && (200..=211).contains(&packet[1]);
-            if !is_rtcp && rx_pkts <= 5 {
-                info!(
-                    label = ?self.label,
-                    from = %addr,
-                    len = packet.len(),
-                    rx_pkts,
-                    "IceConn: received RTP packet"
-                );
-            }
 
             if self.latch_on_rtp.load(Ordering::Relaxed) {
                 if is_rtcp {

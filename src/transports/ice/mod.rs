@@ -1558,14 +1558,38 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     use futures::stream::StreamExt;
     let mut successful_pairs: Vec<IceCandidatePair> = Vec::new();
 
-    while let Some(res) = checks.next().await {
-        if let Some(pair) = res {
-            // Skip duplicates (same local+remote already collected)
-            let key = (pair.local.address, pair.remote.address);
-            if successful_pairs.iter().any(|p| (p.local.address, p.remote.address) == key) {
-                continue;
+    // Collect successful pairs. Once the first usable pair arrives, only wait a
+    // short grace window for additional (possibly higher-priority) pairs before
+    // proceeding to nomination. This keeps a single unreachable candidate (e.g.
+    // a stale LAN host candidate returning EHOSTDOWN/EHOSTUNREACH) from stalling
+    // connection setup for the full STUN timeout — all checks still run
+    // concurrently, but nomination is no longer gated on the slowest failing pair.
+    const NOMINATION_GRACE: Duration = Duration::from_millis(200);
+    loop {
+        let next = if successful_pairs.is_empty() {
+            checks.next().await
+        } else {
+            tokio::select! {
+                biased;
+                res = checks.next() => res,
+                _ = tokio::time::sleep(NOMINATION_GRACE) => break,
             }
-            successful_pairs.push(pair);
+        };
+
+        match next {
+            Some(pair) => {
+                if let Some(pair) = pair {
+                    // Skip duplicates (same local+remote already collected)
+                    let key = (pair.local.address, pair.remote.address);
+                    if !successful_pairs
+                        .iter()
+                        .any(|p| (p.local.address, p.remote.address) == key)
+                    {
+                        successful_pairs.push(pair);
+                    }
+                }
+            }
+            None => break,
         }
     }
 
@@ -2303,10 +2327,6 @@ async fn perform_binding_check(
                                 Ok(Ok(msg)) => {
                                     if msg.class == StunClass::SuccessResponse {
                                         client_clone.add_channel(remote_addr, channel_num).await;
-                                        debug!(
-                                            "TURN ChannelBound: {} -> {}",
-                                            remote_addr, channel_num
-                                        );
                                     }
                                 }
                                 _ => {
@@ -2405,10 +2425,6 @@ async fn perform_binding_check(
                 }
                 // Transient error (e.g., EHOSTUNREACH / os error 65 during route setup).
                 // Treat as a dropped send — wait for next RTO and retry.
-                debug!(
-                    "socket.send_to {} transient error, will retry: {}",
-                    remote.address, e
-                );
             }
         }
 
