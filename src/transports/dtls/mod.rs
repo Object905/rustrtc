@@ -183,6 +183,15 @@ struct DtlsInner {
     expected_remote_fingerprint: Option<String>,
 }
 
+/// Maximum time to wait for the DTLS handshake to complete before giving up.
+/// After this deadline the transport transitions to `Failed` and the background
+/// task exits — preventing infinite retransmit loops when the peer never
+/// responds.
+#[cfg(not(test))]
+const DTLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const DTLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct DtlsTransport {
     inner: Arc<DtlsInner>,
     close_tx: Arc<tokio::sync::Notify>,
@@ -292,7 +301,7 @@ impl DtlsTransport {
     }
 
     pub fn close(&self) {
-        self.close_tx.notify_waiters();
+        self.close_tx.notify_one();
     }
 
     pub async fn send(&self, data: Bytes) -> Result<()> {
@@ -389,7 +398,7 @@ impl DtlsTransport {
 
 impl Drop for DtlsTransport {
     fn drop(&mut self) {
-        self.close_tx.notify_waiters();
+        self.close_tx.notify_one();
     }
 }
 
@@ -400,7 +409,10 @@ impl DtlsInner {
         }
         if let Some(records) = &ctx.last_flight_records {
             if let Err(e) = self.conn.send_dtls_record_batch(records).await {
-                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                let msg = format!("{:?}", e);
+                if msg.contains("No selected socket") || msg.contains("Remote address not set") {
+                    debug!("Retransmission skipped — ICE socket unavailable");
+                } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                     match io_err.kind() {
                         std::io::ErrorKind::HostUnreachable
                         | std::io::ErrorKind::NetworkUnreachable => {
@@ -410,12 +422,12 @@ impl DtlsInner {
                             if io_err.raw_os_error() == Some(65) {
                                 debug!("Retransmission failed: {}", e);
                             } else {
-                                warn!("Retransmission failed: {}", e);
+                                debug!("Retransmission failed: {}", e);
                             }
                         }
                     }
                 } else {
-                    warn!("Retransmission failed: {}", e);
+                    debug!("Retransmission failed: {}", e);
                 }
             }
         }
@@ -1674,6 +1686,16 @@ impl DtlsInner {
         );
         retransmit_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Watch the ICE socket so we can detect peer disappearance immediately
+        // rather than spinning on retransmits forever.
+        let mut socket_rx = self.conn.socket_rx.clone();
+
+        // Handshake deadline — prevents the task from living forever if the peer
+        // never responds.  Once `Connected` the deadline is disabled.
+        let handshake_deadline = tokio::time::Instant::now() + DTLS_HANDSHAKE_TIMEOUT;
+        let handshake_timeout = tokio::time::sleep_until(handshake_deadline);
+        tokio::pin!(handshake_timeout);
+
         if is_client {
             // Send ClientHello
             let random = Random::new();
@@ -1722,6 +1744,34 @@ impl DtlsInner {
         }
 
         loop {
+            // Definitive ICE-socket check at the top of every iteration.
+            //
+            // We cannot rely solely on `socket_rx.changed()` inside the select!
+            // because polling `changed()` marks the value as seen — if another
+            // branch wins the select! race, the Some→None transition is silently
+            // consumed and never re-delivered.  Using `borrow()` (which does NOT
+            // update the seen version) here as the authoritative check guarantees
+            // we never miss the transition regardless of select! racing.
+            if socket_rx.borrow().is_none() {
+                let is_handshaking =
+                    matches!(*self.state.lock(), DtlsState::Handshaking);
+                if is_handshaking {
+                    warn!("ICE socket closed during DTLS handshake — aborting");
+                    *self.state.lock() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(anyhow::anyhow!(
+                        "ICE socket closed during DTLS handshake"
+                    ));
+                } else {
+                    debug!(
+                        "ICE socket closed after DTLS connected — closing transport"
+                    );
+                    *self.state.lock() = DtlsState::Closed;
+                    let _ = self.state_tx.send(DtlsState::Closed);
+                    return Ok(());
+                }
+            }
+
             tokio::select! {
                 _ = close_rx.notified() => {
                     // Send CloseNotify
@@ -1755,10 +1805,34 @@ impl DtlsInner {
                     }
                     return Ok(());
                 }
+                // Handshake timeout — abort if the peer never responds.
+                _ = &mut handshake_timeout, if matches!(*self.state.lock(), DtlsState::Handshaking) => {
+                    warn!(
+                        "DTLS handshake timed out after {}s — aborting",
+                        DTLS_HANDSHAKE_TIMEOUT.as_secs()
+                    );
+                    *self.state.lock() = DtlsState::Failed;
+                    let _ = self.state_tx.send(DtlsState::Failed);
+                    return Err(anyhow::anyhow!(
+                        "DTLS handshake timed out after {}s",
+                        DTLS_HANDSHAKE_TIMEOUT.as_secs()
+                    ));
+                }
+                // ICE socket watch — just wake up; the top-of-loop borrow()
+                // check makes the actual exit decision.  This avoids the
+                // select!-race where changed() updates the seen version but
+                // another branch wins.
+                _ = socket_rx.changed() => {
+                    // fall through — loop head re-checks socket_rx.borrow()
+                }
                 _ = retransmit_interval.tick() => {
                     self.handle_retransmit(&ctx, is_client).await;
                 }
-                Some(packet) = handshake_rx.recv() => {
+                packet = handshake_rx.recv() => {
+                    let Some(packet) = packet else {
+                        debug!("DTLS handshake feeder closed — exiting loop");
+                        return Ok(());
+                    };
                     if let Err(e) = self.handle_incoming_packet(packet, &mut ctx, &incoming_data_tx, &certificate, is_client).await {
                         warn!("DTLS handshake loop error in handle_incoming_packet: {}", e);
                         // Bad records can be ignored, but once verification has

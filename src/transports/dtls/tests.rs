@@ -3,6 +3,7 @@ use crate::transports::PacketReceiver;
 use crate::transports::ice::IceSocketWrapper;
 use bytes::Bytes;
 use serial_test::serial;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -431,6 +432,197 @@ async fn test_dtls_handshake_no_fingerprint_skips_check() -> Result<()> {
         wait_for_terminal_state(&server_dtls).await?,
         DtlsState::Connected(..)
     ));
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the DTLS retransmit / memory-leak fix.
+//
+// Before the fix, the DTLS handshake task would spin forever once the ICE
+// socket disappeared, logging "no selected socket" warnings every second and
+// holding its `Arc<DtlsInner>` / `Arc<IceConn>` alive indefinitely (a memory
+// leak + log spam).
+//
+// These tests verify that the task now exits promptly when:
+//   1. The ICE socket watch channel transitions to `None`.
+//   2. No peer ever responds to the ClientHello (handshake timeout).
+//   3. The socket is cleared AFTER a successful handshake.
+//   4. close() is called during handshake.
+// ---------------------------------------------------------------------------
+
+/// When the ICE socket is cleared (simulating `IceTransport::stop()`), the
+/// DTLS handshake task must exit within a couple of retransmit intervals
+/// and transition to `Failed`.
+#[tokio::test]
+async fn test_dtls_exits_when_ice_socket_cleared() -> Result<()> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr: SocketAddr = "127.0.0.1:9".parse()?; // discard port — nobody listens
+
+    let (socket_tx, _rx) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let conn = IceConn::new(socket_tx.subscribe(), server_addr, None);
+    let cert = generate_certificate()?;
+
+    let (dtls, _rx, runner) = DtlsTransport::new(conn, cert, true, 1500, None).await?;
+    let task = tokio::spawn(runner);
+
+    // Give the client time to send its ClientHello and enter the retransmit
+    // loop.  500 ms is well within the first 1-second retransmit window.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Simulate ICE stopping — the selected socket goes to None.
+    socket_tx.send(None)?;
+
+    // The task must exit (not spin forever).  If the fix is missing it will
+    // hang indefinitely and the timeout below will fire.
+    let deadline = std::time::Duration::from_secs(5);
+    let result = tokio::time::timeout(deadline, task).await;
+
+    assert!(
+        result.is_ok(),
+        "DTLS handshake task did NOT exit within {deadline:?} after ICE socket was cleared — \
+         this is the memory-leak / log-spam regression"
+    );
+
+    // The state must be `Failed` (we were still handshaking).
+    assert!(
+        matches!(dtls.get_state(), DtlsState::Failed),
+        "expected DtlsState::Failed after ICE socket cleared, got {}",
+        dtls.get_state()
+    );
+
+    Ok(())
+}
+
+/// When no peer ever responds, the handshake must time out and the task must
+/// exit instead of retransmitting forever.
+#[tokio::test]
+async fn test_dtls_handshake_timeout_on_no_response() -> Result<()> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    // Port 9 (discard) — packets are sent but nobody answers.
+    let server_addr: SocketAddr = "127.0.0.1:9".parse()?;
+
+    let (socket_tx, _rx) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let conn = IceConn::new(socket_tx.subscribe(), server_addr, None);
+    let cert = generate_certificate()?;
+
+    let (dtls, _rx, runner) = DtlsTransport::new(conn, cert, true, 1500, None).await?;
+    let task = tokio::spawn(runner);
+
+    // In test mode the timeout is 5 s; allow generous margin.
+    let deadline = std::time::Duration::from_secs(10);
+    let result = tokio::time::timeout(deadline, task).await;
+
+    assert!(
+        result.is_ok(),
+        "DTLS handshake task did NOT time out within {deadline:?} — \
+         the handshake-timeout fix is missing"
+    );
+
+    assert!(
+        matches!(dtls.get_state(), DtlsState::Failed),
+        "expected DtlsState::Failed after handshake timeout, got {}",
+        dtls.get_state()
+    );
+
+    Ok(())
+}
+
+/// After a successful handshake, clearing the ICE socket (peer disconnected)
+/// must transition the transport to `Closed` and the task must exit — not
+/// continue running in the background forever.
+#[tokio::test]
+async fn test_dtls_exits_after_connected_when_ice_socket_cleared() -> Result<()> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+
+    let client_addr = client_socket.local_addr()?;
+    let server_addr = server_socket.local_addr()?;
+
+    let (client_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(client_socket.clone())));
+    let client_conn = IceConn::new(client_socket_tx.subscribe(), server_addr, None);
+
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
+
+    let client_cert = generate_certificate()?;
+    let server_cert = generate_certificate()?;
+
+    let (client_dtls, _client_rx, client_runner) = DtlsTransport::new(
+        client_conn.clone(),
+        client_cert,
+        true,
+        1500,
+        Some(fingerprint(&server_cert)),
+    )
+    .await?;
+    let client_task = tokio::spawn(client_runner);
+    let (server_dtls, _server_rx, server_runner) =
+        DtlsTransport::new(server_conn.clone(), server_cert, false, 1500, None).await?;
+    tokio::spawn(server_runner);
+
+    spawn_socket_pump(client_socket, client_conn);
+    spawn_socket_pump(server_socket, server_conn);
+
+    // Wait for both sides to reach Connected.
+    assert!(matches!(
+        wait_for_terminal_state(&client_dtls).await?,
+        DtlsState::Connected(..)
+    ));
+    assert!(matches!(
+        wait_for_terminal_state(&server_dtls).await?,
+        DtlsState::Connected(..)
+    ));
+
+    // Simulate ICE stopping on the client side.
+    client_socket_tx.send(None)?;
+
+    // The client DTLS task must transition to Closed and exit.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client_task,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "Client DTLS task did NOT exit after ICE socket was cleared post-Connected"
+    );
+    assert!(
+        matches!(client_dtls.get_state(), DtlsState::Closed),
+        "expected DtlsState::Closed, got {}",
+        client_dtls.get_state()
+    );
+
+    // Cleanup server side.
+    server_dtls.close();
+    Ok(())
+}
+
+/// `DtlsTransport::close()` must reliably stop the handshake task, even when
+/// called during the `Handshaking` phase.  This guards against the
+/// `notify_waiters` → `notify_one` race fix.
+#[tokio::test]
+async fn test_dtls_close_during_handshake_exits_task() -> Result<()> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr: SocketAddr = "127.0.0.1:9".parse()?;
+
+    let (socket_tx, _rx) = watch::channel(Some(IceSocketWrapper::Udp(client_socket)));
+    let conn = IceConn::new(socket_tx.subscribe(), server_addr, None);
+    let cert = generate_certificate()?;
+
+    let (dtls, _rx, runner) = DtlsTransport::new(conn, cert, true, 1500, None).await?;
+    let task = tokio::spawn(runner);
+
+    // Let the ClientHello be sent.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    dtls.close();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+    assert!(
+        result.is_ok(),
+        "DTLS task did NOT exit within 3s after close() — notify_one race?"
+    );
 
     Ok(())
 }

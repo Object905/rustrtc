@@ -232,7 +232,7 @@ impl IceConn {
                 self.tx_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 Ok(n)
             } else {
-                tracing::warn!("IceConn: send failed - no selected socket");
+                tracing::debug!("IceConn: send failed - no selected socket");
                 Err(anyhow::anyhow!("No selected socket"))
             }
         }
@@ -261,7 +261,7 @@ impl IceConn {
         }
 
         let Some(socket) = socket_opt else {
-            tracing::warn!("IceConn: send_dtls_record_batch failed - no selected socket");
+            tracing::debug!("IceConn: send_dtls_record_batch failed - no selected socket");
             return Err(anyhow::anyhow!("No selected socket"));
         };
 

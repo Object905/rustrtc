@@ -1629,6 +1629,14 @@ impl PeerConnection {
             sctp_runner = Box::pin(std::future::pending());
         }
 
+        // Close any previous DTLS transport so its background handshake/packet
+        // task stops instead of being orphaned (which caused a memory leak and
+        // the “no selected socket” retransmit log spam every second).
+        if let Some(old_dtls) = self.inner.dtls_transport.lock().take() {
+            debug!("Closing previous DTLS transport before creating a new one");
+            old_dtls.close();
+        }
+
         *self.inner.dtls_transport.lock() = Some(dtls.clone());
 
         let dtls_clone = dtls.clone();
