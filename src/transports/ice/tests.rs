@@ -2797,7 +2797,10 @@ fn test_ice_tcp_candidate_sdp_roundtrip() {
     let addr: SocketAddr = "192.168.1.100:3478".parse().unwrap();
     let cand = IceCandidate::host_tcp(addr, 1, TcpType::Passive);
     let sdp = cand.to_sdp();
-    assert!(sdp.contains("tcptype passive"), "SDP should contain tcptype passive");
+    assert!(
+        sdp.contains("tcptype passive"),
+        "SDP should contain tcptype passive"
+    );
     assert!(sdp.contains("tcp"), "SDP transport should be tcp");
     assert!(sdp.contains("host"), "SDP type should be host");
 
@@ -2874,15 +2877,23 @@ async fn test_ice_tcp_pair_formation() -> Result<()> {
     // Wait for gathering
     let mut g1 = t1.subscribe_gathering_state();
     let mut g2 = t2.subscribe_gathering_state();
-    wait_ice_connected_or_timeout(&mut g1, Duration::from_secs(2), IceGathererState::Complete).await;
-    wait_ice_connected_or_timeout(&mut g2, Duration::from_secs(2), IceGathererState::Complete).await;
+    wait_ice_connected_or_timeout(&mut g1, Duration::from_secs(2), IceGathererState::Complete)
+        .await;
+    wait_ice_connected_or_timeout(&mut g2, Duration::from_secs(2), IceGathererState::Complete)
+        .await;
 
     let locals1 = t1.local_candidates();
     let locals2 = t2.local_candidates();
 
     // Both sides should have TCP candidates
-    assert!(locals1.iter().any(|c| c.transport == "tcp"), "t1 should have TCP candidates");
-    assert!(locals2.iter().any(|c| c.transport == "tcp"), "t2 should have TCP candidates");
+    assert!(
+        locals1.iter().any(|c| c.transport == "tcp"),
+        "t1 should have TCP candidates"
+    );
+    assert!(
+        locals2.iter().any(|c| c.transport == "tcp"),
+        "t2 should have TCP candidates"
+    );
 
     // Add TCP candidates as remote
     for c in locals1.iter().filter(|c| c.transport == "tcp") {
@@ -2897,8 +2908,14 @@ async fn test_ice_tcp_pair_formation() -> Result<()> {
 
     assert!(!remote1.is_empty(), "t1 should have remote TCP candidates");
     assert!(!remote2.is_empty(), "t2 should have remote TCP candidates");
-    assert!(remote1.iter().all(|c| c.transport == "tcp"), "t1 remotes should all be TCP");
-    assert!(remote2.iter().all(|c| c.transport == "tcp"), "t2 remotes should all be TCP");
+    assert!(
+        remote1.iter().all(|c| c.transport == "tcp"),
+        "t1 remotes should all be TCP"
+    );
+    assert!(
+        remote2.iter().all(|c| c.transport == "tcp"),
+        "t2 remotes should all be TCP"
+    );
 
     // Verify that forming pairs using ICE pair logic would work
     for local in &locals1 {
@@ -2951,7 +2968,10 @@ async fn test_ice_tcp_disabled_gathers_udp_only() -> Result<()> {
             "With TCP disabled, all candidates should be UDP, got {:?} at {}",
             candidate.transport, candidate.address
         );
-        assert!(candidate.tcp_type.is_none(), "TCP candidates should not exist when TCP is disabled");
+        assert!(
+            candidate.tcp_type.is_none(),
+            "TCP candidates should not exist when TCP is disabled"
+        );
     }
 
     Ok(())
@@ -2977,7 +2997,10 @@ async fn test_ice_tcp_gathers_tcp_candidates() -> Result<()> {
 
     for candidate in &candidates {
         if candidate.transport == "tcp" {
-            assert!(candidate.tcp_type.is_some(), "TCP candidate should have tcptype set");
+            assert!(
+                candidate.tcp_type.is_some(),
+                "TCP candidate should have tcptype set"
+            );
             assert_eq!(
                 candidate.tcp_type,
                 Some(TcpType::Passive),
@@ -3091,8 +3114,14 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
     let ctrl_locals = controlling.local_candidates();
     let ctrd_locals = controlled.local_candidates();
 
-    assert!(!ctrl_locals.is_empty(), "Controlling should have local candidates");
-    assert!(!ctrd_locals.is_empty(), "Controlled should have local candidates");
+    assert!(
+        !ctrl_locals.is_empty(),
+        "Controlling should have local candidates"
+    );
+    assert!(
+        !ctrd_locals.is_empty(),
+        "Controlled should have local candidates"
+    );
     assert!(
         ctrl_locals.iter().any(|c| c.transport == "tcp"),
         "Controlling should have TCP candidates"
@@ -3167,7 +3196,10 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
 
     // Send a test message to verify data flow
     let test_data = b"test-data-over-tcp";
-    wrapper.send_to(test_data, pair.remote.address).await.unwrap();
+    wrapper
+        .send_to(test_data, pair.remote.address)
+        .await
+        .unwrap();
 
     Ok(())
 }
@@ -3230,16 +3262,8 @@ async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
         .start(controlling.local_parameters())
         .expect("controlled.start");
 
-    let ctrl_ok = wait_ice_connected(
-        controlling.subscribe_state(),
-        Duration::from_secs(15),
-    )
-    .await;
-    let ctrd_ok = wait_ice_connected(
-        controlled.subscribe_state(),
-        Duration::from_secs(15),
-    )
-    .await;
+    let ctrl_ok = wait_ice_connected(controlling.subscribe_state(), Duration::from_secs(15)).await;
+    let ctrd_ok = wait_ice_connected(controlled.subscribe_state(), Duration::from_secs(15)).await;
 
     assert!(ctrl_ok, "Controlling should connect over TCP");
     assert!(ctrd_ok, "Controlled should connect over TCP");
@@ -3259,9 +3283,281 @@ async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
     // Verify we can send data without errors (actual delivery is handled by the
     // background ICE read loop which dispatches to STUN/DTLS/RTP handlers).
     let msg_a = b"msg-from-controlling";
-    ctrl_socket.send_to(msg_a, ctrl_pair.remote.address).await.unwrap();
+    ctrl_socket
+        .send_to(msg_a, ctrl_pair.remote.address)
+        .await
+        .unwrap();
     let msg_b = b"msg-from-controlled";
-    ctrd_socket.send_to(msg_b, ctrd_pair.remote.address).await.unwrap();
+    ctrd_socket
+        .send_to(msg_b, ctrd_pair.remote.address)
+        .await
+        .unwrap();
 
+    Ok(())
+}
+
+// =============================================================================
+// ICE UDP Mux (single-port multiplexing) tests
+// =============================================================================
+
+/// Grab a free UDP port on the loopback interface (best-effort; tests are
+/// `#[serial]` to avoid collisions on the process-wide mux registry).
+fn pick_free_udp_port() -> u16 {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.local_addr().unwrap().port()
+}
+
+/// Direct test of the shared UDP demux loop: two sessions register distinct
+/// ufrags on the same socket, and a STUN Binding Request is routed to the
+/// session named in USERNAME. Non-STUN packets then follow the learned
+/// peer→ufrag mapping.
+#[tokio::test]
+#[serial]
+async fn shared_udp_demux_routes_by_ufrag_and_peer_addr() -> Result<()> {
+    let port = pick_free_udp_port();
+    let bind_addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+
+    // Register two sessions on the same shared socket.
+    let (local1, h1, reg1) = shared_udp::acquire(bind_addr, "ufrag1".into()).await?;
+    let (local2, h2, reg2) = shared_udp::acquire(bind_addr, "ufrag2".into()).await?;
+    assert_eq!(local1, local2, "both sessions must share one socket");
+    assert_eq!(shared_udp::session_count(bind_addr), 2);
+
+    // Build a STUN Binding Request whose USERNAME targets ufrag1.
+    let sender_sock = UdpSocket::bind("127.0.0.1:0").await?;
+    let peer_addr = sender_sock.local_addr()?;
+    let tx_id = random_bytes::<12>();
+    let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
+    msg.attributes
+        .push(StunAttribute::Username("ufrag1:clientfrag".into()));
+    let bytes = msg.encode(None, false)?;
+    sender_sock.send_to(&bytes, local1).await?;
+
+    // ufrag1 receives it; ufrag2 must not.
+    let (data, from) = timeout(Duration::from_secs(2), h1.recv())
+        .await
+        .context("ufrag1 did not receive demuxed STUN request")?
+        .expect("channel closed");
+    assert_eq!(from, peer_addr);
+    assert_eq!(data, bytes);
+    assert!(
+        timeout(Duration::from_millis(150), h2.recv())
+            .await
+            .is_err(),
+        "ufrag2 must not receive ufrag1's traffic"
+    );
+
+    // The peer routing table now maps peer_addr -> ufrag1, so a subsequent
+    // non-STUN packet (first byte >= 2) from the same source routes by addr.
+    let rtp_like: Vec<u8> = vec![0x80, 0x60, 0x00, 0x01];
+    sender_sock.send_to(&rtp_like, local1).await?;
+    let (data2, from2) = timeout(Duration::from_secs(2), h1.recv())
+        .await
+        .context("ufrag1 did not receive routed non-STUN packet")?
+        .expect("channel closed");
+    assert_eq!(from2, peer_addr);
+    assert_eq!(data2, rtp_like);
+    assert_eq!(
+        shared_udp::ufrag_for_peer(bind_addr, peer_addr).as_deref(),
+        Some("ufrag1")
+    );
+
+    // Outbound send through a handle records the destination so that replies
+    // to locally-initiated traffic route back (simulates a controlled agent's
+    // own STUN connectivity check whose response carries no ufrag).
+    h1.send_to(&[0x80, 0x00], peer_addr).await?;
+    assert_eq!(
+        shared_udp::ufrag_for_peer(bind_addr, peer_addr).as_deref(),
+        Some("ufrag1"),
+        "outbound send_to must (re)record the peer mapping"
+    );
+
+    // Dropping reg1 removes the session and its peer entries.
+    drop(reg1);
+    assert_eq!(shared_udp::session_count(bind_addr), 1);
+    assert_eq!(shared_udp::ufrag_for_peer(bind_addr, peer_addr), None);
+
+    drop(reg2);
+    assert_eq!(shared_udp::session_count(bind_addr), 0);
+    Ok(())
+}
+
+/// End-to-end: a controlled PeerConnection with `ice_udp_mux` enabled shares a
+/// single UDP port, and a normal controlling PeerConnection connects to it.
+#[tokio::test]
+#[serial]
+async fn ice_udp_mux_connects_through_shared_port() -> Result<()> {
+    let port = pick_free_udp_port();
+
+    let mut controlled_cfg = RtcConfiguration::default();
+    controlled_cfg.ice_udp_mux = true;
+    controlled_cfg.ice_udp_mux_port = Some(port);
+    controlled_cfg.bind_ip = Some("127.0.0.1".into());
+
+    let mut controlling_cfg = RtcConfiguration::default();
+    controlling_cfg.bind_ip = Some("127.0.0.1".into());
+
+    let (controlled, runner_d) = IceTransportBuilder::new(controlled_cfg)
+        .role(IceRole::Controlled)
+        .build();
+    let (controlling, runner_c) = IceTransportBuilder::new(controlling_cfg)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(runner_d);
+    tokio::spawn(runner_c);
+
+    // Wait for gathering to complete on both sides (poll the gatherer's state
+    // directly — see note in `ice_udp_mux_two_sessions_share_one_port`).
+    for t in [&controlled, &controlling] {
+        timeout(Duration::from_secs(5), async {
+            while t.gather_state() != IceGathererState::Complete {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("gathering did not complete in time")?;
+    }
+
+    // The mux side advertises exactly one UDP host candidate on the mux port.
+    let mux_cand = controlled
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.transport == "udp" && c.typ == IceCandidateType::Host)
+        .expect("controlled mux side must advertise a UDP host candidate");
+    assert_eq!(mux_cand.address.port(), port);
+
+    // Exchange candidates both ways (initial batch + trickle).
+    for c in controlled.local_candidates() {
+        controlling.add_remote_candidate(c);
+    }
+    for c in controlling.local_candidates() {
+        controlled.add_remote_candidate(c);
+    }
+    let cc = controlling.clone();
+    let dc = controlled.clone();
+    let mut crx = controlling.subscribe_candidates();
+    let mut drx = controlled.subscribe_candidates();
+    tokio::spawn(async move {
+        while let Ok(c) = crx.recv().await {
+            dc.add_remote_candidate(c);
+        }
+    });
+    tokio::spawn(async move {
+        while let Ok(c) = drx.recv().await {
+            cc.add_remote_candidate(c);
+        }
+    });
+
+    controlling.start(controlled.local_parameters())?;
+    controlled.start(controlling.local_parameters())?;
+
+    let wait_connected = |mut rx: watch::Receiver<IceTransportState>| async move {
+        loop {
+            if *rx.borrow_and_update() == IceTransportState::Connected {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if rx.changed().await.is_err() {
+                anyhow::bail!("state channel closed");
+            }
+        }
+    };
+
+    timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            wait_connected(controlling.subscribe_state()),
+            wait_connected(controlled.subscribe_state()),
+        ),
+    )
+    .await
+    .context("timed out waiting for ICE connection through UDP mux")??;
+
+    // The controlled side must send/receive via the shared UDP socket.
+    let selected = controlled.get_selected_socket().await.unwrap();
+    assert!(
+        matches!(selected, IceSocketWrapper::SharedUdp(_)),
+        "controlled mux side should use the shared UDP socket, got: {}",
+        selected.diag()
+    );
+
+    controlled.stop();
+    controlling.stop();
+    Ok(())
+}
+
+/// Two controlled PeerConnections can register on the same mux port at once:
+/// both advertise the same host address but distinct ufrags, and the process-
+/// wide registry holds both sessions.
+#[tokio::test]
+#[serial]
+async fn ice_udp_mux_two_sessions_share_one_port() -> Result<()> {
+    let port = pick_free_udp_port();
+
+    fn mux_config(port: u16) -> RtcConfiguration {
+        let mut cfg = RtcConfiguration::default();
+        cfg.ice_udp_mux = true;
+        cfg.ice_udp_mux_port = Some(port);
+        cfg.bind_ip = Some("127.0.0.1".into());
+        cfg
+    }
+
+    let (a, ra) = IceTransportBuilder::new(mux_config(port))
+        .role(IceRole::Controlled)
+        .build();
+    let (b, rb) = IceTransportBuilder::new(mux_config(port))
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(ra);
+    tokio::spawn(rb);
+
+    // Both finish gathering on the shared socket. Poll the gatherer's internal
+    // state directly (the gathering_state watch can miss the Complete update if
+    // no receiver was subscribed at send time — a pre-existing watch quirk).
+    for t in [&a, &b] {
+        timeout(Duration::from_secs(5), async {
+            while t.gather_state() != IceGathererState::Complete {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("gathering did not complete in time")?;
+    }
+
+    // The registry now holds two sessions on the same bind address.
+    let bind_addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    assert_eq!(shared_udp::session_count(bind_addr), 2);
+
+    // Both advertise the same host address (same port) but distinct ufrags.
+    let a_cand = a
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.typ == IceCandidateType::Host && c.transport == "udp")
+        .expect("a must have a host candidate");
+    let b_cand = b
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.typ == IceCandidateType::Host && c.transport == "udp")
+        .expect("b must have a host candidate");
+    assert_eq!(a_cand.address, b_cand.address);
+    assert_eq!(a_cand.address.port(), port);
+    assert_ne!(
+        a.local_parameters().username_fragment,
+        b.local_parameters().username_fragment,
+        "each PeerConnection must own a distinct ufrag"
+    );
+
+    // Stopping one PeerConnection deregisters only its session.
+    a.stop();
+    // Give the drop a moment to propagate.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        shared_udp::session_count(bind_addr),
+        1,
+        "stopping a should leave exactly one session"
+    );
+
+    b.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(shared_udp::session_count(bind_addr), 0);
     Ok(())
 }

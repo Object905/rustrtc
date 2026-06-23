@@ -152,9 +152,7 @@ async fn dispatch_incoming(
 
     let inner = {
         let sessions = port.sessions.lock();
-        sessions
-            .get(&ufrag)
-            .and_then(|weak| weak.upgrade())
+        sessions.get(&ufrag).and_then(|weak| weak.upgrade())
     };
 
     let inner = inner.ok_or_else(|| anyhow!("no ICE session registered for ufrag {ufrag}"))?;
@@ -184,7 +182,7 @@ async fn read_tcp_framed_packet(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// USERNAME on an inbound Binding request is `peer-ufrag:own-ufrag` from the sender.
 /// For a browser connecting to our passive listener, peer-ufrag is our local ufrag.
-fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
+pub(crate) fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
     let decoded = StunMessage::decode(data).ok()?;
     if decoded.class != StunClass::Request || decoded.method != StunMethod::Binding {
         return None;
@@ -194,7 +192,7 @@ fn peer_ufrag_from_binding_request(data: &[u8]) -> Option<String> {
     Some(peer.to_string())
 }
 
-fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
+pub(crate) fn username_from_stun_bytes(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 20 {
         return None;
     }

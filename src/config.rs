@@ -487,6 +487,21 @@ pub struct RtcConfiguration {
     /// Default: Disabled — only UDP candidates are gathered and used.
     #[serde(default)]
     pub ice_tcp_policy: IceTcpPolicy,
+    /// Enable process-wide shared ICE UDP socket (single-port multiplexing).
+    ///
+    /// When `true`, multiple `PeerConnection`s share one `UdpSocket` bound to
+    /// `ice_udp_mux_port`. Incoming UDP packets are demultiplexed by the server
+    /// ufrag embedded in the first STUN Binding Request's `USERNAME` attribute,
+    /// and — once a pair is established — by the remote source address.
+    ///
+    /// Requires `ice_udp_mux_port` to be set. Useful for SFU/WHEP deployments
+    /// that need to advertise a single public UDP port for many sessions.
+    #[serde(default)]
+    pub ice_udp_mux: bool,
+    /// UDP port to bind the shared mux socket on. Required when `ice_udp_mux`
+    /// is enabled. All `PeerConnection`s sharing this port must agree on it.
+    #[serde(default)]
+    pub ice_udp_mux_port: Option<u16>,
     /// SDP generation compatibility mode.
     #[serde(default)]
     pub sdp_compatibility: SdpCompatibilityMode,
@@ -542,6 +557,8 @@ impl Default for RtcConfiguration {
             buffer_drop_strategy: BufferDropStrategy::default(),
             buffer_stats_log_interval: default_buffer_stats_log_interval(),
             ice_tcp_policy: IceTcpPolicy::default(),
+            ice_udp_mux: false,
+            ice_udp_mux_port: None,
             sdp_compatibility: SdpCompatibilityMode::default(),
             label: None,
             cname: None,
@@ -764,6 +781,19 @@ impl RtcConfigurationBuilder {
         self
     }
 
+    /// Enable process-wide shared ICE UDP socket (single-port multiplexing).
+    /// Requires `ice_udp_mux_port` to also be set.
+    pub fn ice_udp_mux(mut self, enable: bool) -> Self {
+        self.inner.ice_udp_mux = enable;
+        self
+    }
+
+    /// Set the shared UDP mux port. Must be set when `ice_udp_mux` is enabled.
+    pub fn ice_udp_mux_port(mut self, port: u16) -> Self {
+        self.inner.ice_udp_mux_port = Some(port);
+        self
+    }
+
     pub fn sdp_compatibility(mut self, mode: SdpCompatibilityMode) -> Self {
         self.inner.sdp_compatibility = mode;
         self
@@ -890,9 +920,7 @@ mod tests {
 
     #[test]
     fn test_external_port_builder() {
-        let config = RtcConfigurationBuilder::new()
-            .external_port(30000)
-            .build();
+        let config = RtcConfigurationBuilder::new().external_port(30000).build();
         assert_eq!(config.external_port, Some(30000));
     }
 
@@ -939,5 +967,25 @@ mod tests {
             config.ice_connection_timeout,
             defaults.ice_connection_timeout
         );
+    }
+
+    #[test]
+    fn test_ice_udp_mux_defaults() {
+        let config = RtcConfiguration::default();
+        assert!(
+            !config.ice_udp_mux,
+            "ICE UDP mux should be disabled by default"
+        );
+        assert_eq!(config.ice_udp_mux_port, None);
+    }
+
+    #[test]
+    fn test_ice_udp_mux_builder_methods() {
+        let config = RtcConfigurationBuilder::new()
+            .ice_udp_mux(true)
+            .ice_udp_mux_port(30500)
+            .build();
+        assert!(config.ice_udp_mux);
+        assert_eq!(config.ice_udp_mux_port, Some(30500));
     }
 }

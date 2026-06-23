@@ -1,5 +1,6 @@
 pub mod conn;
 pub mod shared_tcp;
+pub mod shared_udp;
 pub mod stun;
 #[cfg(test)]
 mod tests;
@@ -209,6 +210,9 @@ impl IceTransportRunner {
                             IceSocketWrapper::Udp(s) => {
                                 read_futures.push(Box::pin(Self::run_udp_read_loop(s, self.inner.clone())));
                             }
+                            IceSocketWrapper::SharedUdp(handle) => {
+                                read_futures.push(Box::pin(Self::run_shared_udp_read_loop(handle, self.inner.clone())));
+                            }
                             IceSocketWrapper::TcpListener(l) => {
                                 read_futures.push(Box::pin(Self::run_tcp_listen_loop(l, self.inner.clone())));
                             }
@@ -342,6 +346,42 @@ impl IceTransportRunner {
         }
     }
 
+    /// Read loop for a shared (muxed) UDP socket. Packets arrive via the
+    /// handle's receiver (fed by the shared demux loop); outbound replies go out
+    /// through the same handle.
+    async fn run_shared_udp_read_loop(
+        handle: Arc<shared_udp::SharedUdpHandle>,
+        inner: Arc<IceTransportInner>,
+    ) {
+        let mut state_rx = inner.state.subscribe();
+        let sender = IceSocketWrapper::SharedUdp(handle.clone());
+        trace!("Shared UDP read loop started");
+        loop {
+            let packet_opt = tokio::select! {
+                biased;
+                res = state_rx.changed() => {
+                    if res.is_err()
+                        || matches!(
+                            *state_rx.borrow(),
+                            IceTransportState::Closed | IceTransportState::Failed
+                        )
+                    {
+                        debug!("Shared UDP read loop stopping (IceTransport Closed or Failed)");
+                        break;
+                    }
+                    continue;
+                }
+                pkt = handle.recv() => pkt,
+            };
+            match packet_opt {
+                Some((packet, addr)) => {
+                    handle_packet(&packet, addr, inner.clone(), sender.clone()).await;
+                }
+                None => break,
+            }
+        }
+    }
+
     async fn run_turn_read_loop(
         client: Arc<TurnClient>,
         relayed_addr: SocketAddr,
@@ -380,10 +420,7 @@ impl IceTransportRunner {
         }
     }
 
-    async fn run_tcp_listen_loop(
-        listener: Arc<TcpListener>,
-        inner: Arc<IceTransportInner>,
-    ) {
+    async fn run_tcp_listen_loop(listener: Arc<TcpListener>, inner: Arc<IceTransportInner>) {
         let mut state_rx = inner.state.subscribe();
         let local_addr = match listener.local_addr() {
             Ok(a) => a,
@@ -861,7 +898,13 @@ impl IceTransport {
         let inner = self.inner.clone();
         info!("ICE: nudging passive TCP nomination (controlled, awaiting inbound TCP)");
         tokio::spawn(async move {
-            let streams: Vec<_> = inner.gatherer.tcp_streams.lock().values().cloned().collect();
+            let streams: Vec<_> = inner
+                .gatherer
+                .tcp_streams
+                .lock()
+                .values()
+                .cloned()
+                .collect();
             for wrapper in streams {
                 if let IceSocketWrapper::TcpStream(_, _, peer) = wrapper {
                     complete_controlled_inbound_tcp_nomination(&wrapper, peer, inner).await;
@@ -1284,6 +1327,7 @@ impl IceTransport {
         self.inner.gatherer.tcp_listeners.lock().clear();
         self.inner.gatherer.tcp_streams.lock().clear();
         self.inner.gatherer.shared_tcp_regs.lock().clear();
+        self.inner.gatherer.shared_udp_regs.lock().clear();
         self.inner.gatherer.turn_clients.lock().clear();
     }
 
@@ -1629,8 +1673,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 pair.local.address, pair.remote.address
             );
 
-            let result =
-                perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await;
+            let result = perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await;
             match &result {
                 Ok(_) => {
                     debug!(
@@ -1701,6 +1744,12 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
         drop(streams);
         inner.gatherer.get_tcp_socket(pair.local.base_address())
     } else {
+        // Shared UDP mux socket backs the single host candidate when active.
+        if pair.local.typ == IceCandidateType::Host
+            && let Some(shared) = inner.gatherer.shared_udp_socket.lock().clone()
+        {
+            return Some(shared);
+        }
         let socket = inner.gatherer.get_socket(pair.local.base_address());
         if socket.is_none() {
             debug!(
@@ -1765,8 +1814,7 @@ async fn complete_controlled_inbound_tcp_nomination(
         c.base_address() == local_addr
             || (c.transport == "tcp"
                 && c.base_address().port() == local_addr.port()
-                && (c.base_address().ip().is_unspecified()
-                    || local_addr.ip().is_unspecified()))
+                && (c.base_address().ip().is_unspecified() || local_addr.ip().is_unspecified()))
     });
 
     let pair = {
@@ -2077,7 +2125,7 @@ async fn handle_stun_request(
     if !known {
         debug!("Discovered peer reflexive candidate: {}", addr);
         let transport = match sender {
-            IceSocketWrapper::Udp(_) => "udp",
+            IceSocketWrapper::Udp(_) | IceSocketWrapper::SharedUdp(_) => "udp",
             IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _) => "tcp",
             IceSocketWrapper::Turn(_, _) => "udp",
         };
@@ -2147,6 +2195,9 @@ async fn handle_stun_request(
             } else {
                 let local_addr: SocketAddr = match sender {
                     IceSocketWrapper::Udp(s) => s
+                        .local_addr()
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+                    IceSocketWrapper::SharedUdp(h) => h
                         .local_addr()
                         .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
                     IceSocketWrapper::TcpListener(l) => l
@@ -2221,9 +2272,7 @@ async fn perform_binding_check(
     }
 
     // For Controlled role with TCP passive candidates, don't initiate outbound checks
-    if role == IceRole::Controlled
-        && local.transport == "tcp"
-    {
+    if role == IceRole::Controlled && local.transport == "tcp" {
         return Ok(());
     }
 
@@ -2401,7 +2450,9 @@ async fn perform_binding_check(
                 let mut resp_buf = vec![0u8; resp_len];
                 tcp_stream.read_exact(&mut resp_buf).await?;
                 StunMessage::decode(&resp_buf).map_err(|e| anyhow!(e))
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(parsed)) => {
                     if parsed.class == StunClass::SuccessResponse {
                         return Ok(());
@@ -2538,7 +2589,10 @@ async fn perform_tcp_binding_check(
     role: IceRole,
     nominated: bool,
 ) -> Result<()> {
-    debug!("perform_tcp_binding_check: {} -> {}", local.address, remote.address);
+    debug!(
+        "perform_tcp_binding_check: {} -> {}",
+        local.address, remote.address
+    );
     let local_params = inner.local_parameters.lock().clone();
     let remote_params = match inner.remote_parameters.lock().clone() {
         Some(p) => p,
@@ -3053,6 +3107,10 @@ struct IceGatherer {
     tcp_listeners: Arc<parking_lot::Mutex<Vec<Arc<TcpListener>>>>,
     tcp_streams: Arc<parking_lot::Mutex<HashMap<SocketAddr, IceSocketWrapper>>>,
     shared_tcp_regs: Arc<parking_lot::Mutex<Vec<shared_tcp::SharedTcpRegistration>>>,
+    shared_udp_regs: Arc<parking_lot::Mutex<Vec<shared_udp::SharedUdpRegistration>>>,
+    /// The shared UDP mux socket wrapper (when `ice_udp_mux` is enabled).
+    /// Stored so `resolve_socket` can return it for sending.
+    shared_udp_socket: Arc<parking_lot::Mutex<Option<IceSocketWrapper>>>,
     transport_inner: Arc<parking_lot::Mutex<Option<std::sync::Weak<IceTransportInner>>>>,
     turn_clients: Arc<parking_lot::Mutex<HashMap<SocketAddr, Arc<TurnClient>>>>,
     upnp_mappers: Arc<parking_lot::Mutex<Vec<UpnpPortMapper>>>,
@@ -3074,6 +3132,8 @@ impl IceGatherer {
             tcp_listeners: Arc::new(parking_lot::Mutex::new(Vec::new())),
             tcp_streams: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             shared_tcp_regs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            shared_udp_regs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            shared_udp_socket: Arc::new(parking_lot::Mutex::new(None)),
             transport_inner: Arc::new(parking_lot::Mutex::new(None)),
             turn_clients: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             upnp_mappers: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -3172,19 +3232,32 @@ impl IceGatherer {
     }
 
     fn get_socket(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
-        let sockets = self.sockets.lock();
-        for socket in sockets.iter() {
-            if let Ok(local) = socket.local_addr() {
-                if local == addr {
-                    return Some(socket.clone());
-                }
-                if local.ip().is_unspecified() && local.port() == addr.port() {
-                    return Some(socket.clone());
-                }
+        let found = {
+            let sockets = self.sockets.lock();
+            sockets.iter().find_map(|socket| {
+                let local = socket.local_addr().ok()?;
+                let matches =
+                    local == addr || (local.ip().is_unspecified() && local.port() == addr.port());
+                matches.then(|| socket.clone())
+            })
+        };
+        if let Some(s) = found {
+            return Some(s);
+        }
+        // Fallback: the shared UDP mux socket (sending side). It backs the single
+        // host candidate when `ice_udp_mux` is enabled and is not stored in
+        // `sockets` (to keep a single demux read loop).
+        if let Some(IceSocketWrapper::SharedUdp(handle)) = self.shared_udp_socket.lock().clone()
+            && let Ok(local) = handle.local_addr()
+        {
+            if local == addr || (local.ip().is_unspecified() && local.port() == addr.port()) {
+                return Some(handle.socket().clone());
             }
         }
         // Avoid unwrap in logging to prevent panic hiding
-        let available: Vec<String> = sockets
+        let available: Vec<String> = self
+            .sockets
+            .lock()
             .iter()
             .map(|s| {
                 s.local_addr()
@@ -3262,9 +3335,7 @@ impl IceGatherer {
         host_fut.await;
 
         // TCP host candidate gathering
-        if self.config.tcp_port_range_start.is_some()
-            || self.config.tcp_port_range_end.is_some()
-        {
+        if self.config.tcp_port_range_start.is_some() || self.config.tcp_port_range_end.is_some() {
             if let Err(e) = self.gather_tcp_host_candidates().await {
                 debug!("TCP host gathering failed: {}", e);
             }
@@ -3289,6 +3360,70 @@ impl IceGatherer {
         }
 
         *self.state.lock() = IceGathererState::Complete;
+        Ok(())
+    }
+
+    /// Gather a host candidate backed by the process-wide shared UDP socket
+    /// (single-port multiplexing). All PeerConnections sharing the same
+    /// `ice_udp_mux_port` register their ufrag on the same socket; incoming
+    /// packets are demuxed by ufrag / source address in `shared_udp`.
+    async fn gather_shared_udp_host_candidate(&self) -> Result<()> {
+        let port = self
+            .config
+            .ice_udp_mux_port
+            .ok_or_else(|| anyhow!("ice_udp_mux is enabled but ice_udp_mux_port is not set"))?;
+
+        let bind_ip = if let Some(bind_ip_str) = &self.config.bind_ip {
+            bind_ip_str
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid bind_ip {}", bind_ip_str))?
+        } else {
+            // Bind on the wildcard so the shared socket accepts on every
+            // interface; the advertised candidate IP is rewritten below.
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        };
+
+        if self.config.disable_ipv6 && bind_ip.is_ipv6() {
+            bail!("disable_ipv6 is set but bind_ip is IPv6");
+        }
+
+        let bind_addr = SocketAddr::new(bind_ip, port);
+
+        let inner = self
+            .transport_inner
+            .lock()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .context("ICE transport unavailable during shared UDP gather")?;
+        let ufrag = inner.local_parameters.lock().username_fragment.clone();
+
+        let (local_addr, handle, registration) = shared_udp::acquire(bind_addr, ufrag).await?;
+
+        self.shared_udp_regs.lock().push(registration);
+
+        let wrapper = IceSocketWrapper::SharedUdp(Arc::new(handle));
+        *self.shared_udp_socket.lock() = Some(wrapper.clone());
+        let _ = self.socket_tx.send(wrapper);
+
+        // Derive the advertised candidate address (mirror the per-IP path).
+        let mut cand_addr = local_addr;
+        if let Some(ext_ip) = &self.config.external_ip
+            && let Ok(parsed_ip) = ext_ip.parse::<IpAddr>()
+        {
+            if !bind_ip.is_loopback() {
+                cand_addr.set_ip(parsed_ip);
+            }
+        } else if bind_ip.is_unspecified()
+            && let Ok(local_ip) = get_local_ip()
+        {
+            cand_addr.set_ip(local_ip);
+        }
+
+        let mut cand = IceCandidate::host(cand_addr, 1);
+        if cand_addr != local_addr {
+            cand.related_address = Some(local_addr);
+        }
+        self.push_candidate(cand);
         Ok(())
     }
 
@@ -3333,8 +3468,19 @@ impl IceGatherer {
             }
         }
 
+        if self.config.ice_udp_mux
+            && let Err(e) = self.gather_shared_udp_host_candidate().await
+        {
+            debug!("Shared UDP mux host candidate failed: {}", e);
+        }
+
         for ip in &bind_ips {
             let ip = *ip;
+            // When UDP mux is enabled, the shared socket already provides the
+            // host candidate; skip per-IP UDP socket binding.
+            if self.config.ice_udp_mux {
+                continue;
+            }
             match self.bind_socket(ip).await {
                 Ok(socket) => {
                     if let Ok(addr) = socket.local_addr() {
@@ -3387,9 +3533,7 @@ impl IceGatherer {
                         if let Ok(addr) = listener.local_addr() {
                             let listener = Arc::new(listener);
                             self.tcp_listeners.lock().push(listener.clone());
-                            let _ = self
-                                .socket_tx
-                                .send(IceSocketWrapper::TcpListener(listener));
+                            let _ = self.socket_tx.send(IceSocketWrapper::TcpListener(listener));
 
                             let tcp_type = TcpType::Passive;
                             let mut cand = IceCandidate::host_tcp(addr, 1, tcp_type);
@@ -3397,7 +3541,8 @@ impl IceGatherer {
                                 if let Ok(local_ip) = get_local_ip() {
                                     let mut cand_addr = addr;
                                     cand_addr.set_ip(local_ip);
-                                    let mut ext_cand = IceCandidate::host_tcp(cand_addr, 1, tcp_type);
+                                    let mut ext_cand =
+                                        IceCandidate::host_tcp(cand_addr, 1, tcp_type);
                                     ext_cand.related_address = Some(addr);
                                     cand = ext_cand;
                                 }
@@ -3967,8 +4112,16 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[derive(Debug, Clone)]
 pub enum IceSocketWrapper {
     Udp(Arc<UdpSocket>),
+    /// Shared (muxed) UDP socket. Incoming packets arrive via the handle's
+    /// receiver (fed by the shared demux loop); outbound packets go out through
+    /// the handle, which also records the destination for reverse routing.
+    SharedUdp(Arc<shared_udp::SharedUdpHandle>),
     TcpListener(Arc<TcpListener>),
-    TcpStream(Arc<Mutex<TcpReadHalf>>, Arc<Mutex<TcpWriteHalf>>, SocketAddr),
+    TcpStream(
+        Arc<Mutex<TcpReadHalf>>,
+        Arc<Mutex<TcpWriteHalf>>,
+        SocketAddr,
+    ),
     Turn(Arc<TurnClient>, SocketAddr),
 }
 
@@ -3979,6 +4132,12 @@ impl IceSocketWrapper {
             IceSocketWrapper::Udp(s) => format!(
                 "udp:{}",
                 s.local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "?".into())
+            ),
+            IceSocketWrapper::SharedUdp(h) => format!(
+                "udp-mux:{}",
+                h.local_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".into())
             ),
@@ -4014,6 +4173,10 @@ impl IceSocketWrapper {
                     }
                 }
             },
+            IceSocketWrapper::SharedUdp(h) => {
+                let dest = addr;
+                h.send_to(data, dest).await.map_err(anyhow::Error::from)
+            }
             IceSocketWrapper::TcpListener(_) => {
                 bail!("send_to not supported on TcpListener")
             }
@@ -4043,6 +4206,21 @@ impl IceSocketWrapper {
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         match self {
             IceSocketWrapper::Udp(s) => s.recv_from(buf).await.map_err(|e| e.into()),
+            IceSocketWrapper::SharedUdp(h) => match h.recv().await {
+                Some((data, addr)) => {
+                    if data.len() > buf.len() {
+                        return Err(anyhow::anyhow!(
+                            "shared UDP packet too large: {} > {}",
+                            data.len(),
+                            buf.len()
+                        ));
+                    }
+                    let len = data.len();
+                    buf[..len].copy_from_slice(&data);
+                    Ok((len, addr))
+                }
+                None => Err(anyhow::anyhow!("shared UDP channel closed")),
+            },
             IceSocketWrapper::TcpStream(read, _, peer) => {
                 use tokio::io::AsyncReadExt;
                 let mut stream = read.lock().await;

@@ -12,6 +12,7 @@ A high-performance, full-featured real-time communication library — **WebRTC, 
 - ** WebRTC Compliant** — Full compliance with Chrome/WebRTC. Supports offer/answer, renegotiation, and all standard SDP attributes.
 - ** Media Support** — RTP/SRTP handling for audio and video with packetizer, depacketizer, jitter buffer, NACK/FIR/PLI, TWCC, and REMB.
 - ** ICE/STUN/TURN** — Full ICE implementation with STUN, TURN (UDP + TCP), ICE Lite, ICE TCP (RFC 6544), and nominated pair management.
+- ** ICE UDP Mux** — Single-port multiplexing: many `PeerConnection`s share one UDP socket, demuxed by the server ufrag in the STUN Binding Request. Ideal for SFU/WHEP deployments that must advertise a single public UDP port.
 - ** T.38 Fax** — Fax over IP via T.38 (UDPTL, IFP ASN.1 PER encoding, T.30 state machine). Gated behind `features = ["t38"]`.
 - ** RTP Latching** — Dynamic remote address detection for RTP-only NAT traversal. Probation-based candidate selection with configurable observation window.
 - ** Transport Modes** — `TransportMode::WebRtc` (full ICE/DTLS), `TransportMode::Srtp` (SRTP without ICE), `TransportMode::Rtp` (raw RTP without encryption).
@@ -127,6 +128,7 @@ All configuration goes through `RtcConfiguration` (or its builder `RtcConfigurat
 - **`disable_ipv6`** — Disable IPv6 candidate gathering.
 - **`enable_ice_lite`** — Enable ICE Lite mode.
 - **`ice_tcp_policy`** — `IceTcpPolicy::Disabled` (default), `IceTcpPolicy::Enabled`, or `IceTcpPolicy::PassiveOnly`. Controls ICE TCP candidate support per RFC 6544.
+- **`ice_udp_mux`** / **`ice_udp_mux_port`** — Share a single UDP socket across many `PeerConnection`s (single-port multiplexing for SFU/WHEP). Set `ice_udp_mux = true` and `ice_udp_mux_port = <port>`; incoming packets are demuxed by the server ufrag in the STUN Binding Request, then by remote source address.
 
 ### UPnP
 - **`enable_upnp`** — Auto-map ports via UPnP IGD.
