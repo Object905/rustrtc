@@ -4304,7 +4304,9 @@ impl PeerConnectionInner {
             return;
         }
 
-        let final_reason = if self.disconnect_reason.borrow().is_none() {
+        let reason_guard = self.disconnect_reason.borrow();
+        let final_reason = if reason_guard.is_none() {
+            drop(reason_guard);
             let sctp_reason =
                 self.sctp_transport
                     .lock()
@@ -4333,7 +4335,7 @@ impl PeerConnectionInner {
             let _ = self.disconnect_reason.send(Some(r.clone()));
             r
         } else {
-            self.disconnect_reason.borrow().clone().unwrap()
+            reason_guard.clone().unwrap()
         };
 
         tracing::debug!("PeerConnection closing: reason={}", final_reason);

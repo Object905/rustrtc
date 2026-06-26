@@ -10,6 +10,7 @@ use aes_gcm::{
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -100,29 +101,29 @@ impl SrtpSession {
 
     pub fn protect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
         let ssrc = packet.header.ssrc;
-        let ctx = self.tx_contexts.entry(ssrc).or_insert_with(|| {
-            SrtpContext::new(
+        let ctx = match self.tx_contexts.entry(ssrc) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(SrtpContext::new(
                 ssrc,
                 self.profile,
                 self.tx_keying.clone(),
                 SrtpDirection::Sender,
-            )
-            .unwrap()
-        });
+            )?),
+        };
         ctx.protect(packet)
     }
 
     pub fn unprotect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
         let ssrc = packet.header.ssrc;
-        let ctx = self.rx_contexts.entry(ssrc).or_insert_with(|| {
-            SrtpContext::new(
+        let ctx = match self.rx_contexts.entry(ssrc) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(SrtpContext::new(
                 ssrc,
                 self.profile,
                 self.rx_keying.clone(),
                 SrtpDirection::Receiver,
-            )
-            .unwrap()
-        });
+            )?),
+        };
         ctx.unprotect(packet)
     }
 
@@ -132,15 +133,15 @@ impl SrtpSession {
         }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        let ctx = self.tx_contexts.entry(ssrc).or_insert_with(|| {
-            SrtpContext::new(
+        let ctx = match self.tx_contexts.entry(ssrc) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(SrtpContext::new(
                 ssrc,
                 self.profile,
                 self.tx_keying.clone(),
                 SrtpDirection::Sender,
-            )
-            .unwrap()
-        });
+            )?),
+        };
         ctx.protect_rtcp(packet)
     }
 
@@ -151,15 +152,15 @@ impl SrtpSession {
         }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
-        let ctx = self.rx_contexts.entry(ssrc).or_insert_with(|| {
-            SrtpContext::new(
+        let ctx = match self.rx_contexts.entry(ssrc) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(SrtpContext::new(
                 ssrc,
                 self.profile,
                 self.rx_keying.clone(),
                 SrtpDirection::Receiver,
-            )
-            .unwrap()
-        });
+            )?),
+        };
         ctx.unprotect_rtcp(packet)
     }
 }

@@ -120,7 +120,7 @@ impl Random {
     pub fn new() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
         let start = SystemTime::now();
-        let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap();
+        let since_the_epoch = start.duration_since(UNIX_EPOCH).unwrap_or_default();
         let gmt_unix_time = since_the_epoch.as_secs() as u32;
 
         let mut random_bytes = [0u8; 28];

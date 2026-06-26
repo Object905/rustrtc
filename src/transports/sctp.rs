@@ -1166,7 +1166,9 @@ impl SctpInner {
         if mac.verify_slice(received_mac).is_err() {
             return false;
         }
-        let stamp_ms = u64::from_be_bytes(timestamp.try_into().unwrap());
+        let stamp_ms = u64::from_be_bytes(
+            timestamp.try_into().expect("COOKIE_TIMESTAMP_LEN must be 8"),
+        );
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

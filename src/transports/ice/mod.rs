@@ -668,7 +668,7 @@ impl IceTransportRunner {
                             if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
                                 debug!(
                                     "TURN Refresh got {}: updating nonce, retrying",
-                                    msg.error_code.unwrap()
+                                    msg.error_code.unwrap_or(0)
                                 );
                                 client.update_nonce(realm, nonce).await;
                             }
@@ -706,7 +706,7 @@ impl IceTransportRunner {
                                 if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
                                     debug!(
                                         "TURN CreatePermission got {}: updating nonce, retrying",
-                                        msg.error_code.unwrap()
+                                        msg.error_code.unwrap_or(0)
                                     );
                                     client.update_nonce(realm, nonce).await;
                                 }
@@ -753,7 +753,7 @@ impl IceTransportRunner {
                                     if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
                                         debug!(
                                             "TURN ChannelBind got {}: updating nonce, retrying ch {}",
-                                            msg.error_code.unwrap(),
+                                            msg.error_code.unwrap_or(0),
                                             channel
                                         );
                                         client.update_nonce(realm, nonce).await;
@@ -1373,7 +1373,7 @@ impl IceTransport {
                     if let (Some(realm), Some(nonce)) = (msg.realm, msg.nonce) {
                         debug!(
                             "TURN destroy got {}: updating nonce, retrying",
-                            msg.error_code.unwrap()
+                            msg.error_code.unwrap_or(0)
                         );
                         client.update_nonce(realm, nonce).await;
                         continue;
