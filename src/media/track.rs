@@ -311,6 +311,10 @@ struct RelayInner {
     ended: AtomicBool,
     feedback_tx: mpsc::Sender<FeedbackEvent>,
     feedback_rx: SyncMutex<Option<mpsc::Receiver<FeedbackEvent>>>,
+    /// Serializes the "no subscribers → shut down" transition against a racing
+    /// `subscribe()` so the relay task cannot exit while a new subscriber is
+    /// being attached (and vice-versa).
+    lifecycle: SyncMutex<()>,
 }
 
 impl MediaRelay {
@@ -344,16 +348,22 @@ impl MediaRelay {
                 ended: AtomicBool::new(false),
                 feedback_tx,
                 feedback_rx: SyncMutex::new(Some(feedback_rx)),
+                lifecycle: SyncMutex::new(()),
             }),
         }
     }
 
     pub fn subscribe(&self) -> Arc<RelayStreamTrack> {
+        // Hold the lifecycle lock so the relay task cannot observe a transient
+        // receiver_count==0 and shut down while we are attaching a subscriber.
+        let _guard = self.inner.lifecycle.lock();
+        // Increment receiver_count FIRST, then ensure the task is running.
+        let receiver = self.inner.sender.subscribe();
         self.inner.ensure_started();
         Arc::new(RelayStreamTrack::new(
             next_relay_track_id(&self.inner.base_id),
             self.inner.kind,
-            self.inner.sender.subscribe(),
+            receiver,
             self.inner.ended.load(Ordering::SeqCst),
             self.inner.feedback_tx.clone(),
         ))
@@ -377,7 +387,26 @@ impl RelayInner {
                         res = this.track.recv() => {
                             match res {
                                 Ok(sample) => {
-                                    let _ = this.sender.send(RelayEvent::Sample(sample));
+                                    // broadcast::send returns Err when there are
+                                    // no active receivers. When that happens the
+                                    // relay has no consumers; shut down (race-free
+                                    // w.r.t. subscribe() via the lifecycle lock) so
+                                    // this task, the source track Arc and the
+                                    // feedback channel don't linger until the
+                                    // upstream track happens to close.
+                                    if this.sender.send(RelayEvent::Sample(sample)).is_err() {
+                                        let guard = this.lifecycle.lock();
+                                        // A subscriber may have arrived between the
+                                        // failed send and acquiring the lock; only
+                                        // shut down if still nobody is listening.
+                                        if this.sender.receiver_count() == 0 {
+                                            this.started.store(false, Ordering::SeqCst);
+                                            drop(guard);
+                                            break;
+                                        }
+                                        // Otherwise a new subscriber just attached;
+                                        // keep relaying (the current sample is lost).
+                                    }
                                 }
                                 Err(MediaError::Lagged) => {
                                     debug!(target: "rustrtc::media", track = %this.base_id, "source track lagged; dropping sample");
@@ -412,6 +441,7 @@ impl RelayInner {
                         }
                     }
                 }
+                debug!(target: "rustrtc::media", track = %this.base_id, "MediaRelay task exiting (no subscribers or source ended)");
             });
         }
     }

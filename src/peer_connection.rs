@@ -311,6 +311,12 @@ struct PeerConnectionInner {
     ssrc_generator: AtomicU32,
     disconnect_reason: watch::Sender<Option<DisconnectReason>>,
     _disconnect_reason_rx: watch::Receiver<Option<DisconnectReason>>,
+    /// JoinHandles of fire-and-forget tasks spawned by this PeerConnection
+    /// (event forwarding, DCEP open, RTCP BYE, RTP sender/receiver loops, …).
+    /// `close_with_reason` / `Drop` abort any that survived cooperative
+    /// shutdown so they cannot outlive the connection and leak the Arcs they
+    /// captured (tracks, transports, etc.).
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 pub(crate) fn generate_sdes_key_params() -> String {
@@ -401,6 +407,7 @@ impl PeerConnection {
             ssrc_generator,
             disconnect_reason: disconnect_reason_tx,
             _disconnect_reason_rx: disconnect_reason_rx,
+            tasks: Mutex::new(Vec::new()),
         };
         let pc = Self {
             inner: Arc::new(inner),
@@ -414,11 +421,12 @@ impl PeerConnection {
             let inner_weak = Arc::downgrade(&pc.inner);
             let ice_transport = pc.inner.ice_transport.clone();
             let ice_connection_state_tx = pc.inner.ice_connection_state.clone();
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 let rtp_ice_loop =
                     run_rtp_direct_loop(ice_transport, ice_connection_state_tx, inner_weak);
                 tokio::join!(rtp_ice_loop, ice_runner);
             });
+            pc.inner.track_task(h);
         } else {
             let inner_weak = Arc::downgrade(&pc.inner);
             let ice_transport = pc.inner.ice_transport.clone();
@@ -428,7 +436,7 @@ impl PeerConnection {
             let ice_transport_gathering = ice_transport.clone();
             let ice_gathering_state_tx = pc.inner.ice_gathering_state.clone();
             let inner_weak_gathering = inner_weak.clone();
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 let gathering_loop = run_gathering_loop(
                     ice_transport_gathering,
                     ice_gathering_state_tx,
@@ -444,6 +452,7 @@ impl PeerConnection {
 
                 tokio::join!(gathering_loop, dtls_loop, ice_runner);
             });
+            pc.inner.track_task(h);
         }
         pc
     }
@@ -1578,6 +1587,10 @@ impl PeerConnection {
         // Start the handshake loop before flushing buffered packets so inbound
         // DTLS records are not dropped on the try_send race.
         let mut dtls_runner_task = tokio::spawn(dtls_runner);
+        // Once the runner task completes we must not poll its JoinHandle again
+        // (tokio panics with "JoinHandle polled after completion"). This flag
+        // guards the select! branch below so the handle is only ever polled once.
+        let mut dtls_runner_done = false;
 
         // DTLS receiver is now registered (inside DtlsTransport::new),
         // safe to set data receiver and flush buffered packets.
@@ -1689,7 +1702,24 @@ impl PeerConnection {
                 crate::transports::dtls::DtlsState::Failed => {
                     return Err(RtcError::Internal("DTLS handshake failed".into()));
                 }
+                crate::transports::dtls::DtlsState::Closed => {
+                    return Err(RtcError::Internal(
+                        "DTLS transport closed before completing handshake".into(),
+                    ));
+                }
                 _ => {}
+            }
+
+            // The runner task has finished but the watch state wasn't
+            // Connected/Failed/Closed yet (the handshake can return Ok after
+            // setting Closed, or exit via feeder/close without a final state).
+            // Wait for a state transition instead of re-polling the completed
+            // JoinHandle, which would panic.
+            if dtls_runner_done {
+                if state_rx.changed().await.is_err() {
+                    break;
+                }
+                continue;
             }
 
             tokio::select! {
@@ -1697,6 +1727,9 @@ impl PeerConnection {
                     if let Err(e) = res {
                         return Err(RtcError::Internal(format!("DTLS runner panicked: {e}")));
                     }
+                    dtls_runner_done = true;
+                    // Loop back: the top-of-loop state check will return/err
+                    // based on the final DtlsState set by the handshake.
                 }
                 _ = &mut sctp_runner => {
                      return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
@@ -2228,12 +2261,13 @@ impl PeerConnection {
         );
         let pair_monitor =
             Self::create_pair_monitor(ice_transport.subscribe_selected_pair(), ice_conn);
-        tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             tokio::select! {
                 _ = rtcp_loop => {},
                 _ = pair_monitor => {},
             }
         });
+        self.inner.track_task(h);
 
         rtp_transport
     }
@@ -2623,11 +2657,12 @@ impl PeerConnection {
             let transport = self.inner.sctp_transport.lock().clone();
             if let Some(transport) = transport {
                 let dc_clone = dc.clone();
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     if let Err(e) = transport.send_dcep_open(&dc_clone).await {
                         debug!("Failed to send DCEP OPEN: {}", e);
                     }
                 });
+                self.inner.track_task(h);
             }
         }
 
@@ -3530,6 +3565,25 @@ fn is_ice_disconnected(state: crate::transports::ice::IceTransportState) -> bool
 }
 
 impl PeerConnectionInner {
+    /// Track a spawned task so it can be aborted on close. Only meant for
+    /// fire-and-forget tasks whose lifetime should be bounded by the connection.
+    fn track_task(&self, handle: tokio::task::JoinHandle<()>) {
+        // Opportunistically prune finished handles so the vec stays small over
+        // a long-lived connection with many renegotiations.
+        let mut tasks = self.tasks.lock();
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Abort every tracked task. Called as a belt-and-suspenders cleanup after
+    /// cooperative shutdown signals have been sent.
+    fn abort_tracked_tasks(&self) {
+        let mut tasks = self.tasks.lock();
+        for handle in tasks.drain(..) {
+            handle.abort();
+        }
+    }
+
     fn direct_rtp_ice_transport(&self, transceiver_id: u64, primary: bool) -> IceTransport {
         if primary {
             return self.ice_transport.clone();
@@ -3541,7 +3595,8 @@ impl PeerConnectionInner {
         }
 
         let (transport, runner) = IceTransport::new(self.config.clone());
-        tokio::spawn(runner);
+        let h = tokio::spawn(runner);
+        self.track_task(h);
         transports.insert(transceiver_id, transport.clone());
         transport
     }
@@ -4440,6 +4495,9 @@ impl Drop for PeerConnectionInner {
     fn drop(&mut self) {
         debug!("PeerConnectionInner dropped, stopping ICE transport");
         self.close_with_reason(DisconnectReason::Dropped);
+        // Belt-and-suspenders: abort any tracked task that survived cooperative
+        // shutdown so it (and the Arcs it captured) cannot outlive the PC.
+        self.abort_tracked_tasks();
     }
 }
 
@@ -5329,13 +5387,17 @@ impl RtpSender {
 impl RtpSender {
     /// Stop the sender's send loop immediately (e.g. on PeerConnection close).
     pub(crate) fn stop(&self) {
-        self.stop_tx.notify_waiters();
+        // notify_one() stores a permit so the wake is not lost even if the
+        // send-loop task is between select! iterations (notify_waiters() would
+        // silently drop the wake in that case, leaking the task + the strong
+        // Arc<dyn MediaStreamTrack> it captures).
+        self.stop_tx.notify_one();
     }
 }
 
 impl Drop for RtpSender {
     fn drop(&mut self) {
-        self.stop_tx.notify_waiters();
+        self.stop_tx.notify_one();
     }
 }
 

@@ -829,13 +829,22 @@ impl SctpTransport {
     }
 
     pub fn close(&self) {
-        self.close_tx.notify_waiters();
+        // Mark state as Closed so blocked senders (flow-control wait loop) can
+        // bail out instead of waiting forever for window credit.
+        *self.inner.state.lock() = SctpState::Closed;
+        // notify_one() stores a permit, eliminating the race where notify_waiters()
+        // would lose the wake if no task was currently parked on the Notify.
+        self.close_tx.notify_one();
+        // Wake any task parked in send_data_raw()'s flow-control loop.
+        self.inner.flow_control_notify.notify_waiters();
     }
 }
 
 impl Drop for SctpTransport {
     fn drop(&mut self) {
-        self.close_tx.notify_waiters();
+        *self.inner.state.lock() = SctpState::Closed;
+        self.close_tx.notify_one();
+        self.inner.flow_control_notify.notify_waiters();
     }
 }
 
@@ -2803,6 +2812,12 @@ impl SctpInner {
         let flags_base = if !ordered { 0x04 } else { 0x00 };
 
         loop {
+            // Bail out if the association has been closed while we were waiting
+            // for window credit, otherwise this task (and the Arc<SctpInner> /
+            // DataChannel it captures) would live forever.
+            if *self.state.lock() == SctpState::Closed {
+                return Err(anyhow::anyhow!("sctp association closed"));
+            }
             let flight = self.flight_size.load(Ordering::Relaxed);
             let queued = self.queued_bytes.load(Ordering::Relaxed);
             if flight + queued <= MAX_BUFFERED_AMOUNT {

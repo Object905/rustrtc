@@ -84,6 +84,16 @@ pub struct SrtpSession {
     rx_contexts: HashMap<u32, SrtpContext>,
 }
 
+/// Above this many per-SSRC contexts, stale ones (not seen for
+/// `SSRC_INACTIVITY_EVICT`) are evicted. Caps unbounded growth from SSRC churn
+/// (re-INVITE, simulcast layer switch, SSRC collision, relay rewrite) while
+/// staying well above realistic active-SSRC counts.
+const SSRC_CONTEXT_HIGH_WATERMARK: usize = 32;
+/// Inactivity threshold after which an SRTP context is considered stale and
+/// eligible for eviction. A real media SSRC silent this long has almost
+/// certainly ended (or rotated), so dropping its ROC state is safe.
+const SSRC_INACTIVITY_EVICT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl SrtpSession {
     pub fn new(
         profile: SrtpProfile,
@@ -101,6 +111,7 @@ impl SrtpSession {
 
     pub fn protect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
         let ssrc = packet.header.ssrc;
+        self.evict_stale_tx(ssrc);
         let ctx = match self.tx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(SrtpContext::new(
@@ -110,11 +121,13 @@ impl SrtpSession {
                 SrtpDirection::Sender,
             )?),
         };
+        ctx.last_used = std::time::Instant::now();
         ctx.protect(packet)
     }
 
     pub fn unprotect_rtp(&mut self, packet: &mut RtpPacket) -> SrtpResult<()> {
         let ssrc = packet.header.ssrc;
+        self.evict_stale_rx(ssrc);
         let ctx = match self.rx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(SrtpContext::new(
@@ -124,6 +137,7 @@ impl SrtpSession {
                 SrtpDirection::Receiver,
             )?),
         };
+        ctx.last_used = std::time::Instant::now();
         ctx.unprotect(packet)
     }
 
@@ -133,6 +147,7 @@ impl SrtpSession {
         }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
+        self.evict_stale_tx(ssrc);
         let ctx = match self.tx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(SrtpContext::new(
@@ -142,6 +157,7 @@ impl SrtpSession {
                 SrtpDirection::Sender,
             )?),
         };
+        ctx.last_used = std::time::Instant::now();
         ctx.protect_rtcp(packet)
     }
 
@@ -152,6 +168,7 @@ impl SrtpSession {
         }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
 
+        self.evict_stale_rx(ssrc);
         let ctx = match self.rx_contexts.entry(ssrc) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(SrtpContext::new(
@@ -161,7 +178,32 @@ impl SrtpSession {
                 SrtpDirection::Receiver,
             )?),
         };
+        ctx.last_used = std::time::Instant::now();
         ctx.unprotect_rtcp(packet)
+    }
+
+    /// Evict stale transmit contexts once the map crosses the high-water mark.
+    /// `keep_ssrc` (the SSRC of the packet currently being processed) is never
+    /// evicted.
+    fn evict_stale_tx(&mut self, keep_ssrc: u32) {
+        if self.tx_contexts.len() <= SSRC_CONTEXT_HIGH_WATERMARK {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.tx_contexts.retain(|s, c| {
+            *s == keep_ssrc || now.duration_since(c.last_used) < SSRC_INACTIVITY_EVICT
+        });
+    }
+
+    /// Evict stale receive contexts once the map crosses the high-water mark.
+    fn evict_stale_rx(&mut self, keep_ssrc: u32) {
+        if self.rx_contexts.len() <= SSRC_CONTEXT_HIGH_WATERMARK {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.rx_contexts.retain(|s, c| {
+            *s == keep_ssrc || now.duration_since(c.last_used) < SSRC_INACTIVITY_EVICT
+        });
     }
 }
 
@@ -185,6 +227,10 @@ pub struct SrtpContext {
     rollover_counter: u32,
     last_sequence: Option<u16>,
     rtcp_index: u32,
+    /// Wall-clock time of the most recent protect/unprotect call, used to evict
+    /// contexts for SSRCs that have gone away (prevents unbounded growth as
+    /// SSRCs churn across a long call / relay).
+    last_used: std::time::Instant,
 }
 
 impl fmt::Debug for SrtpContext {
@@ -252,6 +298,7 @@ impl SrtpContext {
             rollover_counter: 0,
             last_sequence: None,
             rtcp_index: 0,
+            last_used: std::time::Instant::now(),
         })
     }
 
