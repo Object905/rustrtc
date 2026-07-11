@@ -50,7 +50,6 @@ mod tests {
                 data: Bytes::from_static(&[1, 2, 3]),
                 ..AudioFrame::default()
             })
-            .await
             .unwrap();
 
         // Receive Packet 1
@@ -65,7 +64,6 @@ mod tests {
                 data: Bytes::from_static(&[4, 5, 6]),
                 ..AudioFrame::default()
             })
-            .await
             .unwrap();
 
         // Receive Packet 2
@@ -120,7 +118,6 @@ mod tests {
                 data: Bytes::from_static(&[1]),
                 ..rustrtc::media::frame::VideoFrame::default()
             })
-            .await
             .unwrap();
 
         let (len, _) = receiver_socket.recv_from(&mut buf).await.unwrap();
@@ -134,7 +131,6 @@ mod tests {
                 data: Bytes::from_static(&[2]),
                 ..rustrtc::media::frame::VideoFrame::default()
             })
-            .await
             .unwrap();
 
         let (len, _) = receiver_socket.recv_from(&mut buf).await.unwrap();
@@ -150,7 +146,6 @@ mod tests {
                 data: Bytes::from_static(&[3]),
                 ..rustrtc::media::frame::VideoFrame::default()
             })
-            .await
             .unwrap();
 
         let (len, _) = receiver_socket.recv_from(&mut buf).await.unwrap();

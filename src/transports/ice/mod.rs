@@ -960,7 +960,7 @@ impl IceTransport {
         self.inner.gatherer.state()
     }
 
-    pub async fn role(&self) -> IceRole {
+    pub fn role(&self) -> IceRole {
         *self.inner.role.lock()
     }
 
@@ -1489,7 +1489,7 @@ impl IceTransport {
         &self.inner.config
     }
 
-    pub async fn get_selected_socket(&self) -> Option<IceSocketWrapper> {
+    pub fn get_selected_socket(&self) -> Option<IceSocketWrapper> {
         if let Some(socket) = self.inner._socket_rx_keeper.borrow().clone() {
             return Some(socket);
         }
@@ -1497,7 +1497,7 @@ impl IceTransport {
         resolve_socket(&self.inner, &pair)
     }
 
-    pub async fn get_selected_pair(&self) -> Option<IceCandidatePair> {
+    pub fn get_selected_pair(&self) -> Option<IceCandidatePair> {
         self.inner.selected_pair.lock().clone()
     }
 
@@ -1512,7 +1512,7 @@ impl IceTransport {
             if buffer.is_empty() {
                 return;
             }
-            tracing::info!(
+            debug!(
                 count = buffer.len(),
                 "Flushing buffered RTP packets to newly registered data_receiver"
             );
@@ -1902,7 +1902,7 @@ fn publish_selected_socket(
         _ => resolve_socket(inner, pair),
     };
     if let Some(socket) = socket {
-        info!(
+        debug!(
             pair_local = %pair.local.address,
             pair_remote = %pair.remote.address,
             socket = %socket.diag(),
@@ -1998,7 +1998,7 @@ async fn complete_controlled_inbound_tcp_nomination(
         .as_ref()
         .map(|p| format!("{} -> {}", p.local.address, p.remote.address))
         .unwrap_or_else(|| format!("(no pair) peer={addr}"));
-    info!(
+    debug!(
         peer = %addr,
         local_bind = %local_addr,
         pair = %pair_summary,

@@ -74,7 +74,7 @@ async fn test_media_flow_and_pli() -> Result<()> {
             };
             let sample = MediaSample::Video(frame);
 
-            if source_clone.send(sample).await.is_err() {
+            if source_clone.send(sample).is_err() {
                 break;
             }
             seq += 1;

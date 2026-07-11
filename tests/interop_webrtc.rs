@@ -241,7 +241,7 @@ async fn interop_vp8_echo() -> Result<()> {
                 payload_type: None,
                 ..Default::default()
             };
-            if let Err(_) = source_clone.send_video(frame).await {
+            if let Err(_) = source_clone.send_video(frame) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(33)).await;
@@ -440,7 +440,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
                 payload_type: None,
                 ..Default::default()
             };
-            if let Err(_) = source_clone.send_video(frame).await {
+            if let Err(_) = source_clone.send_video(frame) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(33)).await;

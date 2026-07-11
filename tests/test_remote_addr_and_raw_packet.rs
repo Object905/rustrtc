@@ -79,7 +79,7 @@ async fn test_remote_addr_and_raw_packet() -> Result<()> {
             };
             let sample = MediaSample::Video(frame);
 
-            if source_clone.send(sample).await.is_err() {
+            if source_clone.send(sample).is_err() {
                 break;
             }
             seq += 1;

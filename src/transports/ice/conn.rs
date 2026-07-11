@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 /// Per-source-address state tracked during the latching probation period.
 ///
@@ -427,7 +427,7 @@ impl PacketReceiver for IceConn {
                 // tracing::trace!("IceConn: Forwarding DTLS packet to receiver");
                 strong_rx.receive(packet, addr, marshal_buf).await;
             } else {
-                debug!("IceConn: Received DTLS packet but no receiver registered");
+                trace!("IceConn: Received DTLS packet but no receiver registered");
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP
@@ -547,7 +547,7 @@ impl PacketReceiver for IceConn {
                                     *self.remote_addr.write() = win_addr;
                                 }
                                 self.rtp_latched.store(true, Ordering::Relaxed);
-                                tracing::info!(
+                                trace!(
                                     "IceConn: RTP latched to {} after probation \
                                          (expected_ssrc={}, total_obs={})",
                                     win_addr,
@@ -563,7 +563,7 @@ impl PacketReceiver for IceConn {
                                 *self.remote_addr.write() = addr;
                             }
                             self.rtp_latched.store(true, Ordering::Relaxed);
-                            tracing::info!(
+                            trace!(
                                 "IceConn: RTP latched to {} immediately \
                                      (expected_ssrc={})",
                                 addr,
@@ -597,7 +597,7 @@ impl PacketReceiver for IceConn {
                 }
                 strong_rx.receive(packet, addr, marshal_buf).await;
             } else {
-                tracing::debug!(
+                trace!(
                     "IceConn: No RTP receiver registered for packet from {}",
                     addr
                 );

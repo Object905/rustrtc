@@ -510,7 +510,7 @@ async fn setup_new_peer(peer: Arc<Peer>, room: Arc<Room>) {
                                     }
                                 }
 
-                                if let Err(_) = source.send(sample).await {
+                                if let Err(_) = source.send(sample) {
                                     break;
                                 }
                             }

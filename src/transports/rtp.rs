@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, trace, warn};
 
 const EXT_ID_NONE: u8 = 0;
 
@@ -122,6 +122,7 @@ impl RewriteBridge {
 struct ListenerRegistry {
     by_ssrc: HashMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>,
     by_rid: HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
+    by_mid: HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>,
     routes: Vec<ListenerRoute>,
 }
 
@@ -156,6 +157,7 @@ impl ListenerRegistry {
     }
 
     fn register_mid(&mut self, mid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
+        self.by_mid.insert(mid.clone(), tx.clone());
         self.route_for_sender_mut(&tx).mid = Some(mid);
     }
 
@@ -185,10 +187,7 @@ impl ListenerRegistry {
     }
 
     fn by_mid(&self, mid: &str) -> Option<mpsc::Sender<(RtpPacket, SocketAddr)>> {
-        self.routes
-            .iter()
-            .find(|route| route.mid.as_deref() == Some(mid))
-            .map(|route| route.tx.clone())
+        self.by_mid.get(mid).cloned()
     }
 
     fn unique_by_pt(&self, pt: u8) -> Option<mpsc::Sender<(RtpPacket, SocketAddr)>> {
@@ -235,6 +234,7 @@ impl ListenerRegistry {
         self.by_ssrc
             .retain(|_, existing| !existing.same_channel(tx));
         self.by_rid.retain(|_, existing| !existing.same_channel(tx));
+        self.by_mid.retain(|_, existing| !existing.same_channel(tx));
         self.routes.retain(|route| !route.tx.same_channel(tx));
     }
 }
@@ -397,7 +397,7 @@ impl RtpTransport {
             let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
             let data = abs_send_time.to_be_bytes();
             if let Err(e) = packet.header.set_extension(id, &data[1..4]) {
-                debug!("RtpTransport: abs-send-time extension skipped: {}", e);
+                trace!("RtpTransport: abs-send-time extension skipped: {}", e);
             }
         }
 
@@ -437,14 +437,13 @@ impl RtpTransport {
     }
 
     pub async fn send_rtcp(&self, packets: &[RtcpPacket]) -> Result<usize> {
-        let raw = marshal_rtcp_packets(packets)?;
+        let mut raw = marshal_rtcp_packets(packets)?;
         let protected = {
             let session_guard = self.srtp_session.lock();
             if let Some(session) = &*session_guard {
                 let mut srtp = session.lock();
-                let mut buf = raw.clone();
-                srtp.protect_rtcp(&mut buf)?;
-                buf
+                srtp.protect_rtcp(&mut raw)?;
+                raw
             } else {
                 if self.srtp_required {
                     tracing::warn!("Failed to send PLI: SRTP required but session not ready");
@@ -520,7 +519,7 @@ impl PacketReceiver for RtpTransport {
                     }
                 } else {
                     if self.srtp_required {
-                        tracing::debug!(
+                        trace!(
                             "Dropping packet because SRTP is required but session is not ready"
                         );
                         return;
@@ -542,11 +541,11 @@ impl PacketReceiver for RtpTransport {
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("RTCP parse failed: {}", e);
+                        trace!("RTCP parse failed: {}", e);
                     }
                 }
             } else {
-                tracing::debug!(
+                trace!(
                     "No RTCP listener, dropping {} bytes from {}",
                     unprotected.len(),
                     addr
@@ -565,13 +564,13 @@ impl PacketReceiver for RtpTransport {
                             Err(_) => return,
                         },
                         Err(e) => {
-                            tracing::debug!("RTP parse failed: {}", e);
+                            trace!("RTP parse failed: {}", e);
                             return;
                         }
                     }
                 } else {
                     if self.srtp_required {
-                        tracing::debug!(
+                        trace!(
                             "Dropping packet because SRTP is required but session is not ready"
                         );
                         return;
@@ -582,7 +581,7 @@ impl PacketReceiver for RtpTransport {
                     match RtpPacket::parse_bytes(packet.clone()) {
                         Ok(rtp_packet) => rtp_packet,
                         Err(e) => {
-                            tracing::debug!("RTP parse failed: {}", e);
+                            trace!("RTP parse failed: {}", e);
                             return;
                         }
                     }
@@ -655,7 +654,7 @@ impl PacketReceiver for RtpTransport {
                     }
                 }
             } else {
-                tracing::debug!(
+                trace!(
                     "No listener found for packet SSRC: {} PT: {} from {}",
                     ssrc,
                     pt,

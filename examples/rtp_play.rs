@@ -88,7 +88,7 @@ async fn main() {
     loop {
         match packetizer.next_sample().await {
             Ok(sample) => {
-                if let Err(e) = sample_source.send(sample).await {
+                if let Err(e) = sample_source.send(sample) {
                     eprintln!("Failed to send sample to track: {}", e);
                     break;
                 }

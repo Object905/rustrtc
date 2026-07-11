@@ -203,15 +203,15 @@ impl SampleStreamSource {
         self.kind
     }
 
-    pub async fn send_audio(&self, frame: AudioFrame) -> MediaResult<()> {
-        self.send(MediaSample::Audio(frame)).await
+    pub fn send_audio(&self, frame: AudioFrame) -> MediaResult<()> {
+        self.send(MediaSample::Audio(frame))
     }
 
-    pub async fn send_video(&self, frame: VideoFrame) -> MediaResult<()> {
-        self.send(MediaSample::Video(frame)).await
+    pub fn send_video(&self, frame: VideoFrame) -> MediaResult<()> {
+        self.send(MediaSample::Video(frame))
     }
 
-    pub async fn send(&self, sample: MediaSample) -> MediaResult<()> {
+    pub fn send(&self, sample: MediaSample) -> MediaResult<()> {
         if sample.kind() != self.kind {
             return Err(MediaError::KindMismatch {
                 expected: self.kind,
@@ -221,7 +221,7 @@ impl SampleStreamSource {
         self.try_send_drop_oldest(sample)
     }
 
-    pub async fn send_many<I>(&self, samples: I) -> MediaResult<()>
+    pub fn send_many<I>(&self, samples: I) -> MediaResult<()>
     where
         I: IntoIterator<Item = MediaSample>,
     {
@@ -685,7 +685,6 @@ mod tests {
             .send_audio(AudioFrame {
                 ..Default::default()
             })
-            .await
             .unwrap();
         let _sample = selector.recv_audio().await.unwrap();
 
@@ -697,7 +696,6 @@ mod tests {
             .send_audio(AudioFrame {
                 ..Default::default()
             })
-            .await
             .unwrap();
         let _sample = selector.recv_audio().await.unwrap();
     }
@@ -737,7 +735,7 @@ mod tests {
             format: VideoPixelFormat::Rgba,
             ..Default::default()
         };
-        let err = source.send_video(video).await.unwrap_err();
+        let err = source.send_video(video).unwrap_err();
         assert!(matches!(err, MediaError::KindMismatch { .. }));
     }
 
@@ -762,7 +760,7 @@ mod tests {
             data: Bytes::from_static(&[1u8; 4]),
             ..Default::default()
         };
-        source.send_audio(frame.clone()).await.unwrap();
+        source.send_audio(frame.clone()).unwrap();
 
         let sample_a = subscriber_a.recv().await.unwrap();
         let sample_b = subscriber_b.recv().await.unwrap();
@@ -790,7 +788,7 @@ mod tests {
     async fn audio_trait_helper_returns_frame() {
         let (source, track, _) = sample_track(MediaKind::Audio, 1);
         let frame = AudioFrame::default();
-        source.send_audio(frame.clone()).await.unwrap();
+        source.send_audio(frame.clone()).unwrap();
         let output = track.recv_audio().await.unwrap();
         assert_eq!(output.payload_type, frame.payload_type);
     }
@@ -798,8 +796,8 @@ mod tests {
     #[tokio::test]
     async fn send_drops_when_queue_is_full() {
         let (source, _track, _) = sample_track(MediaKind::Audio, 1);
-        source.send_audio(AudioFrame::default()).await.unwrap();
-        source.send_audio(AudioFrame::default()).await.unwrap();
+        source.send_audio(AudioFrame::default()).unwrap();
+        source.send_audio(AudioFrame::default()).unwrap();
     }
 
     #[tokio::test]
@@ -814,8 +812,8 @@ mod tests {
             ..Default::default()
         };
 
-        source.send_audio(first).await.unwrap();
-        source.send_audio(second.clone()).await.unwrap();
+        source.send_audio(first).unwrap();
+        source.send_audio(second.clone()).unwrap();
 
         let recv = track.recv_audio().await.unwrap();
         assert_eq!(recv.data, second.data);
@@ -825,16 +823,11 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // intentionally held to prove send_audio doesn't deadlock
     async fn send_does_not_block_when_receiver_lock_is_held() {
         let (source, _track, _) = sample_track(MediaKind::Audio, 1);
-        source.send_audio(AudioFrame::default()).await.unwrap();
+        source.send_audio(AudioFrame::default()).unwrap();
 
         let _pop_lock = source.pop_lock.lock();
-        tokio::time::timeout(
-            tokio::time::Duration::from_millis(20),
-            source.send_audio(AudioFrame::default()),
-        )
-        .await
-        .expect("send should not block while receiver lock is held")
-        .unwrap();
+        source.send_audio(AudioFrame::default())
+            .expect("send should not block while receiver lock is held");
     }
 
     #[tokio::test]

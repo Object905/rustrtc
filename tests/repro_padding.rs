@@ -101,7 +101,7 @@ async fn test_padding_packet_drop() -> Result<()> {
             match track2.recv().await {
                 Ok(sample) => {
                     // Echo the sample
-                    let _ = sample_source.send(sample).await;
+                    let _ = sample_source.send(sample);
                 }
                 Err(_) => break,
             }
@@ -121,7 +121,7 @@ async fn test_padding_packet_drop() -> Result<()> {
         data: Bytes::from(vec![0x90, 0x80, 0x01]),
         ..Default::default()
     };
-    client_source.send_video(f1).await?;
+    client_source.send_video(f1)?;
     println!("Sent P1");
 
     // Packet 2: Empty (Padding)
@@ -131,7 +131,7 @@ async fn test_padding_packet_drop() -> Result<()> {
         data: Bytes::new(), // Empty
         ..Default::default()
     };
-    client_source.send_video(f2).await?;
+    client_source.send_video(f2)?;
     println!("Sent P2");
 
     // Packet 3: Valid
@@ -142,7 +142,7 @@ async fn test_padding_packet_drop() -> Result<()> {
         is_last_packet: true,
         ..Default::default()
     };
-    client_source.send_video(f3).await?;
+    client_source.send_video(f3)?;
     println!("Sent P3");
 
     // 7. Verify Reception on PC1

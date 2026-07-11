@@ -205,7 +205,7 @@ async fn run_client(addr_str: &str) {
                 data: bytes::Bytes::from_static(&[0u8; 100]),
                 ..Default::default()
             };
-            let _ = source.send_video(frame).await;
+            let _ = source.send_video(frame);
         }
     });
 

@@ -539,7 +539,7 @@ fn apply_sack_to_sent_queue(
 
             // Log first few missing TSNs
             if missing_count <= 3 {
-                debug!(
+                trace!(
                     "Missing TSN {} reports: {} -> {}, acked={}, fast_retrans={}",
                     tsn, old_reports, record.missing_reports, record.acked, record.fast_retransmit
                 );
@@ -578,7 +578,7 @@ fn apply_sack_to_sent_queue(
                     outcome.flight_reduction += len;
                 }
 
-                debug!(
+                trace!(
                     "Fast retransmit triggered for TSN {} after {} missing reports (retrans #{})",
                     tsn, DUP_THRESH, record.transmit_count
                 );
@@ -589,7 +589,7 @@ fn apply_sack_to_sent_queue(
     }
 
     if missing_count > 0 && to_retransmit.is_empty() {
-        debug!(
+        trace!(
             "Found {} missing TSNs but none reached fast retransmit threshold",
             missing_count
         );
@@ -745,7 +745,7 @@ impl SctpTransport {
                 _ = async {
                     while let Some(packet) = outgoing_packet_rx.recv().await {
                         if let Err(e) = dtls_transport_clone.send(packet).await {
-                            debug!("SCTP Failed to send outgoing DTLS packet: {}", e);
+                            trace!("SCTP Failed to send outgoing DTLS packet: {}", e);
                             if e.to_string().contains("DTLS not connected") {
                                 break;
                             }
@@ -1026,26 +1026,26 @@ impl SctpInner {
                 _ = self.timer_notify.notified() => {
                     // Woken up by sender, recalculate timeout
                     if let Err(e) = self.transmit().await {
-                         debug!("Transmit error: {}", e);
+                         trace!("Transmit error: {}", e);
                     }
                 },
                 _ = tokio::time::sleep(sleep_duration) => {
                     // Check T1 Timer (INIT / COOKIE-ECHO retransmission)
                     if let Err(e) = self.handle_t1_timeout().await {
-                        debug!("SCTP T1 timeout error: {}", e);
+                        trace!("SCTP T1 timeout error: {}", e);
                     }
 
                     // Check RTO Timer
                     // We check this regardless of whether sleep woke up due to RTO or SACK,
                     // because they might be close.
                     if let Err(e) = self.handle_timeout().await {
-                        debug!("SCTP handle timeout error: {}", e);
+                        trace!("SCTP handle timeout error: {}", e);
                     }
 
                     // Check Heartbeat Timer
                     if Instant::now() >= last_heartbeat + heartbeat_interval {
                         if let Err(e) = self.send_heartbeat().await {
-                            debug!("Failed to send HEARTBEAT: {}", e);
+                            trace!("Failed to send HEARTBEAT: {}", e);
                         }
                         last_heartbeat = Instant::now();
                     }
@@ -1054,18 +1054,18 @@ impl SctpInner {
                     match res {
                         Some(packet) => {
                             if let Err(e) = self.handle_packet(packet).await {
-                                debug!("SCTP handle packet error: {}", e);
+                                trace!("SCTP handle packet error: {}", e);
                             }
                             // Batch receive: try to drain channel
                             while let Ok(packet) = incoming_data_rx.try_recv() {
                                 if let Err(e) = self.handle_packet(packet).await {
-                                    debug!("SCTP handle packet error: {}", e);
+                                    trace!("SCTP handle packet error: {}", e);
                                 }
                             }
 
                             // Try to transmit immediately after processing packets (e.g. SACKs releasing Window)
                             if let Err(e) = self.transmit().await {
-                                debug!("SCTP transmit error after packet: {}", e);
+                                trace!("SCTP transmit error after packet: {}", e);
                             }
                         }
                         None => {
@@ -1647,7 +1647,7 @@ impl SctpInner {
 
             // Log peer_rwnd to understand flow control
             if a_rwnd < 100000 {
-                debug!(
+                trace!(
                     "Received SACK: peer_rwnd LOW = {} (was {})",
                     a_rwnd, old_rwnd
                 );
@@ -1735,7 +1735,7 @@ impl SctpInner {
                     if cwnd >= ssthresh * 4 / 5 {
                         let new_ssthresh = (cwnd * 2).max(CWND_INITIAL * 2).min(self.max_cwnd);
                         self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-                        debug!(
+                        trace!(
                             "Raising ssthresh {} -> {} to allow faster recovery (cwnd={})",
                             ssthresh, new_ssthresh, cwnd
                         );
@@ -1751,7 +1751,7 @@ impl SctpInner {
                     let new_count = current_error_count.saturating_sub(reduction);
                     self.association_error_count
                         .store(new_count, Ordering::SeqCst);
-                    debug!(
+                    trace!(
                         "Gap ACK indicates peer is alive (acked {} bytes = ~{} packets via gaps), reducing error count {} -> {} (reduction={})",
                         outcome.bytes_acked_by_gap,
                         packets_acked,
@@ -1783,7 +1783,7 @@ impl SctpInner {
                         let old_rto = rto_state.rto;
                         rto_state.rto = ((rto_state.rto + computed_rto) / 2.0)
                             .clamp(rto_state.min, rto_state.max);
-                        debug!(
+                        trace!(
                             "RTO decay on SACK progress: {:.3}s -> {:.3}s (computed={:.3}s)",
                             old_rto, rto_state.rto, computed_rto
                         );
@@ -1812,7 +1812,7 @@ impl SctpInner {
                 if was_in_fast_recovery && !in_fast_recovery {
                     self.fast_recovery_active.store(false, Ordering::SeqCst);
                     self.fast_recovery_exit_tsn.store(0, Ordering::SeqCst);
-                    debug!(
+                    trace!(
                         "Exiting Fast Recovery! cum_ack: {}, exit_tsn: {}",
                         cumulative_tsn_ack, exit_tsn
                     );
@@ -1833,7 +1833,7 @@ impl SctpInner {
                             if actual_increase > 0 {
                                 self.cwnd_tx.fetch_add(actual_increase, Ordering::SeqCst);
                             }
-                            debug!(
+                            trace!(
                                 "Congestion Control: Slow Start cwnd_tx {} -> {} (ssthresh={}, increase={})",
                                 cwnd, new_cwnd, ssthresh, actual_increase
                             );
@@ -1850,7 +1850,7 @@ impl SctpInner {
                                 if actual_increase > 0 {
                                     self.cwnd_tx.fetch_add(actual_increase, Ordering::SeqCst);
                                 }
-                                debug!(
+                                trace!(
                                     "Congestion Control: Congestion Avoidance cwnd_tx {} -> {} (ssthresh={}, pba={})",
                                     cwnd, new_cwnd, ssthresh, total_pba
                                 );
@@ -1885,7 +1885,7 @@ impl SctpInner {
                     // the window again.  This prevents the cwnd-pinned-at-floor
                     // oscillation seen on rate-limited TURN relays.
                     if since_last < FAST_RECOVERY_REENTRY_COOLDOWN {
-                        debug!(
+                        trace!(
                             "Fast Recovery re-entry suppressed ({}ms < {}ms cooldown), retransmitting {} chunks without cwnd cut",
                             since_last.as_millis(),
                             FAST_RECOVERY_REENTRY_COOLDOWN.as_millis(),
@@ -1925,7 +1925,7 @@ impl SctpInner {
 
                         *self.last_fast_recovery_entry.lock() = now_fr;
 
-                        debug!(
+                        trace!(
                             "Entering Fast Recovery! cwnd_tx {} -> {}, cwnd_rx {} -> {}, ssthresh: {}, exit_tsn: {}, retransmitting {} chunks{}",
                             cwnd_tx,
                             new_ssthresh,
@@ -2075,7 +2075,7 @@ impl SctpInner {
                     self.handle_reconfig_outgoing_ssn_reset(param_data).await?;
                 }
                 RECONFIG_PARAM_RESPONSE => {
-                    self.handle_reconfig_response(param_data).await?;
+                    self.handle_reconfig_response(param_data)?;
                 }
                 _ => {
                     trace!("Unhandled RE-CONFIG parameter type: {}", param_type);
@@ -2139,7 +2139,7 @@ impl SctpInner {
         Ok(())
     }
 
-    async fn handle_reconfig_response(&self, mut buf: Bytes) -> Result<()> {
+    fn handle_reconfig_response(&self, mut buf: Bytes) -> Result<()> {
         if buf.remaining() < 8 {
             return Ok(());
         }
@@ -2519,7 +2519,7 @@ impl SctpInner {
                 }
             }
         } else {
-            debug!("SCTP: Received data for unknown stream id {}", stream_id);
+            trace!("SCTP: Received data for unknown stream id {}", stream_id);
         }
 
         Ok(())
@@ -3375,6 +3375,16 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    fn create_data_chunk(tsn: u32) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(tsn); // TSN
+        buf.put_u16(0); // Stream ID
+        buf.put_u16(0); // SSN
+        buf.put_u32(51); // PPID (binary)
+        buf.put_slice(b"test data");
+        buf.freeze()
+    }
 
     #[test]
     fn test_rto_calculator() {
@@ -6434,17 +6444,6 @@ mod tests {
         // Simulate receiving packets out of order: TSN 101, 102, 103 arrive, but 100 is missing
         // This should result in a SACK with cum_ack=99 and gap blocks for 101-103
 
-        // Create DATA chunk for TSN 101
-        let create_data_chunk = |tsn: u32| -> Bytes {
-            let mut buf = BytesMut::new();
-            buf.put_u32(tsn); // TSN
-            buf.put_u16(0); // Stream ID
-            buf.put_u16(0); // SSN
-            buf.put_u32(51); // PPID (binary)
-            buf.put_slice(b"test data");
-            buf.freeze()
-        };
-
         // Receive TSN 101 (out of order)
         let chunk_101 = create_data_chunk(101);
         sctp.inner
@@ -6723,17 +6722,6 @@ mod tests {
             .store(12345, Ordering::SeqCst);
         sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
 
-        // Create DATA chunk
-        let create_data_chunk = |tsn: u32| -> Bytes {
-            let mut buf = BytesMut::new();
-            buf.put_u32(tsn); // TSN
-            buf.put_u16(0); // Stream ID
-            buf.put_u16(0); // SSN
-            buf.put_u32(51); // PPID (binary)
-            buf.put_slice(b"test data");
-            buf.freeze()
-        };
-
         // Receive TSN 100 for the first time
         let chunk_100 = create_data_chunk(100);
         sctp.inner
@@ -6993,16 +6981,6 @@ mod tests {
             .store(12345, Ordering::SeqCst);
         sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
 
-        let create_data_chunk = |tsn: u32| -> Bytes {
-            let mut buf = BytesMut::new();
-            buf.put_u32(tsn);
-            buf.put_u16(0);
-            buf.put_u16(0);
-            buf.put_u32(51);
-            buf.put_slice(b"test data");
-            buf.freeze()
-        };
-
         // Step 1: Receive TSN 101 (out of order, TSN 100 missing)
         println!("\nStep 1: Receive TSN 101 (out of order)");
         let chunk_101 = create_data_chunk(101);
@@ -7144,16 +7122,6 @@ mod tests {
             .remote_verification_tag
             .store(12345, Ordering::SeqCst);
         sctp.inner.cumulative_tsn_ack.store(99, Ordering::SeqCst);
-
-        let create_data_chunk = |tsn: u32| -> Bytes {
-            let mut buf = BytesMut::new();
-            buf.put_u32(tsn);
-            buf.put_u16(0);
-            buf.put_u16(0);
-            buf.put_u32(51);
-            buf.put_slice(b"test data");
-            buf.freeze()
-        };
 
         // Receive packet, this sets sack_needed
         println!("\n1. Receive TSN 100");

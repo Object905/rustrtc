@@ -153,7 +153,7 @@ async fn interop_turn_datachannel_test() -> Result<()> {
     println!("ICE Connected");
 
     // Check selected pair
-    if let Some(pair) = rust_pc.ice_transport().get_selected_pair().await {
+    if let Some(pair) = rust_pc.ice_transport().get_selected_pair() {
         println!("Selected ICE Pair:");
         println!("  Local: {:?} {}", pair.local.typ, pair.local.address);
         println!("  Remote: {:?} {}", pair.remote.typ, pair.remote.address);

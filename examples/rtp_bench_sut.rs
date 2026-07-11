@@ -136,7 +136,7 @@ async fn start_forwarding(pc: PeerConnection, pt: u8, echo_addr: SocketAddr) {
                                 ..Default::default()
                             })
                         };
-                        if let Err(e) = sample_source_clone.send(sample).await {
+                        if let Err(e) = sample_source_clone.send(sample) {
                             warn!("Sample source for {} error: {}", ssrc, e);
                             break;
                         }

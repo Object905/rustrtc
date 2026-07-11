@@ -104,7 +104,7 @@ async fn test_rtp_mode_no_default_extensions() -> Result<()> {
                 is_last_packet: true,
                 ..Default::default()
             };
-            if source_clone.send(MediaSample::Video(frame)).await.is_err() {
+            if source_clone.send(MediaSample::Video(frame)).is_err() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

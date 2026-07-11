@@ -311,7 +311,7 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
                             f.header_extension = None;
                         }
 
-                        if let Err(err) = sample_source.send(sample).await {
+                        if let Err(err) = sample_source.send(sample) {
                             warn!("Video echo forwarder stopped: {}", err);
                             break;
                         }

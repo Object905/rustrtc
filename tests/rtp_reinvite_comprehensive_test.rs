@@ -520,7 +520,7 @@ async fn test_reinvite_updates_remote_addr() {
 
     // Verify initial remote address
     let initial_pair: Option<rustrtc::transports::ice::IceCandidatePair> =
-        pc.ice_transport().get_selected_pair().await;
+        pc.ice_transport().get_selected_pair();
     assert!(initial_pair.is_some());
     assert_eq!(
         initial_pair.unwrap().remote.address,
@@ -548,7 +548,7 @@ async fn test_reinvite_updates_remote_addr() {
 
     // Verify selected_pair reflects new remote address after reinvite
     let updated_pair: Option<rustrtc::transports::ice::IceCandidatePair> =
-        pc.ice_transport().get_selected_pair().await;
+        pc.ice_transport().get_selected_pair();
     assert!(updated_pair.is_some());
     assert_eq!(
         updated_pair.unwrap().remote.address,

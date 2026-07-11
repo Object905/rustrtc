@@ -181,7 +181,7 @@ async fn test_rtp_latching() -> Result<()> {
                 is_last_packet: true,
                 ..Default::default()
             };
-            if source_clone.send(MediaSample::Video(frame)).await.is_err() {
+            if source_clone.send(MediaSample::Video(frame)).is_err() {
                 break;
             }
             seq += 1;

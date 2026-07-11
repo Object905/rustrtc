@@ -316,7 +316,7 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     r2?;
 
     // Verify selected pair on transport 1 is Relay
-    let pair1 = transport1.get_selected_pair().await.unwrap();
+    let pair1 = transport1.get_selected_pair().unwrap();
     assert_eq!(pair1.local.typ, IceCandidateType::Relay);
 
     // Send data
@@ -338,8 +338,8 @@ async fn turn_connection_relay_to_host() -> Result<()> {
         .set_data_receiver(Arc::new(TestReceiver(tx2)))
         .await;
 
-    let socket1 = transport1.get_selected_socket().await.unwrap();
-    let pair1 = transport1.get_selected_pair().await.unwrap();
+    let socket1 = transport1.get_selected_socket().unwrap();
+    let pair1 = transport1.get_selected_pair().unwrap();
 
     let data = Bytes::from_static(b"hello from 1");
     socket1.send_to(&data, pair1.remote.address).await?;
@@ -350,8 +350,8 @@ async fn turn_connection_relay_to_host() -> Result<()> {
     assert_eq!(received, data);
 
     // Send data back
-    let socket2 = transport2.get_selected_socket().await.unwrap();
-    let pair2 = transport2.get_selected_pair().await.unwrap();
+    let socket2 = transport2.get_selected_socket().unwrap();
+    let pair2 = transport2.get_selected_pair().unwrap();
     let data2 = Bytes::from_static(b"hello from 2");
     socket2.send_to(&data2, pair2.remote.address).await?;
 
@@ -735,8 +735,8 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     )?;
 
     // Verify selected pairs
-    let lite_pair = ice_lite.get_selected_pair().await.unwrap();
-    let full_pair = ice_full.get_selected_pair().await.unwrap();
+    let lite_pair = ice_lite.get_selected_pair().unwrap();
+    let full_pair = ice_full.get_selected_pair().unwrap();
 
     println!(
         "ICE-lite selected pair: {} -> {}",
@@ -772,7 +772,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
         .await;
 
     // Send data from full agent to ICE-lite using the remote address from the pair
-    let full_socket = ice_full.get_selected_socket().await.unwrap();
+    let full_socket = ice_full.get_selected_socket().unwrap();
     let test_data = Bytes::from_static(b"Hello from full ICE agent");
     // Use full_pair.remote.address which should be the ICE-lite's address
     full_socket
@@ -785,7 +785,7 @@ async fn test_ice_lite_connectivity_establishment() -> Result<()> {
     assert_eq!(received_by_lite, test_data);
 
     // Send data from ICE-lite to full agent using the remote address from the pair
-    let lite_socket = ice_lite.get_selected_socket().await.unwrap();
+    let lite_socket = ice_lite.get_selected_socket().unwrap();
     let response_data = Bytes::from_static(b"Hello from ICE-lite agent");
     // Use lite_pair.remote.address which should be the full agent's address
     lite_socket
@@ -1231,13 +1231,13 @@ async fn test_ice_connection_with_external_ip() -> Result<()> {
     );
 
     // Verify selected pair exists
-    let selected_pair = controlling.get_selected_pair().await;
+    let selected_pair = controlling.get_selected_pair();
     assert!(
         selected_pair.is_some(),
         "Controlling agent should have a selected pair"
     );
 
-    let selected_pair = controlled.get_selected_pair().await;
+    let selected_pair = controlled.get_selected_pair();
     assert!(
         selected_pair.is_some(),
         "Controlled agent should have a selected pair"
@@ -1361,7 +1361,7 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
     );
 
     // Verify selected pair exists and is valid
-    let ctrl_pair = controlling.get_selected_pair().await;
+    let ctrl_pair = controlling.get_selected_pair();
     assert!(
         ctrl_pair.is_some(),
         "Controlling agent should have a selected pair"
@@ -1377,7 +1377,7 @@ async fn test_ice_connection_without_external_ip() -> Result<()> {
         "Remote address should have valid port"
     );
 
-    let ctrd_pair = controlled.get_selected_pair().await;
+    let ctrd_pair = controlled.get_selected_pair();
     assert!(
         ctrd_pair.is_some(),
         "Controlled agent should have a selected pair"
@@ -1948,13 +1948,13 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
     })
     .await;
 
-    let ctrl_pair = controlling.get_selected_pair().await;
+    let ctrl_pair = controlling.get_selected_pair();
     assert!(
         ctrl_pair.is_some(),
         "Even when nomination times out, ICE selected pair should exist. nom={:?}",
         nom
     );
-    let ctrd_pair = controlled.get_selected_pair().await;
+    let ctrd_pair = controlled.get_selected_pair();
     assert!(
         ctrd_pair.is_some(),
         "Controlled side should have a selected pair even when controlling nomination times out"
@@ -2016,7 +2016,7 @@ async fn test_dtls_proceeds_after_nomination_timeout() -> Result<()> {
     .ok()
     .flatten();
 
-    if let (Some(sock), Some(ctrl_pair)) = (ctrl_sock, controlling.get_selected_pair().await) {
+    if let (Some(sock), Some(ctrl_pair)) = (ctrl_sock, controlling.get_selected_pair()) {
         let _ = sock.send_to(&test_payload, ctrl_pair.remote.address).await;
         let received = timeout(Duration::from_secs(2), rx2.recv()).await;
         if let Ok(Some(pkt)) = received {
@@ -2116,7 +2116,7 @@ async fn test_nomination_fallback_all_pairs_fail() -> Result<()> {
     }
 
     // Selected pair should exist regardless
-    let pair = controlling.get_selected_pair().await;
+    let pair = controlling.get_selected_pair();
     assert!(
         pair.is_some(),
         "selected pair should exist even after nomination outcome"
@@ -2173,7 +2173,7 @@ async fn test_nomination_fallback_controlled_side_works() -> Result<()> {
     );
 
     // Controlled side should have a selected pair
-    let ctrd_pair = controlled.get_selected_pair().await;
+    let ctrd_pair = controlled.get_selected_pair();
     assert!(
         ctrd_pair.is_some(),
         "Controlled side should have a selected pair"
@@ -2686,7 +2686,7 @@ async fn use_candidate_nominates_first_pair() -> Result<()> {
 
     // Controlled side must have a selected pair after nomination.
     assert!(
-        t2.get_selected_pair().await.is_some(),
+        t2.get_selected_pair().is_some(),
         "controlled side must have a selected pair after the first USE-CANDIDATE"
     );
 
@@ -2760,7 +2760,6 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
     // 2. Record the nominated pair and subscribe to future pair changes.
     let nominated_pair = t2
         .get_selected_pair()
-        .await
         .expect("controlled side must have a selected pair after nomination");
 
     let mut pair_rx = t2.subscribe_selected_pair();
@@ -2801,7 +2800,6 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
 
     let final_pair = t2
         .get_selected_pair()
-        .await
         .expect("selected pair should still be present");
     assert_eq!(
         nominated_pair.remote.address, final_pair.remote.address,
@@ -2862,7 +2860,6 @@ async fn test_buffered_dtls_packets_delivered_when_dtls_receiver_registered_firs
     // 1. Create IceConn (same as start_dtls does)
     let selected_pair = ctrl
         .get_selected_pair()
-        .await
         .expect("Should have selected pair after ICE connected");
     let socket_rx = ctrl.subscribe_selected_socket();
     let ice_conn = IceConn::new(socket_rx, selected_pair.remote.address, None);
@@ -3307,7 +3304,7 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
     assert!(ctrd_ok, "Controlled side should connect over TCP");
 
     // Verify the selected pair uses TCP transport
-    let selected_pair = controlling.get_selected_pair().await;
+    let selected_pair = controlling.get_selected_pair();
     assert!(selected_pair.is_some(), "Should have a selected pair");
     let pair = selected_pair.unwrap();
     assert_eq!(
@@ -3317,7 +3314,7 @@ async fn test_ice_tcp_end_to_end_connectivity() -> Result<()> {
     );
 
     // Verify we can get a selected socket
-    let wrapper = controlling.get_selected_socket().await;
+    let wrapper = controlling.get_selected_socket();
     assert!(wrapper.is_some(), "Should have a selected socket");
     let wrapper = wrapper.unwrap();
     assert!(
@@ -3400,14 +3397,14 @@ async fn test_ice_tcp_data_flow_bidirectional() -> Result<()> {
     assert!(ctrd_ok, "Controlled should connect over TCP");
 
     // Verify both sides selected TCP transport
-    let ctrl_pair = controlling.get_selected_pair().await.unwrap();
-    let ctrd_pair = controlled.get_selected_pair().await.unwrap();
+    let ctrl_pair = controlling.get_selected_pair().unwrap();
+    let ctrd_pair = controlled.get_selected_pair().unwrap();
     assert_eq!(ctrl_pair.local.transport, "tcp");
     assert_eq!(ctrd_pair.local.transport, "tcp");
 
     // Verify the selected sockets are TcpStream
-    let ctrl_socket = controlling.get_selected_socket().await.unwrap();
-    let ctrd_socket = controlled.get_selected_socket().await.unwrap();
+    let ctrl_socket = controlling.get_selected_socket().unwrap();
+    let ctrd_socket = controlled.get_selected_socket().unwrap();
     assert!(matches!(ctrl_socket, IceSocketWrapper::TcpStream(_, _, _)));
     assert!(matches!(ctrd_socket, IceSocketWrapper::TcpStream(_, _, _)));
 
@@ -3604,7 +3601,7 @@ async fn ice_udp_mux_connects_through_shared_port() -> Result<()> {
     .context("timed out waiting for ICE connection through UDP mux")??;
 
     // The controlled side must send/receive via the shared UDP socket.
-    let selected = controlled.get_selected_socket().await.unwrap();
+    let selected = controlled.get_selected_socket().unwrap();
     assert!(
         matches!(selected, IceSocketWrapper::SharedUdp(_)),
         "controlled mux side should use the shared UDP socket, got: {}",

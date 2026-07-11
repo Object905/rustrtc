@@ -100,7 +100,7 @@ fn sample_queue_channel(capacity: usize) -> (SampleQueueSender, SampleQueueRecei
 }
 
 impl SampleQueueSender {
-    pub async fn send(&self, sample: MediaSample) -> Result<(), ()> {
+    pub fn send(&self, sample: MediaSample) -> Result<(), ()> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(());
         }
@@ -227,7 +227,6 @@ impl MediaSink for ChannelMediaSink {
         }
         self.sender
             .send(sample)
-            .await
             .map_err(|_| MediaError::Closed)
     }
 }
@@ -279,7 +278,7 @@ impl MediaSink for TrackMediaSink {
     }
 
     async fn consume(&self, sample: MediaSample) -> MediaResult<()> {
-        self.source.send(sample).await
+        self.source.send(sample)
     }
 }
 
@@ -337,7 +336,6 @@ mod tests {
                 data: Bytes::from_static(&[1; 4]),
                 ..AudioFrame::default()
             })
-            .await
             .unwrap();
         let sample = track_source.next_sample().await.unwrap();
         assert!(matches!(sample, MediaSample::Audio(_)));
@@ -358,7 +356,7 @@ mod tests {
         let sample = MediaSample::Audio(AudioFrame {
             ..AudioFrame::default()
         });
-        sender.send(sample.clone()).await.unwrap();
+        sender.send(sample.clone()).unwrap();
         let output = source.next_sample().await.unwrap();
         assert_eq!(output, sample);
     }
@@ -386,7 +384,6 @@ mod tests {
             .send_audio(AudioFrame {
                 ..AudioFrame::default()
             })
-            .await
             .unwrap();
 
         let received = receiver.recv().await.unwrap();
@@ -417,7 +414,6 @@ mod tests {
 
         source_handle
             .send_audio(AudioFrame::default())
-            .await
             .unwrap();
 
         let err = pump.await.unwrap().unwrap_err();
@@ -436,7 +432,6 @@ mod tests {
             .send(MediaSample::Audio(AudioFrame {
                 ..AudioFrame::default()
             }))
-            .await
             .unwrap();
 
         let sample = track.recv().await.unwrap();
@@ -456,7 +451,6 @@ mod tests {
             .send_audio(AudioFrame {
                 ..AudioFrame::default()
             })
-            .await
             .unwrap();
 
         let received = track.recv().await.unwrap();

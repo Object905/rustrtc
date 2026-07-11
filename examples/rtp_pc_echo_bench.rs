@@ -220,7 +220,7 @@ async fn start_echo_tracks(pc: PeerConnection, counters: Arc<ServerCounters>) {
                 match incoming_track.recv().await {
                     Ok(sample) => {
                         counters_ref.rx_packets.fetch_add(1, Ordering::Relaxed);
-                        if sample_source.send(sample).await.is_err() {
+                        if sample_source.send(sample).is_err() {
                             break;
                         }
                         counters_ref.tx_packets.fetch_add(1, Ordering::Relaxed);

@@ -97,7 +97,7 @@ async fn test_rtp_mode_peer_connection() -> Result<()> {
             };
             let sample = MediaSample::Video(frame);
 
-            if source_clone.send(sample).await.is_err() {
+            if source_clone.send(sample).is_err() {
                 break;
             }
             seq += 1;

@@ -95,7 +95,7 @@ impl DefaultRtpSenderBitrateHandler {
 impl RtpSenderInterceptor for DefaultRtpSenderBitrateHandler {
     async fn on_rtcp_received(&self, packet: &RtcpPacket, _transport: Arc<RtpTransport>) {
         if let RtcpPacket::RemoteBitrateEstimate(remb) = packet {
-            debug!("Received REMB: {} bps", remb.bitrate_bps);
+            trace!("Received REMB: {} bps", remb.bitrate_bps);
         }
     }
 }
@@ -122,7 +122,7 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
 
     async fn on_rtcp_received(&self, packet: &RtcpPacket, transport: Arc<RtpTransport>) {
         if let RtcpPacket::GenericNack(nack) = packet {
-            debug!(
+            trace!(
                 "NACK: received NACK for {} packets",
                 nack.lost_packets.len()
             );
@@ -142,7 +142,7 @@ impl RtpSenderInterceptor for DefaultRtpSenderNackHandler {
 
             for packet in to_resend {
                 let seq_num = packet.header.sequence_number;
-                debug!("NACK: retransmitting packet seq={}", seq_num);
+                trace!("NACK: retransmitting packet seq={}", seq_num);
                 let _ = transport.send_rtp(packet).await;
             }
         }
@@ -219,7 +219,7 @@ impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
                 lost.push(s);
                 s = s.wrapping_add(1);
             }
-            debug!(
+            trace!(
                 "NACK: detected gap from {} to {}, lost {} packets",
                 last,
                 seq,
@@ -238,7 +238,7 @@ impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
         if diff < 32768 {
             self.last_seq.store(seq, Ordering::SeqCst);
         } else if diff > 32768 {
-            debug!("NACK: received old packet seq={}, last={}", seq, last);
+            trace!("NACK: received old packet seq={}, last={}", seq, last);
             self.nack_recovered_count.fetch_add(1, Ordering::Relaxed);
         }
         None
@@ -1468,7 +1468,6 @@ impl PeerConnection {
             .inner
             .ice_transport
             .get_selected_pair()
-            .await
             .ok_or(RtcError::Internal("No selected pair".into()))?;
 
         let socket_rx = self.inner.ice_transport.subscribe_selected_socket();
@@ -2431,7 +2430,7 @@ impl PeerConnection {
                                 let is_for_sender = match &packet {
                                     RtcpPacket::PictureLossIndication(p) => {
                                         if p.media_ssrc == sender.ssrc() {
-                                            debug!("Received PLI for SSRC: {}", p.media_ssrc);
+                                            trace!("Received PLI for SSRC: {}", p.media_ssrc);
                                             true
                                         } else {
                                             false
@@ -2708,7 +2707,7 @@ impl PeerConnection {
         }
     }
 
-    pub async fn sctp_buffered_amount(&self) -> usize {
+    pub fn sctp_buffered_amount(&self) -> usize {
         let transport = self.inner.sctp_transport.lock().clone();
         if let Some(transport) = transport {
             transport.buffered_amount()
@@ -3054,6 +3053,40 @@ impl PeerConnection {
     }
 }
 
+fn update_local_description_on_gather(
+    inner: &PeerConnectionInner,
+    ice_transport: &IceTransport,
+) -> bool {
+    if inner.config.transport_mode == TransportMode::WebRtc {
+        let candidates = ice_transport.local_candidates();
+        let candidate_strs: Vec<String> =
+            candidates.iter().map(|c| c.to_sdp()).collect();
+        let mut local_guard = inner.local_description.lock();
+        if let Some(desc) = local_guard.as_mut() {
+            desc.add_candidates(&candidate_strs);
+        }
+        true
+    } else {
+        let candidates = ice_transport.local_candidates();
+        if let Some(candidate) = candidates.first() {
+            let mut local_guard = inner.local_description.lock();
+            if let Some(desc) = local_guard.as_mut() {
+                for media in &mut desc.media_sections {
+                    media.port = candidate.address.port();
+                    let ip_str = candidate.address.ip().to_string();
+                    let ip_ver = if candidate.address.is_ipv4() {
+                        "IP4"
+                    } else {
+                        "IP6"
+                    };
+                    media.connection = Some(format!("IN {} {}", ip_ver, ip_str));
+                }
+            }
+        }
+        true
+    }
+}
+
 async fn run_gathering_loop(
     ice_transport: IceTransport,
     ice_gathering_state_tx: watch::Sender<IceGatheringState>,
@@ -3066,42 +3099,10 @@ async fn run_gathering_loop(
         if state == crate::transports::ice::IceGathererState::Complete
             && let Some(inner) = inner_weak.upgrade()
         {
-            let update_local_description = || {
-                if inner.config.transport_mode == TransportMode::WebRtc {
-                    let candidates = ice_transport.local_candidates();
-                    let candidate_strs: Vec<String> =
-                        candidates.iter().map(|c| c.to_sdp()).collect();
-
-                    let mut local_guard = inner.local_description.lock();
-                    if let Some(desc) = local_guard.as_mut() {
-                        desc.add_candidates(&candidate_strs);
-                    }
-                    true
-                } else {
-                    let candidates = ice_transport.local_candidates();
-                    if let Some(candidate) = candidates.first() {
-                        let mut local_guard = inner.local_description.lock();
-                        if let Some(desc) = local_guard.as_mut() {
-                            for media in &mut desc.media_sections {
-                                media.port = candidate.address.port();
-                                let ip_str = candidate.address.ip().to_string();
-                                let ip_ver = if candidate.address.is_ipv4() {
-                                    "IP4"
-                                } else {
-                                    "IP6"
-                                };
-                                media.connection = Some(format!("IN {} {}", ip_ver, ip_str));
-                            }
-                        }
-                    }
-                    true
-                }
-            };
-
-            if !update_local_description() {
+            if !update_local_description_on_gather(&inner, &ice_transport) {
                 let mut sig_rx = inner.signaling_state.subscribe();
                 loop {
-                    if update_local_description() {
+                    if update_local_description_on_gather(&inner, &ice_transport) {
                         break;
                     }
                     if sig_rx.changed().await.is_err() {
@@ -5227,7 +5228,7 @@ impl RtpSender {
                             .send_rtcp(&[RtcpPacket::SenderReport(report)])
                             .await
                         {
-                            debug!("Failed to send Sender Report: {}", e);
+                            trace!("Failed to send Sender Report: {}", e);
                         }
                     }
                     rtcp = rtcp_rx.recv() => {
@@ -5336,7 +5337,7 @@ impl RtpSender {
                                     if n < 5 {
                                         warn!("RtpSender: failed to send RTP (ssrc={}): {}", ssrc, e);
                                     } else {
-                                        debug!("Failed to send RTP: {}", e);
+                                        trace!("Failed to send RTP: {}", e);
                                     }
                                 } else {
                                     let n = packets_sent.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5900,46 +5901,46 @@ impl RtpReceiver {
                             LoopEvent::Packet(packet_opt, rid, packet_rx, mut depacketizer) => {
                                 if let Some((packet, addr)) = packet_opt
                                     && let Some((source, simulcast_ssrc, _)) = tracks.get(&rid) {
+                                        let this = weak_self.upgrade();
                                         if rid.is_some() {
                                             let mut s = simulcast_ssrc.lock();
                                             if s.is_none() {
                                                 *s = Some(packet.header.ssrc);
                                             }
-                                        } else {
+                                        } else if let Some(ref this) = this {
                                             // Main track: Update SSRC if it matched via provisional listener
-                                            if let Some(this) = weak_self.upgrade() {
-                                                let mut s = this.ssrc.lock();
-                                                let old_ssrc = *s;
-                                                if old_ssrc != packet.header.ssrc {
-                                                    trace!(
-                                                        "RTP main track SSRC changed from {} to {}",
-                                                        old_ssrc, packet.header.ssrc
-                                                    );
-                                                    *s = packet.header.ssrc;
+                                            let mut s = this.ssrc.lock();
+                                            let old_ssrc = *s;
+                                            if old_ssrc != packet.header.ssrc {
+                                                trace!(
+                                                    "RTP main track SSRC changed from {} to {}",
+                                                    old_ssrc, packet.header.ssrc
+                                                );
+                                                *s = packet.header.ssrc;
 
-                                                    // Send Track event after learning the first real SSRC.
-                                                    if old_ssrc == 0 {
-                                                        tracing::info!(
-                                                            ssrc = packet.header.ssrc,
-                                                            pt = packet.header.payload_type,
-                                                            src = %addr,
-                                                            "RTP run_loop: first packet — SSRC learned, sending Track event",
-                                                        );
-                                                        // Use swap to atomically check and set the flag
-                                                        if !this.track_event_sent.swap(true, Ordering::SeqCst)
-                                                            && let Some(ref event_tx) = *this.track_ready_event_tx.lock() {
-                                                                let transceiver = this.track_ready_transceiver.lock();
-                                                                if let Some(transceiver) = transceiver.as_ref().and_then(|t| t.upgrade()) {
-                                                                    let _ = event_tx.send(PeerConnectionEvent::Track(transceiver.clone()));
-                                                                    debug!("RTP mode: Sent Track event after SSRC latching complete");
-                                                                }
+                                                // Send Track event after learning the first real SSRC.
+                                                if old_ssrc == 0 {
+                                                    tracing::info!(
+                                                        ssrc = packet.header.ssrc,
+                                                        pt = packet.header.payload_type,
+                                                        src = %addr,
+                                                        "RTP run_loop: first packet — SSRC learned, sending Track event",
+                                                    );
+                                                    // Use swap to atomically check and set the flag
+                                                    if !this.track_event_sent.swap(true, Ordering::SeqCst)
+                                                        && let Some(ref event_tx) = *this.track_ready_event_tx.lock() {
+                                                            let transceiver = this.track_ready_transceiver.lock();
+                                                            if let Some(transceiver) = transceiver.as_ref().and_then(|t| t.upgrade()) {
+                                                                let _ = event_tx.send(PeerConnectionEvent::Track(transceiver.clone()));
+                                                                trace!("RTP mode: Sent Track event after SSRC latching complete");
                                                             }
-                                                    }
+                                                        }
                                                 }
                                             }
                                         }
 
-                                        if let Some(this) = weak_self.upgrade() {
+                                        if let Some(ref this) = this {
+                                            let transport = this.transport.lock().clone();
                                             for interceptor in &this.interceptors {
                                                 if let Some(mut rtcp_packet) = interceptor.on_packet_received(&packet).await {
                                                     if let RtcpPacket::GenericNack(ref mut nack) = rtcp_packet {
@@ -5947,12 +5948,11 @@ impl RtpReceiver {
                                                         if sender_ssrc != 0 {
                                                             nack.sender_ssrc = sender_ssrc;
                                                         } else {
-                                                            debug!("NACK: skipping sender_ssrc update because it is 0");
+                                                            trace!("NACK: skipping sender_ssrc update because it is 0");
                                                         }
                                                     }
 
-                                                    let transport = this.transport.lock().clone();
-                                                    if let Some(transport) = transport {
+                                                    if let Some(ref transport) = transport {
                                                         let _ = transport.send_rtcp(&[rtcp_packet]).await;
                                                     }
                                                 }
@@ -5970,7 +5970,7 @@ impl RtpReceiver {
                                                 if depacketizer.drop_count() > prev_drop {
                                                     source.increment_drop_count();
                                                 }
-                                                if let Err(e) = source.send_many(samples).await {
+                                                if let Err(e) = source.send_many(samples) {
                                                     tracing::warn!("Failed to send media sample batch: {}", e);
                                                 }
                                             }
@@ -6009,7 +6009,7 @@ impl RtpReceiver {
                                                         let transport = this.transport.lock().clone();
                                                         if let Some(transport) = transport
                                                             && let Err(e) = transport.send_rtcp(&[packet]).await {
-                                                                debug!("Failed to send PLI: {}", e);
+                                                                    trace!("Failed to send PLI: {}", e);
                                                             }
                                                     }
                                                 }
@@ -7421,7 +7421,7 @@ a=mid:0
         .await
         .expect("PC should connect with external_port in RTP mode");
 
-        let pair = pc.ice_transport().get_selected_pair().await.unwrap();
+        let pair = pc.ice_transport().get_selected_pair().unwrap();
         // Local candidate should still have external port
         assert_eq!(pair.local.address.port(), 30000);
         assert_eq!(pair.remote.address.port(), 6000);
@@ -7568,7 +7568,7 @@ a=mid:0
         .expect("PC should connect in RTP mode after answer");
 
         // Verify selected pair has the correct remote address
-        let pair = pc.ice_transport().get_selected_pair().await.unwrap();
+        let pair = pc.ice_transport().get_selected_pair().unwrap();
         assert_eq!(
             pair.remote.address.ip().to_string(),
             "10.0.0.2",
@@ -7610,7 +7610,7 @@ a=mid:0
         .expect("Answerer PC should connect in RTP mode");
 
         // Verify selected pair
-        let pair = pc.ice_transport().get_selected_pair().await.unwrap();
+        let pair = pc.ice_transport().get_selected_pair().unwrap();
         assert_eq!(pair.remote.address.ip().to_string(), "10.0.0.1");
         assert_eq!(pair.remote.address.port(), 5000);
     }
@@ -8078,7 +8078,7 @@ a=mid:0
         pc.set_remote_description(remote_answer_desc).await.unwrap();
 
         // Verify initial remote address via selected pair
-        let initial_pair = pc.inner.ice_transport.get_selected_pair().await;
+        let initial_pair = pc.inner.ice_transport.get_selected_pair();
         assert!(
             initial_pair.is_some(),
             "selected_pair should exist after initial negotiation"
@@ -8108,7 +8108,7 @@ a=mid:0
         pc.set_local_description(answer).unwrap();
 
         // Verify selected_pair reflects new remote address after reinvite
-        let updated_pair = pc.inner.ice_transport.get_selected_pair().await;
+        let updated_pair = pc.inner.ice_transport.get_selected_pair();
         assert!(
             updated_pair.is_some(),
             "selected_pair should exist after reinvite"
@@ -8359,7 +8359,7 @@ a=mid:0
         );
 
         // Verify the role is Controlled (ICE-lite is always controlled)
-        let role = ice.role().await;
+        let role = ice.role();
         assert_eq!(
             role,
             crate::transports::ice::IceRole::Controlled,
