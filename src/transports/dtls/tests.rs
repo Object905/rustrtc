@@ -630,8 +630,11 @@ async fn test_dtls_close_during_handshake_exits_task() -> Result<()> {
 //=== Application-data fragmentation (large messages must not be IP-fragmented) ===
 
 /// Spin up a connected client/server DTLS pair over loopback.
-async fn spawn_connected_dtls_pair(
-) -> Result<(Arc<DtlsTransport>, Arc<DtlsTransport>, mpsc::UnboundedReceiver<Bytes>)> {
+async fn spawn_connected_dtls_pair() -> Result<(
+    Arc<DtlsTransport>,
+    Arc<DtlsTransport>,
+    mpsc::UnboundedReceiver<Bytes>,
+)> {
     let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
@@ -695,13 +698,10 @@ async fn send_and_collect_records(
             received.len(),
             payload.len()
         );
-        let record = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            server_rx.recv(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("record recv timeout"))?
-        .ok_or_else(|| anyhow::anyhow!("DTLS channel closed"))?;
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), server_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("record recv timeout"))?
+            .ok_or_else(|| anyhow::anyhow!("DTLS channel closed"))?;
         record_count += 1;
         assert!(
             record.len() <= MAX_APP_DATA_RECORD_SIZE,
@@ -748,7 +748,10 @@ async fn test_dtls_application_data_fragmentation_boundary() -> Result<()> {
         &vec![7u8; MAX_APP_DATA_RECORD_SIZE],
     )
     .await?;
-    assert_eq!(count, 1, "payload == record ceiling must be a single record");
+    assert_eq!(
+        count, 1,
+        "payload == record ceiling must be a single record"
+    );
     assert_eq!(received.len(), MAX_APP_DATA_RECORD_SIZE);
 
     let (count2, received2) = send_and_collect_records(
@@ -763,5 +766,546 @@ async fn test_dtls_application_data_fragmentation_boundary() -> Result<()> {
     );
     assert_eq!(received2.len(), MAX_APP_DATA_RECORD_SIZE + 1);
 
+    Ok(())
+}
+
+// ==================== HandshakeReassembly (fragment reordering) ====================
+
+struct Fragments {
+    f1: HandshakeMessage,
+    f2: HandshakeMessage,
+    full: Vec<u8>,
+}
+
+fn fragmented_message(seq: u16, total_len: usize, split_at: usize) -> Fragments {
+    let body: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
+
+    let mk = |offset: usize, part: &[u8]| HandshakeMessage {
+        msg_type: HandshakeType::Certificate,
+        message_seq: seq,
+        fragment_offset: offset as u32,
+        fragment_length: part.len() as u32,
+        total_length: total_len as u32,
+        body: Bytes::copy_from_slice(part),
+    };
+
+    Fragments {
+        f1: mk(0, &body[..split_at]),
+        f2: mk(split_at, &body[split_at..]),
+        full: body,
+    }
+}
+
+#[test]
+fn reassembly_completes_in_order() {
+    let Fragments { f1, f2, full } = fragmented_message(0, 100, 40);
+    let mut r = HandshakeReassembly::default();
+
+    assert!(
+        r.push(0, 100, f1.fragment_offset, &f1.body)
+            .unwrap()
+            .is_none()
+    );
+    let done = r
+        .push(0, 100, f2.fragment_offset, &f2.body)
+        .unwrap()
+        .expect("complete");
+    assert_eq!(done.len(), 100);
+    assert_eq!(done, full);
+}
+
+#[test]
+fn reassembly_completes_out_of_order() {
+    // Regression: the old implementation reset its buffer when the first
+    // fragment (offset == 0) arrived after later ones, discarding buffered
+    // bytes and wedging the handshake on persistently reordering paths.
+    let Fragments { f1, f2, full } = fragmented_message(0, 100, 40);
+    let mut r = HandshakeReassembly::default();
+
+    // Second fragment arrives first — must be buffered, not dropped.
+    assert!(
+        r.push(0, 100, f2.fragment_offset, &f2.body)
+            .unwrap()
+            .is_none()
+    );
+    let done = r
+        .push(0, 100, f1.fragment_offset, &f1.body)
+        .unwrap()
+        .expect("complete");
+    assert_eq!(done.len(), 100);
+    assert_eq!(done, full);
+}
+
+#[test]
+fn reassembly_ignores_duplicate_fragments() {
+    let Fragments { f1, f2, .. } = fragmented_message(0, 100, 40);
+    let mut r = HandshakeReassembly::default();
+
+    assert!(
+        r.push(0, 100, f1.fragment_offset, &f1.body)
+            .unwrap()
+            .is_none()
+    );
+    // Same fragment again: idempotent, no accounting drift.
+    assert!(
+        r.push(0, 100, f1.fragment_offset, &f1.body)
+            .unwrap()
+            .is_none()
+    );
+    let done = r
+        .push(0, 100, f2.fragment_offset, &f2.body)
+        .unwrap()
+        .expect("complete");
+    assert_eq!(done.len(), 100);
+}
+
+#[test]
+fn reassembly_resets_on_new_message_seq() {
+    let Fragments { f1, .. } = fragmented_message(0, 100, 40);
+    let Fragments {
+        f1: g1,
+        f2: g2,
+        full,
+    } = fragmented_message(1, 60, 30);
+    let mut r = HandshakeReassembly::default();
+
+    assert!(
+        r.push(0, 100, f1.fragment_offset, &f1.body)
+            .unwrap()
+            .is_none()
+    );
+    // A different message seq starts a fresh reassembly.
+    assert!(
+        r.push(1, 60, g1.fragment_offset, &g1.body)
+            .unwrap()
+            .is_none()
+    );
+    let done = r
+        .push(1, 60, g2.fragment_offset, &g2.body)
+        .unwrap()
+        .expect("complete");
+    assert_eq!(done.len(), 60);
+    assert_eq!(done, full);
+}
+
+#[test]
+fn reassembly_rejects_oversized_and_overrun() {
+    let mut r = HandshakeReassembly::default();
+    assert!(
+        r.push(0, MAX_HANDSHAKE_MESSAGE_LEN + 1, 0, &[0u8; 8])
+            .is_err()
+    );
+    assert!(
+        r.push(0, 10, 8, &[0u8; 8]).is_err(),
+        "offset+len exceeds total"
+    );
+}
+
+// ==================== Cipher suite negotiation ====================
+
+#[test]
+fn negotiate_cipher_suite_accepts_only_supported_suite() {
+    assert_eq!(negotiate_cipher_suite(&[0xC02B]), Some(0xC02B));
+    assert_eq!(
+        negotiate_cipher_suite(&[0xC02F, 0xC02B, 0x009C]),
+        Some(0xC02B),
+        "supported suite anywhere in the offer wins"
+    );
+    assert_eq!(negotiate_cipher_suite(&[0xC02F, 0x009C]), None);
+    assert_eq!(negotiate_cipher_suite(&[]), None);
+}
+
+/// Drive the server role directly with a crafted ClientHello.
+async fn server_handle_client_hello(
+    server_dtls: &Arc<DtlsTransport>,
+    cipher_suites: Vec<u16>,
+) -> Result<()> {
+    let client_hello = ClientHello {
+        version: ProtocolVersion::DTLS_1_2,
+        random: Random::new(),
+        session_id: vec![],
+        cookie: vec![],
+        cipher_suites,
+        compression_methods: vec![0],
+        extensions: vec![],
+    };
+    let mut body = BytesMut::new();
+    client_hello.encode(&mut body);
+    let msg = HandshakeMessage {
+        msg_type: HandshakeType::ClientHello,
+        message_seq: 0,
+        fragment_offset: 0,
+        fragment_length: body.len() as u32,
+        total_length: body.len() as u32,
+        body: body.freeze(),
+    };
+
+    let mut ctx = HandshakeContext::new(None);
+    let certificate = generate_certificate()?;
+    server_dtls
+        .inner
+        .handle_client_hello(msg, &mut ctx, &certificate, false)
+        .await
+}
+
+#[tokio::test]
+async fn test_server_accepts_client_hello_offering_supported_suite() -> Result<()> {
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr = server_socket.local_addr()?;
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), server_addr, None);
+    let (server_dtls, _rx, _runner) = DtlsTransport::new(
+        server_conn.clone(),
+        generate_certificate()?,
+        false,
+        1500,
+        None,
+    )
+    .await?;
+
+    // Supported suite anywhere in the offer is enough — extra suites must not
+    // break negotiation.
+    server_handle_client_hello(&server_dtls, vec![0x1301, 0xC02F, 0xC02B])
+        .await
+        .expect("ServerHello flight built for an offering client");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_server_rejects_client_hello_without_supported_suite() -> Result<()> {
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let client_addr = client_socket.local_addr()?;
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
+    let (server_dtls, _rx, _runner) = DtlsTransport::new(
+        server_conn.clone(),
+        generate_certificate()?,
+        false,
+        1500,
+        None,
+    )
+    .await?;
+
+    // The failure alert is a plaintext record — capture it on the client socket.
+    spawn_socket_pump(server_socket, server_conn);
+
+    let result = server_handle_client_hello(&server_dtls, vec![0x1301, 0x009C]).await;
+    assert!(
+        result.is_err(),
+        "handshake must fail loudly when no suite is shared"
+    );
+    assert!(
+        matches!(
+            server_dtls.subscribe_state().borrow().clone(),
+            DtlsState::Failed
+        ),
+        "transport must transition to Failed"
+    );
+
+    // A fatal handshake_failure alert (content type 21) must reach the peer.
+    let mut buf = vec![0u8; 64];
+    let (len, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client_socket.recv_from(&mut buf),
+    )
+    .await
+    .expect("alert within 2s")
+    .expect("recv ok");
+    assert_eq!(buf[0], 21, "expected a DTLS alert record, got {}", buf[0]);
+    assert_eq!(&buf[len - 2..len], &[2, 40], "fatal handshake_failure");
+    Ok(())
+}
+
+// ==================== Mainstream stack cipher-suite offers ====================
+
+/// Default DTLS cipher-suite offers of the mainstream WebRTC stacks, taken
+/// from their sources: every list contains TLS_ECDHE_ECDSA_WITH_AES_128_GCM_
+/// SHA256 (0xC02B) — the only suite this server implements — so negotiation
+/// must succeed for all of them.
+#[tokio::test]
+async fn test_server_accepts_mainstream_client_hello_suite_offers() -> Result<()> {
+    // pion/dtls v2.2.12 defaultCipherSuites() (also pion/webrtc's offer).
+    let pion: Vec<u16> = vec![0xC02B, 0xC02F, 0xC024, 0xC028, 0xC02C, 0xC030];
+    // webrtc-rs dtls 0.17.1 default_cipher_suites() (pion port):
+    // ECDHE_ECDSA_AES128_GCM, ECDHE_ECDSA_AES256_CBC, ECDHE_RSA_AES128_GCM,
+    // ECDHE_RSA_AES256_CBC, ECDHE_ECDSA_CHACHA20.
+    let webrtcrs: Vec<u16> = vec![0xC02B, 0xC00A, 0xC02F, 0xC014, 0xCCA9];
+    // Chromium/libwebrtc DTLS profile: ECDSA AES-GCM + ChaCha20 only.
+    let chrome: Vec<u16> = vec![0xC02B, 0xCCA9];
+    // Firefox: adds the AES-256-GCM ECDSA variant.
+    let firefox: Vec<u16> = vec![0xC02B, 0xCCA9, 0xC02C];
+
+    for (name, suites) in [
+        ("pion", pion),
+        ("webrtc-rs", webrtcrs),
+        ("chrome", chrome),
+        ("firefox", firefox),
+    ] {
+        let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server_socket.local_addr()?;
+        let (server_socket_tx, _) =
+            watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+        let server_conn = IceConn::new(server_socket_tx.subscribe(), server_addr, None);
+        let (server_dtls, _rx, _runner) =
+            DtlsTransport::new(server_conn, generate_certificate()?, false, 1500, None).await?;
+        server_handle_client_hello(&server_dtls, suites)
+            .await
+            .unwrap_or_else(|e| panic!("{name} suite offer must negotiate, got: {e}"));
+    }
+    Ok(())
+}
+
+// ==================== Fragmented + reordered ClientHello (wire level) ====================
+
+/// Chrome's post-quantum ClientHello (~1.8 KB) exceeds the MTU and arrives
+/// as two DTLS handshake fragments — which UDP may deliver out of order.
+/// Drive the full server receive path (record decode → reassembly →
+/// handle_client_hello) with the SECOND fragment's record sent first and
+/// assert the server still answers its ServerHello flight.
+#[tokio::test]
+async fn test_server_processes_fragmented_out_of_order_client_hello() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+        .try_init();
+    let client_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let client_addr = client_socket.local_addr()?;
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr = server_socket.local_addr()?;
+    let (server_socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
+    let (server_dtls, _rx, runner) = DtlsTransport::new(
+        server_conn.clone(),
+        generate_certificate()?,
+        false,
+        1500,
+        None,
+    )
+    .await?;
+    tokio::spawn(runner);
+    spawn_socket_pump(server_socket, server_conn);
+
+    // Build a ClientHello and split its body into two handshake fragments.
+    let client_hello = ClientHello {
+        version: ProtocolVersion::DTLS_1_2,
+        random: Random::new(),
+        session_id: vec![],
+        cookie: vec![],
+        cipher_suites: vec![0xC02B, 0xCCA9],
+        compression_methods: vec![0],
+        extensions: vec![],
+    };
+    let mut body = BytesMut::new();
+    client_hello.encode(&mut body);
+    let body = body.freeze();
+    let split = body.len() / 2;
+
+    let fragment_record = |offset: u32, part: &[u8], record_seq: u64| -> Vec<u8> {
+        let msg = HandshakeMessage {
+            msg_type: HandshakeType::ClientHello,
+            message_seq: 0,
+            fragment_offset: offset,
+            fragment_length: part.len() as u32,
+            total_length: body.len() as u32,
+            body: Bytes::copy_from_slice(part),
+        };
+        let mut handshake_buf = BytesMut::new();
+        msg.encode(&mut handshake_buf);
+        let record = DtlsRecord {
+            content_type: ContentType::Handshake,
+            version: ProtocolVersion::DTLS_1_2,
+            epoch: 0,
+            sequence_number: record_seq,
+            payload: handshake_buf.freeze(),
+        };
+        let mut buf = BytesMut::new();
+        record.encode(&mut buf);
+        buf.to_vec()
+    };
+
+    let second = fragment_record(split as u32, &body[split..], 1);
+    let first = fragment_record(0, &body[..split], 0);
+
+    // Deliver the second fragment's record BEFORE the first one.
+    client_socket.send_to(&second, server_addr).await?;
+    client_socket.send_to(&first, server_addr).await?;
+
+    // The server must answer its flight (a Handshake record, content type 22).
+    let mut buf = vec![0u8; 2048];
+    let (len, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client_socket.recv_from(&mut buf),
+    )
+    .await
+    .expect("server flight within 5s")?;
+    assert_eq!(buf[0], 22, "expected a Handshake record, got {}", buf[0]);
+    assert!(len > 12, "flight must carry a ServerHello");
+    assert!(
+        !matches!(
+            server_dtls.subscribe_state().borrow().clone(),
+            DtlsState::Failed | DtlsState::Closed
+        ),
+        "server must not fail on reordered fragments"
+    );
+    Ok(())
+}
+
+/// RFC 6347 §4.2.2: the handshake header length field carries the TOTAL
+/// message length; fragment_offset/fragment_length describe the fragment.
+/// A fragmented message must encode the total (not the fragment) length so
+/// the peer can reassemble.
+#[test]
+fn handshake_header_length_field_is_total_length_for_fragments() {
+    let frag = HandshakeMessage {
+        msg_type: HandshakeType::ClientHello,
+        message_seq: 0,
+        fragment_offset: 40,
+        fragment_length: 60,
+        total_length: 100,
+        body: Bytes::from(vec![0u8; 60]),
+    };
+    let mut buf = BytesMut::new();
+    frag.encode(&mut buf);
+
+    // Decode back and verify the header semantics survived the round trip.
+    let mut reader = Bytes::copy_from_slice(&buf);
+    let decoded = HandshakeMessage::decode(&mut reader)
+        .unwrap()
+        .expect("some msg");
+    assert_eq!(decoded.total_length, 100, "total length preserved");
+    assert_eq!(decoded.fragment_offset, 40);
+    assert_eq!(decoded.fragment_length, 60);
+
+    // And the on-wire 24-bit length field itself (bytes 1..4) must be the
+    // total length, not the fragment length.
+    let wire_len = ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | buf[3] as u32;
+    assert_eq!(
+        wire_len, 100,
+        "wire length field must carry the message total"
+    );
+}
+
+// ==================== Hardening regressions ====================
+
+#[test]
+fn reassembly_rejects_total_length_change_for_same_seq() {
+    // The header length field is fixed per handshake message; a peer that
+    // flips total_length mid-reassembly is garbage (or allocation-churn
+    // bait) and must be rejected, not silently reallocated.
+    let Fragments { f1, .. } = fragmented_message(0, 100, 40);
+    let mut r = HandshakeReassembly::default();
+    assert!(
+        r.push(0, 100, f1.fragment_offset, &f1.body)
+            .unwrap()
+            .is_none()
+    );
+    // A fragment that fits both the old (100) and tampered (90) totals, so
+    // the rejection can only come from the consistency check.
+    let err = r
+        .push(0, 90, 40, &[7u8; 30])
+        .expect_err("total_length change must be rejected");
+    assert!(err.to_string().contains("changed total_length"), "{err}");
+}
+
+/// Craft a ServerHello handshake message with the given cipher suite.
+fn server_hello_message(cipher_suite: u16) -> HandshakeMessage {
+    let server_hello = ServerHello {
+        version: ProtocolVersion::DTLS_1_2,
+        random: Random::new(),
+        session_id: vec![],
+        cipher_suite,
+        compression_method: 0,
+        extensions: vec![],
+    };
+    let mut body = BytesMut::new();
+    server_hello.encode(&mut body);
+    HandshakeMessage {
+        msg_type: HandshakeType::ServerHello,
+        message_seq: 0,
+        fragment_offset: 0,
+        fragment_length: body.len() as u32,
+        total_length: body.len() as u32,
+        body: body.freeze(),
+    }
+}
+
+async fn client_transport_for_handling() -> Result<Arc<DtlsTransport>> {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let (socket_tx, _) = watch::channel(Some(IceSocketWrapper::Udp(socket)));
+    let conn = IceConn::new(socket_tx.subscribe(), addr, None);
+    let (dtls, _rx, _runner) =
+        DtlsTransport::new(conn, generate_certificate()?, true, 1500, None).await?;
+    Ok(dtls)
+}
+
+#[tokio::test]
+async fn client_rejects_server_hello_with_unsupported_suite() -> Result<()> {
+    let dtls = client_transport_for_handling().await?;
+    let mut ctx = HandshakeContext::new(None);
+    let res = dtls
+        .inner
+        .handle_server_hello(server_hello_message(0xC02F), &mut ctx, true);
+    assert!(res.is_err(), "unsupported suite must abort the handshake");
+    assert!(
+        matches!(dtls.subscribe_state().borrow().clone(), DtlsState::Failed),
+        "client transport must transition to Failed"
+    );
+    assert!(
+        ctx.server_random.is_none(),
+        "no state may leak on rejection"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_accepts_server_hello_with_supported_suite() -> Result<()> {
+    let dtls = client_transport_for_handling().await?;
+    let mut ctx = HandshakeContext::new(None);
+    dtls.inner
+        .handle_server_hello(server_hello_message(0xC02B), &mut ctx, true)?;
+    assert!(ctx.server_random.is_some(), "ServerHello state recorded");
+    Ok(())
+}
+
+/// A reordered server flight (Certificate arriving before ServerHello) must
+/// be buffered and drained in order instead of stalling the handshake until
+/// retransmission (RFC 6347 §4.2.4).
+#[tokio::test]
+async fn client_processes_reordered_server_flight() -> Result<()> {
+    let dtls = client_transport_for_handling().await?;
+    let own_cert = generate_certificate()?;
+
+    let server_hello = server_hello_message(0xC02B);
+    let mut cert_body = BytesMut::new();
+    CertificateMessage {
+        certificates: own_cert.certificate.clone(),
+    }
+    .encode(&mut cert_body);
+    let certificate = HandshakeMessage {
+        msg_type: HandshakeType::Certificate,
+        message_seq: 1,
+        fragment_offset: 0,
+        fragment_length: cert_body.len() as u32,
+        total_length: cert_body.len() as u32,
+        body: cert_body.freeze(),
+    };
+
+    // Deliver Certificate (seq 1) BEFORE ServerHello (seq 0) in one payload.
+    let mut payload = BytesMut::new();
+    certificate.encode(&mut payload);
+    server_hello.encode(&mut payload);
+
+    let mut ctx = HandshakeContext::new(None);
+    dtls.inner
+        .process_handshake_payload(payload.freeze(), &mut ctx, &own_cert, true)
+        .await?;
+
+    assert!(ctx.server_random.is_some(), "ServerHello processed");
+    assert!(
+        ctx.peer_certificate.is_some(),
+        "buffered Certificate drained after the gap closed"
+    );
+    assert_eq!(ctx.recv_message_seq, 2);
     Ok(())
 }

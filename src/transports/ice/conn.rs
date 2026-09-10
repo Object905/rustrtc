@@ -86,6 +86,9 @@ pub struct IceConn {
     both_ways_logged: AtomicBool,
     pub rx_packets: AtomicU64,
     pub rx_bytes: AtomicU64,
+    /// DTLS datagrams dropped because no DTLS receiver was registered yet
+    /// (or it was torn down). Surfaced for handshake-stall diagnostics.
+    dtls_no_receiver_drops: AtomicU64,
     pub tx_packets: AtomicU64,
     pub tx_bytes: AtomicU64,
     /// Candidate state during the brief probation window before latch commits.
@@ -132,6 +135,7 @@ impl IceConn {
             both_ways_logged: AtomicBool::new(false),
             rx_packets: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
+            dtls_no_receiver_drops: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             probation: Mutex::new(None),
@@ -163,7 +167,8 @@ impl IceConn {
         }
         let inbound_seen = self.first_rtp_rx_logged.load(Ordering::Relaxed)
             || self.first_rtcp_rx_logged.load(Ordering::Relaxed);
-        if self.first_out_seen.load(Ordering::Relaxed) && inbound_seen
+        if self.first_out_seen.load(Ordering::Relaxed)
+            && inbound_seen
             && self
                 .both_ways_logged
                 .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -213,8 +218,12 @@ impl IceConn {
     pub fn local_addr(&self) -> SocketAddr {
         let socket = self.socket_rx.borrow();
         match socket.as_ref() {
-            Some(IceSocketWrapper::Udp(s)) => s.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
-            Some(IceSocketWrapper::SharedUdp(h)) => h.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            Some(IceSocketWrapper::Udp(s)) => s
+                .local_addr()
+                .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
+            Some(IceSocketWrapper::SharedUdp(h)) => h
+                .local_addr()
+                .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
             _ => SocketAddr::from(([0, 0, 0, 0], 0)),
         }
     }
@@ -504,7 +513,13 @@ impl PacketReceiver for IceConn {
                 // tracing::trace!("IceConn: Forwarding DTLS packet to receiver");
                 strong_rx.receive(packet, addr, marshal_buf).await;
             } else {
-                trace!("IceConn: Received DTLS packet but no receiver registered");
+                let drops = self.dtls_no_receiver_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                debug!(
+                    drops,
+                    len = packet.len(),
+                    from = %addr,
+                    "IceConn: Received DTLS packet but no receiver registered — dropped"
+                );
             }
         } else if (128..192).contains(&first_byte) {
             // RTP / RTCP

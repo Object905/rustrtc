@@ -54,9 +54,11 @@ impl HandshakeMessage {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.msg_type as u8);
 
-        // Length (24-bit) - length of the body (not fragment)
-        // For simple non-fragmented messages, this is body.len()
-        let len = self.body.len() as u32;
+        // Length (24-bit) — RFC 6347 §4.2.2: total length of the whole
+        // handshake message, NOT the fragment length. For non-fragmented
+        // messages total_length == body.len(), so existing behavior is
+        // unchanged; fragmented messages now encode a spec-compliant header.
+        let len = self.total_length;
         buf.put_u8((len >> 16) as u8);
         buf.put_u8((len >> 8) as u8);
         buf.put_u8(len as u8);

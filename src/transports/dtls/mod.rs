@@ -303,7 +303,10 @@ impl DtlsTransport {
                 )
                 .await
             {
-                debug!("DTLS handshake failed: {e} (remote={})", inner_clone.conn.remote_addr.read());
+                debug!(
+                    "DTLS handshake failed: {e} (remote={})",
+                    inner_clone.conn.remote_addr.read()
+                );
                 *inner_clone.state.lock() = DtlsState::Failed;
                 let _ = inner_clone.state_tx.send(DtlsState::Failed);
             }
@@ -686,10 +689,26 @@ impl DtlsInner {
                             );
                             ctx.recv_message_seq = msg.message_seq;
                             ctx.post_hvr = false;
+                        } else if msg.total_length == msg.fragment_length
+                            && ctx.pending_messages.len() < MAX_PENDING_HANDSHAKE_MESSAGES
+                        {
+                            // RFC 6347 §4.2.4: buffer complete out-of-order
+                            // messages instead of dropping them, so a reordered
+                            // flight doesn't stall the handshake until the peer
+                            // retransmits. Bounded to keep memory flat against
+                            // rogue peers.
+                            debug!(
+                                got = msg.message_seq,
+                                expected = ctx.recv_message_seq,
+                                "Buffering out-of-order handshake message"
+                            );
+                            ctx.pending_messages.insert(msg.message_seq, (msg, raw_msg));
+                            continue;
                         } else {
                             debug!(
-                                "Received out-of-order handshake message: got {}, expected {}",
-                                msg.message_seq, ctx.recv_message_seq
+                                got = msg.message_seq,
+                                expected = ctx.recv_message_seq,
+                                "Ignoring out-of-order handshake message"
                             );
                             // Ignore out-of-order for now
                             continue;
@@ -702,40 +721,42 @@ impl DtlsInner {
                         ctx.post_hvr = false;
                     }
 
-                    // Expected message - handle fragmentation
-                    let (processing_msg, processing_raw) = if msg.total_length
-                        != msg.fragment_length
-                    {
-                        if ctx.incomplete_msg_seq != msg.message_seq || msg.fragment_offset == 0 {
-                            // New message or first fragment, reset buffer
-                            ctx.incomplete_handshake.clear();
-                            ctx.incomplete_msg_seq = msg.message_seq;
-                        }
+                    // Expected message - handle fragmentation (RFC 6347
+                    // §4.2.3): fragments may arrive in any order, so buffer
+                    // them by offset instead of discarding earlier progress.
+                    let (processing_msg, processing_raw) =
+                        if msg.total_length != msg.fragment_length {
+                            match ctx.incomplete_fragments.push(
+                                msg.message_seq,
+                                msg.total_length as usize,
+                                msg.fragment_offset,
+                                &msg.body,
+                            ) {
+                                Ok(Some(body)) => {
+                                    let full_msg = HandshakeMessage {
+                                        msg_type: msg.msg_type,
+                                        total_length: msg.total_length,
+                                        message_seq: msg.message_seq,
+                                        fragment_offset: 0,
+                                        fragment_length: msg.total_length,
+                                        body: Bytes::from(body),
+                                    };
 
-                        ctx.incomplete_handshake.extend_from_slice(&msg.body[..]);
-
-                        if ctx.incomplete_handshake.len() < msg.total_length as usize {
-                            // Still incomplete, wait for more fragments
-                            continue;
-                        }
-
-                        // Fully reassembled
-                        let full_msg = HandshakeMessage {
-                            msg_type: msg.msg_type,
-                            total_length: msg.total_length,
-                            message_seq: msg.message_seq,
-                            fragment_offset: 0,
-                            fragment_length: msg.total_length,
-                            body: ctx.incomplete_handshake.split().freeze(),
+                                    let mut full_raw = BytesMut::new();
+                                    full_msg.encode(&mut full_raw);
+                                    (full_msg, full_raw.freeze())
+                                }
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    warn!("Failed to reassemble handshake message: {}", e);
+                                    ctx.incomplete_fragments = HandshakeReassembly::default();
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // Not fragmented
+                            (msg, raw_msg)
                         };
-
-                        let mut full_raw = BytesMut::new();
-                        full_msg.encode(&mut full_raw);
-                        (full_msg, full_raw.freeze())
-                    } else {
-                        // Not fragmented
-                        (msg, raw_msg)
-                    };
 
                     ctx.recv_message_seq += 1;
 
@@ -755,6 +776,32 @@ impl DtlsInner {
                         is_client,
                     )
                     .await?;
+
+                    // Drain buffered out-of-order messages that are now next
+                    // in sequence (RFC 6347 §4.2.4 reordering tolerance).
+                    while let Some((pending_msg, pending_raw)) =
+                        ctx.pending_messages.remove(&ctx.recv_message_seq)
+                    {
+                        debug!(
+                            message_seq = pending_msg.message_seq,
+                            "Processing buffered out-of-order handshake message"
+                        );
+                        if pending_msg.msg_type != HandshakeType::Finished
+                            && pending_msg.msg_type != HandshakeType::HelloRequest
+                            && pending_msg.msg_type != HandshakeType::HelloVerifyRequest
+                        {
+                            ctx.handshake_messages.extend_from_slice(&pending_raw[..]);
+                        }
+                        self.handle_handshake_message(
+                            pending_msg,
+                            &pending_raw,
+                            ctx,
+                            certificate,
+                            is_client,
+                        )
+                        .await?;
+                        ctx.recv_message_seq += 1;
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to decode handshake message: {}", e);
@@ -844,6 +891,26 @@ impl DtlsInner {
 
         Ok(())
     }
+    /// Send a plaintext fatal `handshake_failure` alert (epoch 0 — sent
+    /// before any keys exist). Best effort: the caller transitions to the
+    /// Failed state regardless of delivery.
+    async fn send_handshake_failure_alert(&self, ctx: &HandshakeContext) {
+        // Alert payload: [level=fatal(2), description=handshake_failure(40)]
+        let alert = vec![2u8, 40u8];
+        let record = DtlsRecord {
+            content_type: ContentType::Alert,
+            version: ProtocolVersion::DTLS_1_2,
+            epoch: 0,
+            sequence_number: ctx.sequence_number,
+            payload: Bytes::from(alert),
+        };
+        let mut buf = BytesMut::new();
+        record.encode(&mut buf);
+        if let Err(e) = self.conn.send(&buf).await {
+            debug!("Failed to send handshake_failure alert: {}", e);
+        }
+    }
+
     async fn handle_client_hello(
         &self,
         msg: HandshakeMessage,
@@ -856,6 +923,10 @@ impl DtlsInner {
         }
 
         if ctx.server_random.is_some() {
+            debug!(
+                message_seq = ctx.message_seq,
+                "ClientHello retransmission received — resending server flight"
+            );
             if let Some(records) = &ctx.last_flight_records
                 && let Err(e) = self.conn.send_dtls_record_batch(records).await
             {
@@ -888,6 +959,13 @@ impl DtlsInner {
                 return Ok(());
             }
         };
+
+        debug!(
+            offered_cipher_suites = ?client_hello.cipher_suites,
+            client_version = ?client_hello.version,
+            extensions_len = client_hello.extensions.len(),
+            "ClientHello decoded"
+        );
 
         trace!(
             "ClientHello Version: {:?} ({}, {})",
@@ -967,11 +1045,32 @@ impl DtlsInner {
         let mut session_id = vec![0u8; 32];
         rand::fill(&mut session_id[..]);
 
+        // Negotiate the cipher suite instead of blindly echoing a fixed one.
+        // This stack implements exactly TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        // (P-256 ECDHE + ECDSA auth + AES-128-GCM record layer), so the client
+        // must have offered it. Replying with an unoffered suite makes the
+        // peer silently drop our flight and retransmit ClientHello forever —
+        // an invisible handshake stall. Fail loudly (alert + warn) instead.
+        let cipher_suite = match negotiate_cipher_suite(&client_hello.cipher_suites) {
+            Some(suite) => suite,
+            None => {
+                warn!(
+                    offered_cipher_suites = ?client_hello.cipher_suites,
+                    supported_cipher_suite = SUPPORTED_CIPHER_SUITE,
+                    "ClientHello offers no supported cipher suite; aborting handshake with fatal handshake_failure alert"
+                );
+                self.send_handshake_failure_alert(ctx).await;
+                *self.state.lock() = DtlsState::Failed;
+                let _ = self.state_tx.send(DtlsState::Failed);
+                anyhow::bail!("ClientHello offers no supported cipher suite (need 0xC02B)");
+            }
+        };
+
         let server_hello = ServerHello {
             version: ProtocolVersion::DTLS_1_2,
             random,
-            session_id,           // Always new session ID
-            cipher_suite: 0xC02B, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            session_id, // Always new session ID
+            cipher_suite,
             compression_method: 0,
             extensions,
         };
@@ -1322,7 +1421,10 @@ impl DtlsInner {
                 self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
                 self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                 let _ = self.state_tx.send(state);
-                debug!("DTLS handshake complete (server role) (remote={})", self.conn.remote_addr.read());
+                debug!(
+                    "DTLS handshake complete (server role) (remote={})",
+                    self.conn.remote_addr.read()
+                );
                 // Clear ephemeral secret as handshake is complete
                 ctx.local_secret = None;
             } else {
@@ -1355,7 +1457,10 @@ impl DtlsInner {
                         self.write_epoch.store(ctx.epoch, Ordering::SeqCst);
                         self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                         let _ = self.state_tx.send(state);
-                        debug!("DTLS handshake complete (client role) (remote={})", self.conn.remote_addr.read());
+                        debug!(
+                            "DTLS handshake complete (client role) (remote={})",
+                            self.conn.remote_addr.read()
+                        );
                         ctx.local_secret = None;
                     }
                 }
@@ -1454,8 +1559,30 @@ impl DtlsInner {
         let mut body = msg.body.clone();
         let server_hello = match ServerHello::decode(&mut body) {
             Ok(h) => h,
-            Err(_) => return Ok(()),
+            Err(e) => {
+                warn!("Failed to decode ServerHello: {}", e);
+                return Ok(());
+            }
         };
+
+        // The record layer implements exactly
+        // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256; a ServerHello negotiating
+        // anything else (misconfigured or rogue server, tampered flight) can
+        // never work with this stack. Fail the handshake here instead of
+        // breaking opaquely at key derivation / record crypto later.
+        if server_hello.cipher_suite != SUPPORTED_CIPHER_SUITE {
+            warn!(
+                negotiated = format!("{:#06x}", server_hello.cipher_suite),
+                "ServerHello negotiated an unsupported cipher suite; aborting handshake"
+            );
+            *self.state.lock() = DtlsState::Failed;
+            let _ = self.state_tx.send(DtlsState::Failed);
+            anyhow::bail!(
+                "ServerHello negotiated unsupported cipher suite {:#06x} (expected {:#06x})",
+                server_hello.cipher_suite,
+                SUPPORTED_CIPHER_SUITE
+            );
+        }
 
         ctx.server_random = Some(server_hello.random.to_bytes());
         trace!("Server extensions len: {}", server_hello.extensions.len());
@@ -2169,6 +2296,119 @@ fn encrypt_record(
     Ok(result)
 }
 
+/// Sanity cap for one DTLS handshake message (RFC 6347 allows up to 2^24-1,
+/// but every real message is a few KB; anything larger is garbage).
+const MAX_HANDSHAKE_MESSAGE_LEN: usize = 65_536;
+
+/// Upper bound on buffered out-of-order handshake messages — a rogue peer
+/// must not be able to grow memory unbounded.
+const MAX_PENDING_HANDSHAKE_MESSAGES: usize = 16;
+
+/// The only cipher suite this DTLS stack implements:
+/// TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (P-256 ECDHE, ECDSA auth,
+/// AES-128-GCM record layer).
+const SUPPORTED_CIPHER_SUITE: u16 = 0xC02B;
+
+/// Pick the suite to echo in the ServerHello: this stack implements exactly
+/// one suite, so negotiation succeeds only when the client offered it.
+fn negotiate_cipher_suite(offered: &[u16]) -> Option<u16> {
+    if offered.contains(&SUPPORTED_CIPHER_SUITE) {
+        Some(SUPPORTED_CIPHER_SUITE)
+    } else {
+        None
+    }
+}
+
+/// Byte-accurate reassembly for one fragmented DTLS handshake message
+/// (RFC 6347 §4.2.3). Fragments are copied into a fixed-size buffer at their
+/// declared `fragment_offset`, so arrival order does not matter: a reordered
+/// first fragment no longer discards already-buffered bytes, and duplicate
+/// fragments are idempotent. The message is complete once every byte of the
+/// declared `total_length` is covered.
+#[derive(Default)]
+struct HandshakeReassembly {
+    message_seq: u16,
+    total_length: usize,
+    buf: Vec<u8>,
+    have: Vec<bool>,
+    have_count: usize,
+}
+
+impl HandshakeReassembly {
+    /// Buffer one fragment of `message_seq`. Returns the fully reassembled
+    /// message body when the last missing byte arrives, otherwise `None`.
+    /// A different `message_seq`/`total_length` restarts the reassembly.
+    fn push(
+        &mut self,
+        message_seq: u16,
+        total_length: usize,
+        fragment_offset: u32,
+        body: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        if total_length == 0 || total_length > MAX_HANDSHAKE_MESSAGE_LEN {
+            anyhow::bail!("handshake message total_length {total_length} out of range");
+        }
+        if fragment_offset as usize + body.len() > total_length {
+            anyhow::bail!(
+                "handshake fragment offset {} + len {} exceeds total_length {}",
+                fragment_offset,
+                body.len(),
+                total_length
+            );
+        }
+        if self.buf.is_empty() || self.message_seq != message_seq {
+            // No state yet, or a different message: start a fresh reassembly.
+            *self = Self {
+                message_seq,
+                total_length,
+                buf: vec![0u8; total_length],
+                have: vec![false; total_length],
+                have_count: 0,
+            };
+        } else if self.total_length != total_length {
+            // The same message_seq must carry a stable total_length (the
+            // header length field is fixed per message, RFC 6347 §4.2.2); a
+            // change is garbage or an attempt to churn allocations — reject
+            // instead of silently reallocating.
+            anyhow::bail!(
+                "handshake message_seq {message_seq} changed total_length {} -> {}",
+                self.total_length,
+                total_length
+            );
+        }
+
+        let start = fragment_offset as usize;
+        for (i, byte) in body.iter().enumerate() {
+            let idx = start + i;
+            if !self.have[idx] {
+                self.have[idx] = true;
+                self.buf[idx] = *byte;
+                self.have_count += 1;
+            }
+        }
+
+        if self.have_count < self.total_length {
+            debug!(
+                message_seq,
+                fragment_offset,
+                fragment_len = body.len(),
+                total_length,
+                have = self.have_count,
+                "Handshake message incomplete; fragment buffered"
+            );
+            return Ok(None);
+        }
+
+        let body = std::mem::take(&mut self.buf);
+        debug!(
+            message_seq,
+            total_length, "Handshake message reassembled from fragments"
+        );
+        *self = Self::default();
+        Ok(Some(body))
+    }
+}
+
 struct HandshakeContext {
     sequence_number: u64,
     /// Outbound DTLS record epoch (write epoch).
@@ -2183,8 +2423,12 @@ struct HandshakeContext {
     /// implementations (e.g. webrtc-dtls) continue from the HVR seq + 1.
     post_hvr: bool,
     last_flight_records: Option<Vec<Vec<u8>>>,
-    incomplete_handshake: BytesMut,
-    incomplete_msg_seq: u16,
+    incomplete_fragments: HandshakeReassembly,
+    /// Complete handshake messages received ahead of their turn
+    /// (message_seq > expected), buffered per RFC 6347 §4.2.4 so reordered
+    /// flights don't stall the handshake until retransmission. Bounded by
+    /// [`MAX_PENDING_HANDSHAKE_MESSAGES`].
+    pending_messages: std::collections::BTreeMap<u16, (HandshakeMessage, Bytes)>,
     local_secret: Option<EphemeralSecret>,
     local_public_key_bytes: Vec<u8>,
     peer_public_key: Option<Vec<u8>>,
@@ -2215,8 +2459,8 @@ impl HandshakeContext {
             recv_message_seq: 0,
             post_hvr: false,
             last_flight_records: None,
-            incomplete_handshake: BytesMut::new(),
-            incomplete_msg_seq: 0,
+            incomplete_fragments: HandshakeReassembly::default(),
+            pending_messages: std::collections::BTreeMap::new(),
             local_secret: Some(local_secret),
             local_public_key_bytes,
             peer_public_key: None,

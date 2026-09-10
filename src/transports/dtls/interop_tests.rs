@@ -273,3 +273,180 @@ async fn test_interop_rustrtc_client_openssl_server() -> Result<()> {
 
     Ok(())
 }
+
+// ==================== rustrtc SERVER interop ====================
+// The tests above exercise rustrtc as a CLIENT against foreign servers; the
+// ones below drive the opposite (and production-critical) direction: foreign
+// clients (pion/Go, OpenSSL) connecting to a rustrtc server-role transport.
+
+/// Boot a rustrtc server-role DTLS transport on a real UDP socket with a
+/// wire→IceConn pump. Returns (transport, appdata_rx, server_addr).
+async fn spawn_rustrtc_dtls_server() -> Result<(
+    Arc<DtlsTransport>,
+    tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    std::net::SocketAddr,
+)> {
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr = server_socket.local_addr()?;
+    let (server_socket_tx, _) =
+        tokio::sync::watch::channel(Some(IceSocketWrapper::Udp(server_socket.clone())));
+    // Remote is latched from the first inbound packet (port 0 = unknown).
+    let server_conn = IceConn::new(
+        server_socket_tx.subscribe(),
+        "0.0.0.0:0".parse().unwrap(),
+        None,
+    );
+    let (server_dtls, server_rx, runner) = DtlsTransport::new(
+        server_conn.clone(),
+        generate_certificate()?,
+        false,
+        1500,
+        None,
+    )
+    .await?;
+    tokio::spawn(runner);
+
+    let pump_conn = server_conn.clone();
+    let pump_socket = server_socket.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut marshal_buf = Vec::new();
+        while let Ok((len, addr)) = pump_socket.recv_from(&mut buf).await {
+            let packet = Bytes::copy_from_slice(&buf[..len]);
+            pump_conn.receive(packet, addr, &mut marshal_buf).await;
+        }
+    });
+
+    Ok((server_dtls, server_rx, server_addr))
+}
+
+/// Fail unless the transport reaches `Connected` within `secs`.
+async fn wait_connected(dtls: &Arc<DtlsTransport>, secs: u64) -> Result<()> {
+    let mut state_rx = dtls.subscribe_state();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if matches!(state_rx.borrow().clone(), DtlsState::Connected(..)) {
+            return Ok(());
+        }
+        if matches!(
+            state_rx.borrow().clone(),
+            DtlsState::Failed | DtlsState::Closed
+        ) {
+            anyhow::bail!(
+                "transport reached terminal state {}",
+                state_rx.borrow().clone()
+            );
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            anyhow::bail!(
+                "not connected within {secs}s (state {})",
+                state_rx.borrow().clone()
+            );
+        }
+        tokio::time::timeout_at(deadline, state_rx.changed()).await??;
+    }
+}
+
+/// pion/dtls (Go) — the stack behind pion/webrtc — dials a rustrtc server:
+/// full handshake with pion's default cipher offer (0xC02B first), plus one
+/// application-data echo round trip. Skips gracefully when no Go toolchain
+/// (or module download) is available.
+#[tokio::test]
+async fn test_interop_pion_client_rustrtc_server() -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    if Command::new("go").arg("version").output().is_err() {
+        info!("go toolchain not found, skipping pion interop");
+        return Ok(());
+    }
+    let client_dir = format!("{}/interop/go/pion-dtls-client", env!("CARGO_MANIFEST_DIR"));
+    let bin = std::env::temp_dir()
+        .join(format!("pion-dtls-client-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    let build = Command::new("go")
+        .args(["build", "-o", &bin, "."])
+        .current_dir(&client_dir)
+        .output()?;
+    if !build.status.success() {
+        info!(
+            "go build failed (offline CI?), skipping pion interop: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        return Ok(());
+    }
+
+    let (server, mut server_rx, server_addr) = spawn_rustrtc_dtls_server().await?;
+    let child = Command::new(&bin)
+        .arg(server_addr.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    wait_connected(&server, 30).await?;
+    let ping = tokio::time::timeout(Duration::from_secs(5), server_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("pion client sent no application data"))?
+        .ok_or_else(|| anyhow::anyhow!("server rx closed"))?;
+    assert_eq!(&ping[..], b"ping");
+    server.send(Bytes::from_static(b"pong")).await?;
+
+    let out = child.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        stdout.contains("HANDSHAKE_OK"),
+        "pion handshake failed: {stdout} (stderr: {})",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    anyhow::ensure!(stdout.contains("ECHO_OK"), "pion echo failed: {stdout}");
+    anyhow::ensure!(out.status.success(), "pion client exited with error");
+    Ok(())
+}
+
+/// OpenSSL `s_client -dtls1_2` (the DTLS family used by Asterisk /
+/// FreeSWITCH-style third-party PBXes) dials a rustrtc server using OpenSSL's
+/// default cipher offer. Skips gracefully without a compatible openssl.
+#[tokio::test]
+async fn test_interop_openssl_client_rustrtc_server() -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let version = match Command::new("openssl").arg("version").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => {
+            info!("openssl not found, skipping openssl interop");
+            return Ok(());
+        }
+    };
+    if !version.starts_with("OpenSSL") {
+        info!("{version}: LibreSSL/BoringSSL lack reliable s_client DTLS, skipping");
+        return Ok(());
+    }
+    let help = Command::new("openssl")
+        .args(["s_client", "-help"])
+        .output()?;
+    if !String::from_utf8_lossy(&help.stderr).contains("dtls1_2") {
+        info!("openssl s_client has no -dtls1_2, skipping");
+        return Ok(());
+    }
+
+    let (server, _rx, server_addr) = spawn_rustrtc_dtls_server().await?;
+    let mut child = Command::new("openssl")
+        .args([
+            "s_client",
+            "-dtls1_2",
+            "-connect",
+            &server_addr.to_string(),
+            "-cipher",
+            "ECDHE-ECDSA-AES128-GCM-SHA256",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let connected = wait_connected(&server, 15).await;
+    drop(child.stdin.take()); // EOF → s_client sends close_notify and exits
+    let _ = child.wait()?;
+    connected
+}
