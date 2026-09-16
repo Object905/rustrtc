@@ -4581,3 +4581,80 @@ async fn fast_path_try_send_relays_rtp_via_turn() -> Result<()> {
     turn_server.stop().await?;
     Ok(())
 }
+
+/// End-to-end reproduction through the real RTP rewrite bridge: an inbound RTP
+/// packet on a plain-UDP leg must be forwarded to a leg whose selected ICE
+/// transport is a TURN relay. Before 0.3.134 the bridge fast-path
+/// (`RtpTransport::try_bridge_rewrite_rtp` -> `IceConn::try_send`) dropped the
+/// packet on any non-UDP transport — the production "call connected but no
+/// audio" on Relay paths.
+#[tokio::test]
+#[serial]
+async fn rewrite_bridge_relays_rtp_to_turn_leg() -> Result<()> {
+    use crate::transports::rtp::{RtpRewriteBridgeParams, RtpTransport};
+
+    let mut turn_server = TestTurnServer::start().await?;
+
+    // Destination leg: selected ICE transport is a TURN relay.
+    let ice_server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+    let creds = super::turn::TurnCredentials::from_server(&ice_server)?;
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let turn = super::turn::TurnClient::connect(&uri, false).await?;
+    let alloc = turn.allocate(creds).await?;
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    let peer_addr = peer.local_addr()?;
+    turn.create_permission(peer_addr).await?;
+
+    let dst_wrapper = IceSocketWrapper::Turn(Arc::new(turn), alloc.relayed_address);
+    let (_dst_tx, dst_rx) = tokio::sync::watch::channel(Some(dst_wrapper));
+    let dst_conn = super::conn::IceConn::new(dst_rx, peer_addr, None);
+    let dst = Arc::new(RtpTransport::new(dst_conn, false));
+
+    // Source leg: plain UDP.
+    let src_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let (_src_tx, src_rx) =
+        tokio::sync::watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+    let src_conn = super::conn::IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+    let src = RtpTransport::new(src_conn, false);
+
+    src.bridge_rewrite_to(
+        dst.clone(),
+        RtpRewriteBridgeParams {
+            ssrc_offset: 0,
+            fixed_out_ssrc: Some(0x1234_5678),
+            payload_type: Some(8),
+            dtmf_payload_type: None,
+            initial_sequence_number: Some(100),
+            initial_timestamp_offset: None,
+            strip_extensions: false,
+        },
+    );
+
+    // Simulate the plaintext RTP packet arriving on the source leg.
+    let packet = crate::rtp::RtpPacket::new(
+        crate::rtp::RtpHeader::new(0, 1, 160, 0xAAAA),
+        vec![0x55u8; 160],
+    );
+    let bytes = packet.marshal()?;
+    let mut marshal_buf = Vec::new();
+    src.receive(
+        bytes.into(),
+        "127.0.0.1:9".parse().unwrap(),
+        &mut marshal_buf,
+    )
+    .await;
+
+    // The bridge must have forwarded it over the TURN leg to the peer.
+    let mut got = [0u8; 512];
+    let (len, _) = timeout(Duration::from_millis(1000), peer.recv_from(&mut got))
+        .await
+        .expect("rewrite bridge must relay the packet over the TURN leg")?;
+    let forwarded = crate::rtp::RtpPacket::parse_bytes(Bytes::copy_from_slice(&got[..len]))?;
+    assert_eq!(forwarded.header.ssrc, 0x1234_5678);
+    assert_eq!(forwarded.header.payload_type, 8);
+
+    turn_server.stop().await?;
+    Ok(())
+}
