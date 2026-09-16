@@ -9,8 +9,8 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
-use tokio::sync::watch;
+use std::sync::{Arc, OnceLock, Weak};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, trace, warn};
 
 /// Per-source-address state tracked during the latching probation period.
@@ -98,6 +98,12 @@ pub struct IceConn {
     /// Maximum packets to observe during probation.  `0` means "no probation"
     /// — first SSRC-matching RTP latches immediately (legacy behaviour).
     probation_max_packets: AtomicU8,
+    /// Lazily-initialised queue for transports without a synchronous send
+    /// (TURN / TCP / TLS): the RTP bridge fast-path hands packets here and a
+    /// spawned task drains them through the async `send_to`. Without this the
+    /// fast-path dropped every packet on Relay paths ("call connected but no
+    /// audio").
+    deferred_send_tx: OnceLock<mpsc::UnboundedSender<(IceSocketWrapper, Vec<u8>, SocketAddr)>>,
 }
 
 impl IceConn {
@@ -140,6 +146,7 @@ impl IceConn {
             tx_bytes: AtomicU64::new(0),
             probation: Mutex::new(None),
             probation_max_packets: AtomicU8::new(probation_max_packets.unwrap_or(0)),
+            deferred_send_tx: OnceLock::new(),
         })
     }
 
@@ -304,25 +311,55 @@ impl IceConn {
                 tracing::trace!("IceConn: try_send failed - no selected socket");
                 return Err(anyhow::anyhow!("No selected socket"));
             };
-            return Self::do_try_send(socket, buf, &self.remote_addr);
+            return self.do_try_send(socket, buf);
         };
-        Self::do_try_send(socket, buf, &self.remote_addr)
+        self.do_try_send(socket, buf)
     }
 
-    fn do_try_send(
-        socket: IceSocketWrapper,
-        buf: &[u8],
-        remote_addr: &parking_lot::RwLock<SocketAddr>,
-    ) -> Result<usize> {
-        let remote = *remote_addr.read();
+    fn do_try_send(&self, socket: IceSocketWrapper, buf: &[u8]) -> Result<usize> {
+        let remote = *self.remote_addr.read();
         if remote.port() == 0 {
             return Err(anyhow::anyhow!("Remote address not set"));
         }
-        let n = socket.try_send_to(buf, remote)?;
-        // Note: tx_packets/tx_bytes not updated here (fast-path opt).
-        // These counters are informational and the write-order atomic
-        // would add unnecessary cost on the hot path.
-        Ok(n)
+        match &socket {
+            IceSocketWrapper::Udp(_) | IceSocketWrapper::SharedUdp(_) => {
+                let n = socket.try_send_to(buf, remote)?;
+                // Note: tx_packets/tx_bytes not updated here (fast-path opt).
+                // These counters are informational and the write-order atomic
+                // would add unnecessary cost on the hot path.
+                Ok(n)
+            }
+            // TURN relay / TCP / TLS only expose async sends: queue the packet
+            // for a background task instead of failing (and dropping) forever.
+            _ => {
+                self.defer_async_send(socket, buf, remote);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    /// Queue `buf` for asynchronous transmission on `socket`. The drain task is
+    /// spawned on first use and exits when `self` (and therefore the channel
+    /// sender) is dropped. Unbounded on purpose: this is the audio path, and
+    /// dropping on a full queue is exactly the failure mode being fixed.
+    fn defer_async_send(&self, socket: IceSocketWrapper, buf: &[u8], addr: SocketAddr) {
+        let tx = self.deferred_send_tx.get_or_init(|| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<(IceSocketWrapper, Vec<u8>, SocketAddr)>();
+            tokio::spawn(async move {
+                while let Some((socket, buf, addr)) = rx.recv().await {
+                    if let Err(e) = socket.send_to(&buf, addr).await {
+                        debug!(
+                            error = %e,
+                            "IceConn: deferred async send failed (relay fast-path fallback)"
+                        );
+                    }
+                }
+            });
+            tx
+        });
+        if tx.send((socket, buf.to_vec(), addr)).is_err() {
+            trace!("IceConn: deferred send queue closed, dropping packet");
+        }
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
@@ -757,6 +794,87 @@ mod tests {
         let mut buf = [0u8; 1024];
         let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..len], b"hello");
+    }
+
+    /// Regression: the RTP bridge fast-path used to drop every packet on a
+    /// non-`Udp` transport because `IceSocketWrapper::try_send_to` returned
+    /// "not supported" (the "call connected but no audio" Relay-path bug).
+    /// Shared (muxed) UDP is such a transport — `try_send` must still deliver.
+    #[tokio::test]
+    async fn test_try_send_delivers_on_shared_udp_transport() {
+        // `acquire` keys the shared-port registry by the requested address, so
+        // reserve a concrete loopback port first instead of using port 0.
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (_local, handle, _guard) =
+            crate::transports::ice::shared_udp::acquire(bind_addr, "fastpath-test".to_string())
+                .await
+                .unwrap();
+        // tokio's `try_send_to` reports WouldBlock until the reactor has marked
+        // the socket writable; in production the socket is already actively
+        // receiving, so this only matters for the test's fresh socket.
+        let shared_socket = handle.socket().clone();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::SharedUdp(Arc::new(handle))));
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let conn = IceConn::new(rx, receiver_addr, None);
+
+        shared_socket.writable().await.unwrap();
+        conn.try_send(b"relayed")
+            .expect("fast-path send must not fail on shared UDP");
+
+        let mut buf = [0u8; 32];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("shared-UDP fast-path send must deliver")
+        .unwrap();
+        assert_eq!(&buf[..len], b"relayed");
+    }
+
+    /// Same regression for the transports that have **no** synchronous send
+    /// (TURN / TCP / TLS) — the production Relay-path case. `try_send` must
+    /// queue through the deferred async sender instead of returning Err.
+    #[tokio::test]
+    async fn test_try_send_defers_on_non_udp_transport() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let (read, write) = server.into_split();
+
+        let wrapper = IceSocketWrapper::TcpStream(
+            Arc::new(tokio::sync::Mutex::new(read)),
+            Arc::new(tokio::sync::Mutex::new(write)),
+            peer,
+        );
+        let (_tx, rx) = watch::channel(Some(wrapper));
+        let conn = IceConn::new(rx, peer, None);
+
+        // Non-UDP: must be accepted (queued for async send), not rejected.
+        conn.try_send(b"relayed")
+            .expect("fast-path send must not fail on non-UDP transport");
+
+        // The async drain task writes a 2-byte big-endian length prefix + data.
+        let mut header = [0u8; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut header),
+        )
+        .await
+        .expect("deferred fast-path send must deliver")
+        .unwrap();
+        let n = u16::from_be_bytes(header) as usize;
+        let mut body = vec![0u8; n];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut body)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"relayed");
     }
 
     #[tokio::test]

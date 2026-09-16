@@ -4566,8 +4566,24 @@ impl IceSocketWrapper {
                     Err(anyhow!(reason))
                 }
             },
-            // Non-UDP transports (TCP/TLS/TURN) are not used by the bridge
-            // fast-path; fall back to the async variant.
+            IceSocketWrapper::SharedUdp(h) => {
+                // Shared (muxed) UDP is still a synchronous datagram socket:
+                // record the peer for reverse routing, then write without
+                // parking (same contract as the `Udp` arm above).
+                h.register_peer(addr);
+                match h.socket().try_send_to(data, addr) {
+                    Ok(len) => Ok(len),
+                    Err(e) => {
+                        let reason = match h.local_addr() {
+                            Ok(local) => format!("shared UDP {} -> {} failed: {}", local, addr, e),
+                            Err(_) => format!("shared UDP -> {} failed: {}", addr, e),
+                        };
+                        Err(anyhow!(reason))
+                    }
+                }
+            }
+            // TURN / TCP / TLS have no synchronous send: callers must use the
+            // async `send_to` (the bridge fast-path queues via `IceConn`).
             _ => Err(anyhow::anyhow!(
                 "IceSocketWrapper::try_send_to not supported for this transport variant"
             )),

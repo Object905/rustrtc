@@ -225,9 +225,16 @@ impl SharedUdpHandle {
         &self.socket
     }
 
+    /// Record `dest` as a peer belonging to this session (no send). Used by the
+    /// synchronous fast-path, which writes through [`Self::socket`] directly and
+    /// still needs reverse routing for the peer's replies.
+    pub(crate) fn register_peer(&self, dest: SocketAddr) {
+        self.peers.lock().insert(dest, self.ufrag.clone());
+    }
+
     /// Record `dest` as a peer belonging to this session, then send.
     pub async fn send_to(&self, data: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
-        self.peers.lock().insert(dest, self.ufrag.clone());
+        self.register_peer(dest);
         self.socket.send_to(data, dest).await
     }
 
