@@ -4543,3 +4543,41 @@ async fn test_runner_upnp_refresh_tick_renews_mappings() {
     // test harness teardown.
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
+
+/// Reproduction for the Relay-path "call connected but no audio" bug: a leg
+/// whose selected ICE socket is a TURN relay must still forward RTP through the
+/// synchronous fast-path (`IceConn::try_send`). Before the fix every packet was
+/// dropped with "try_send_to not supported for this transport variant".
+#[tokio::test]
+#[serial]
+async fn fast_path_try_send_relays_rtp_via_turn() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+
+    let ice_server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+    let creds = super::turn::TurnCredentials::from_server(&ice_server)?;
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let client = super::turn::TurnClient::connect(&uri, false).await?;
+    let alloc = client.allocate(creds).await?;
+
+    // A plain UDP peer that the relayed packet must reach.
+    let peer = UdpSocket::bind("127.0.0.1:0").await?;
+    let peer_addr = peer.local_addr()?;
+    client.create_permission(peer_addr).await?;
+
+    let wrapper = IceSocketWrapper::Turn(Arc::new(client), alloc.relayed_address);
+    let (_tx, rx) = tokio::sync::watch::channel(Some(wrapper));
+    let conn = super::conn::IceConn::new(rx, peer_addr, None);
+
+    conn.try_send(b"relayed")
+        .expect("TURN fast-path send must not fail");
+
+    let mut buf = [0u8; 32];
+    let (len, _) = timeout(Duration::from_millis(1000), peer.recv_from(&mut buf))
+        .await
+        .expect("packet must be relayed through TURN")?;
+    assert_eq!(&buf[..len], b"relayed");
+
+    turn_server.stop().await?;
+    Ok(())
+}
