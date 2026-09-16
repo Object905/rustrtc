@@ -2961,15 +2961,16 @@ async fn use_candidate_nominates_first_pair() -> Result<()> {
     Ok(())
 }
 
-/// Regression test: after a pair is nominated on the controlled side, any
-/// subsequent STUN Binding Requests that carry USE-CANDIDATE (keepalives or
-/// probes from other candidates) must NOT trigger re-nomination.
+/// The controlled agent must FOLLOW a re-nomination: a USE-CANDIDATE that
+/// arrives on a different pair after the first nomination selects that new
+/// pair. That is exactly what a real controlling peer does when its current
+/// path dies (e.g. a browser abandoning a dead srflx path for its relay); if
+/// the controlled side freezes on the abandoned pair, DTLS is sent to the
+/// wrong address and the call has no media.
 ///
-/// Before the fix, `selected_pair_notifier` was fired on every such packet,
-/// causing PeerConnection to log "pair_monitor update" continuously and
-/// potentially switch the active pair.
+/// A USE-CANDIDATE on the *same* pair remains a no-op.
 #[tokio::test]
-async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
+async fn use_candidate_follows_renomination_from_new_candidate() -> Result<()> {
     // 1. Connect two ICE agents (controlling + controlled).
     let (t1, r1) = IceTransportBuilder::new(RtcConfiguration::default())
         .role(IceRole::Controlling)
@@ -3042,19 +3043,13 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
     .await
     .context("timed out waiting for nomination")??;
 
-    // 2. Record the nominated pair and subscribe to future pair changes.
+    // 2. Record the nominated pair, then re-nominate a different pair.
     let nominated_pair = t2
         .get_selected_pair()
         .expect("controlled side must have a selected pair after nomination");
 
-    let mut pair_rx = t2.subscribe_selected_pair();
-    // Mark the current value as "seen" so has_changed() only fires for
-    // updates that happen after this point.
-    let _ = pair_rx.borrow_and_update();
-
-    // 3. Register a fake second "remote candidate" whose address is different
-    //    from the currently nominated remote.  This simulates the browser
-    //    keepalive arriving from a different candidate (srflx / relay).
+    // 3. Register a second remote candidate at a distinct address — the pair
+    //    the controlling agent will re-nominate.
     let second_socket = UdpSocket::bind("127.0.0.1:0").await?;
     let second_addr = second_socket.local_addr()?;
     assert_ne!(
@@ -3076,36 +3071,25 @@ async fn use_candidate_no_renomination_after_nomination() -> Result<()> {
     // 5. Allow time for the packet to be received and processed.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 6. Assert: selected_pair must not have changed.
-    assert!(
-        !pair_rx.has_changed().unwrap_or(true),
-        "selected_pair must NOT be updated by a USE-CANDIDATE after initial nomination \
-         (re-nomination guard is missing or broken)"
-    );
-
+    // 6. Assert: the controlled agent followed the re-nomination.
     let final_pair = t2
         .get_selected_pair()
         .expect("selected pair should still be present");
     assert_eq!(
-        nominated_pair.remote.address, final_pair.remote.address,
-        "remote address of selected pair must not change after subsequent USE-CANDIDATE keepalives"
+        final_pair.remote.address, second_addr,
+        "controlled agent must follow a post-nomination USE-CANDIDATE to the new pair"
     );
 
     Ok(())
 }
 
-/// Regression test (nominated-pair freeze): a USE-CANDIDATE arriving on a
-/// DIFFERENT, strictly higher-priority pair after nomination must NOT
-/// replace the nominated pair.
-///
-/// Before the freeze, the controlled agent "upgraded" to the higher-priority
-/// pair, retargeting media mid-session onto a path the controlling agent
-/// never selected. Observed against Chrome: consent keepalives stay green
-/// while the peer hears ~300ms of media and then permanent silence.
+/// The controlled agent must follow a re-nomination even onto a *higher*-
+/// priority pair: the controlling agent is authoritative, not our local
+/// priority ordering. (Previously the controlled side froze on the first
+/// nominated pair to avoid the "upgrade", which broke real re-nominations.)
 #[tokio::test]
-async fn use_candidate_higher_priority_pair_frozen_after_nomination() -> Result<()> {
-    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default())
-        .await;
+async fn use_candidate_follows_renomination_to_higher_priority_pair() -> Result<()> {
+    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
 
     assert!(
         wait_ice_connected(t1.subscribe_state(), Duration::from_secs(10)).await,
@@ -3152,8 +3136,8 @@ async fn use_candidate_higher_priority_pair_frozen_after_nomination() -> Result<
         .get_selected_pair()
         .expect("selected pair should still be present");
     assert_eq!(
-        nominated_pair.remote.address, final_pair.remote.address,
-        "post-nomination UseCandidate on a higher-priority pair must NOT replace the frozen pair"
+        final_pair.remote.address, second_addr,
+        "controlled agent must follow a post-nomination UseCandidate even to a higher-priority pair"
     );
 
     Ok(())

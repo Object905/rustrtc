@@ -1864,74 +1864,52 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // Signal Connected so the PeerConnection starts waiting for nomination_complete.
         let _ = inner.state.send(IceTransportState::Connected);
 
-        // Launch ALL nomination checks in parallel, but select the
-        // highest-priority pair that succeeds — not merely the first one to
-        // complete. A fast lower-priority path (e.g. a TURN relay whose
-        // socket was pre-allocated during gathering) can otherwise win the
-        // race against a higher-priority host path that the peer actually
-        // selected, leaving the two ends with incompatible pairs and a
-        // broken DTLS media path (seen across cascaded NAT: the controlling
-        // side chose a srflx/relay pair while the controlled side selected a
-        // host <-> peer-reflexive pair, so neither direction carried DTLS).
-        //
-        // To avoid paying the N × nomination_timeout latency of sequential
-        // nomination when the highest-priority pairs are unreachable, all
-        // nominations still run concurrently; we only apply a short grace
-        // window after the first success so a slower-but-higher-priority pair
-        // still gets a chance to win. The window is skipped entirely when the
-        // globally highest-priority pair already succeeded or nothing else is
-        // still in flight (the common single-pair LAN case).
-        const NOMINATION_GRACE: Duration = Duration::from_millis(200);
-        let mut nom_checks = futures::stream::FuturesUnordered::new();
-        for pair in &successful_pairs {
-            let inner_c = inner.clone();
-            let local = pair.local.clone();
-            let remote = pair.remote.clone();
-            debug!(
-                "Controlling agent nominating pair: {} -> {}",
-                local.address, remote.address
-            );
-            nom_checks.push(async move {
-                let result = perform_binding_check(&local, &remote, &inner_c, role, true).await;
-                (IceCandidatePair::new(local, remote), result)
-            });
+        // Nominate once. Late trickle candidates re-trigger connectivity checks;
+        // re-nominating on every round would make the controlled peer flap
+        // between pairs (RFC 8445 nominates a single pair for the session —
+        // re-nomination is only expected after an ICE restart, which resets
+        // nomination state).
+        if inner.nomination_complete.borrow().is_some() {
+            debug!("ICE checks complete (controlling): already nominated, keeping selected pair");
+            return;
         }
 
-        let highest_priority = successful_pairs[0].clone();
-        let mut successful_nominations: Vec<IceCandidatePair> = Vec::new();
-        let mut in_flight = nom_checks.len();
-        loop {
-            let next = if successful_nominations.is_empty() {
-                nom_checks.next().await
-            } else {
-                tokio::select! {
-                    biased;
-                    res = nom_checks.next() => res,
-                    _ = tokio::time::sleep(NOMINATION_GRACE) => None,
-                }
-            };
-            let Some((pair, result)) = next else { break };
-            in_flight -= 1;
-            match result {
+        // RFC 8445 regular nomination: send USE-CANDIDATE on exactly ONE pair
+        // — the highest-priority pair that passed connectivity checks
+        // (`successful_pairs` is already sorted best-first). Nominating every
+        // successful pair in parallel (the previous behaviour) sends
+        // USE-CANDIDATE on multiple pairs, leaving the controlled peer unable
+        // to tell which is authoritative; it had to freeze/guess, and when a
+        // real controlling peer later re-nominated (e.g. a browser abandoning
+        // a dead srflx path for its relay) the frozen side kept DTLS pointed
+        // at the stale address and the handshake never completed. A single
+        // authoritative nomination makes re-nomination unambiguous.
+        //
+        // Try pairs in priority order; a nomination binding check can still be
+        // lost, so fall through to the next successful pair. Bound the whole
+        // phase to a single nomination_timeout so a lossy link cannot multiply
+        // the latency by the candidate count (which previously stalled setup
+        // for N × nomination_timeout under high packet loss).
+        let nomination_deadline = tokio::time::Instant::now() + inner.config.nomination_timeout;
+        let mut nominated_pair: Option<IceCandidatePair> = None;
+        for (idx, pair) in successful_pairs.iter().enumerate() {
+            // Always attempt the best pair; only bound the fallbacks.
+            if idx > 0 && tokio::time::Instant::now() >= nomination_deadline {
+                debug!("Nomination deadline reached before trying all candidate pairs");
+                break;
+            }
+            debug!(
+                "Controlling agent nominating pair: {} -> {}",
+                pair.local.address, pair.remote.address
+            );
+            match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await {
                 Ok(_) => {
                     debug!(
                         "Nomination succeeded: {} -> {}",
                         pair.local.address, pair.remote.address
                     );
-                    let key = (pair.local.address, pair.remote.address);
-                    if !successful_nominations
-                        .iter()
-                        .any(|p| (p.local.address, p.remote.address) == key)
-                    {
-                        successful_nominations.push(pair.clone());
-                    }
-                    // The globally highest-priority pair succeeded — nothing
-                    // better to wait for.
-                    if pair.local.address == highest_priority.local.address
-                        && pair.remote.address == highest_priority.remote.address
-                    {
-                        break;
-                    }
+                    nominated_pair = Some(pair.clone());
+                    break;
                 }
                 Err(e) => {
                     debug!(
@@ -1940,19 +1918,14 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                     );
                 }
             }
-            if in_flight == 0 {
-                break;
-            }
         }
 
-        // Set selected_pair: use the highest-priority successful nomination,
-        // or the highest-priority pair on all-fail (for best-effort data flow).
-        successful_nominations.sort_by_key(|p| std::cmp::Reverse(p.priority(role)));
-        let final_pair = successful_nominations
-            .first()
-            .cloned()
+        // Fall back to the highest-priority pair on all-fail so best-effort
+        // data still has a path.
+        let final_pair = nominated_pair
+            .clone()
             .unwrap_or_else(|| successful_pairs[0].clone());
-        let nominated = !successful_nominations.is_empty();
+        let nominated = nominated_pair.is_some();
         *inner.selected_pair.lock() = Some(final_pair.clone());
         let _ = inner.selected_pair_notifier.send(Some(final_pair.clone()));
         if let Some(socket) = resolve_socket(&inner, &final_pair) {
@@ -1967,10 +1940,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         if nominated {
             let _ = inner.nomination_complete.send(Some(true));
         } else {
-            debug!(
-                "All {} nomination attempts failed",
-                successful_pairs.len()
-            );
+            debug!("All {} nomination attempts failed", successful_pairs.len());
             let _ = inner.nomination_complete.send(Some(false));
             let _ = inner.state.send(IceTransportState::Failed);
         }
@@ -2487,24 +2457,16 @@ async fn handle_stun_request(
             if matches!(sender, IceSocketWrapper::TcpStream(_, _, _)) {
                 return;
             }
-            // RFC 8445 §7.3.1.5: once a pair has been nominated, subsequent
-            // USE-CANDIDATE (e.g. keepalives from other candidates) must not
-            // trigger re-nomination.  We still process them here, but only to
-            // upgrade to a strictly higher-priority pair: the controlling side
-            // nominates every successful pair in parallel, so a fast
-            // lower-priority path (e.g. TURN relay) routinely arrives BEFORE a
-            // slower host path the peer actually prefers. Latching the first
-            // arrival would leave the two ends on incompatible pairs (see
-            // cascaded-NAT reports). Mirror the controlling side's priority
-            // check so both sides converge on the best nominated pair.
-            let already_nominated = inner.nomination_complete.borrow().is_some();
-            // The controlling agent's nomination is authoritative. A pair
-            // selected earlier by our own check completion is only
-            // provisional: on a multihomed host it can differ from the
-            // pair the peer actually validated - it may even be a path
-            // that only works in one direction (e.g. a source address the
-            // peer's network drops on the return leg) - so it must be
-            // replaced by the pair this request arrived on.
+            // The controlling agent is authoritative. As the controlled agent
+            // we simply follow the pair this USE-CANDIDATE arrived on —
+            // including a *re-nomination*. A real controlling peer (e.g. a
+            // browser) legitimately switches pairs when its current path dies
+            // (dead srflx -> relay) and re-sends USE-CANDIDATE on the new pair.
+            // Freezing on the first nomination (previous behaviour) left us
+            // sending DTLS to an address the peer had already abandoned, so
+            // the handshake never completed and the call had no media.
+            // Keepalives on the same pair remain a no-op; a different pair is
+            // followed.
             let local_addr: SocketAddr = match sender {
                 IceSocketWrapper::Udp(s) => s
                     .local_addr()
@@ -2541,38 +2503,15 @@ async fn handle_stun_request(
                     let selected = inner.selected_pair.lock();
                     match selected.as_ref() {
                         Some(cur) => {
-                            let same = cur.local.address == pair.local.address
-                                && cur.remote.address == pair.remote.address;
-                            if same {
-                                false
-                            } else if already_nominated {
-                                // RFC 8445 §7.3.1.5: the pair the controlling
-                                // agent nominated first is authoritative for
-                                // the rest of the session. Swapping to a
-                                // "better" pair mid-session retargets media
-                                // onto a path the peer never selected (e.g.
-                                // the peer's NAT silently drops it), while
-                                // consent keepalives keep flowing on the
-                                // original socket — the remote then hears
-                                // permanent silence. Freeze the pair instead.
-                                debug!(
-                                    "Ignoring post-nomination UseCandidate {} -> {} (frozen on {} -> {})",
-                                    pair.local.address,
-                                    pair.remote.address,
-                                    cur.local.address,
-                                    cur.remote.address
-                                );
-                                false
-                            } else {
-                                true
-                            }
+                            !(cur.local.address == pair.local.address
+                                && cur.remote.address == pair.remote.address)
                         }
                         None => true,
                     }
                 };
                 if should_select {
                     debug!(
-                        "Controlled agent selected pair via UseCandidate: {} -> {}",
+                        "Controlled agent following UseCandidate: {} -> {}",
                         pair.local.address, pair.remote.address
                     );
                     *inner.selected_pair.lock() = Some(pair.clone());

@@ -563,3 +563,102 @@ async fn interop_ice_close_triggers_pc_close() -> Result<()> {
 
     Ok(())
 }
+
+/// Interop with the roles reversed: the third-party `webrtc` crate (pion) is
+/// the OFFERER / controlling ICE agent and rustrtc is the ANSWERER / controlled
+/// agent. This exercises rustrtc's *controlled-side* ICE + DTLS path against a
+/// real third-party stack — the side changed by the re-nomination fix (the
+/// controlled agent must follow whatever pair the controlling agent nominates).
+///
+/// The deterministic in-house tests (`use_candidate_follows_renomination_*`)
+/// cover the re-nomination itself; this test guards against a regression in the
+/// controlled-side handshake against an external implementation.
+#[tokio::test]
+async fn interop_third_party_controlling_rustrtc_controlled() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Third-party WebRTC PeerConnection (offerer / controlling).
+    let mut m = MediaEngine::default();
+    m.register_default_codecs()?;
+    let mut registry = Registry::new();
+    registry = register_default_interceptors(registry, &mut m)?;
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .build();
+    let webrtc_pc = api
+        .new_peer_connection(WebrtcConfiguration::default())
+        .await?;
+
+    let codec = webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability {
+        mime_type: webrtc::api::media_engine::MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48000,
+        channels: 2,
+        ..Default::default()
+    };
+    let audio_track = Arc::new(
+        webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP::new(
+            codec,
+            "audio".to_string(),
+            "webrtc_stream".to_string(),
+        ),
+    );
+    let _ = webrtc_pc.add_track(audio_track).await?;
+
+    // 2. rustrtc PeerConnection (answerer / controlled).
+    let rust_pc = PeerConnection::new(RtcConfiguration::default());
+    rust_pc.add_transceiver(MediaKind::Audio, TransceiverDirection::SendRecv);
+
+    // 3. Third-party offer -> rustrtc.
+    let offer = webrtc_pc.create_offer(None).await?;
+    let mut gather = webrtc_pc.gathering_complete_promise().await;
+    webrtc_pc.set_local_description(offer).await?;
+    let _ = gather.recv().await;
+    let offer = webrtc_pc
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no local description on controlling side"))?;
+    let rust_offer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, &offer.sdp)?;
+    rust_pc.set_remote_description(rust_offer).await?;
+
+    // 4. rustrtc answer -> third-party.
+    let answer = rust_pc.create_answer().await?;
+    rust_pc.set_local_description(answer)?;
+    rust_pc.wait_for_gathering_complete().await;
+    let answer = rust_pc
+        .local_description()
+        .ok_or_else(|| anyhow::anyhow!("no local description on controlled side"))?;
+    let webrtc_answer = RTCSessionDescription::answer(answer.to_sdp_string())?;
+    webrtc_pc.set_remote_description(webrtc_answer).await?;
+
+    // 5. Both sides must reach connected (ICE + DTLS).
+    timeout(Duration::from_secs(15), rust_pc.wait_for_connected()).await??;
+
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let done_tx = Arc::new(done_tx);
+    let done_tx_clone = done_tx.clone();
+    webrtc_pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        if s == RTCPeerConnectionState::Connected {
+            let _ = done_tx_clone.try_send(());
+        }
+        Box::pin(async {})
+    }));
+    if webrtc_pc.connection_state() == RTCPeerConnectionState::Connected {
+        let _ = done_tx.try_send(());
+    }
+    timeout(Duration::from_secs(15), done_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("third-party (controlling) side did not connect"))?;
+
+    // The controlled (rustrtc) side must have selected the pair the controlling
+    // agent nominated.
+    assert!(
+        rust_pc.ice_transport().get_selected_pair().is_some(),
+        "rustrtc (controlled) must have a selected ICE pair after third-party nomination"
+    );
+
+    rust_pc.close();
+    webrtc_pc.close().await?;
+    Ok(())
+}

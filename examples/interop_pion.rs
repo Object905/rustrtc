@@ -80,6 +80,27 @@ async fn handle_offer(Json(payload): Json<OfferRequest>) -> impl IntoResponse {
     }];
     config.media_capabilities = Some(caps);
 
+    // Optional STUN/TURN for browser interop tests. Credentials are read from
+    // the environment only — never baked into the source. Comma-separated URLs
+    // are accepted, e.g. RTC_ICE_URL="stun:host:3478,turn:host:3478".
+    if let Ok(url) = std::env::var("RTC_ICE_URL") {
+        let urls: Vec<String> = url
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !urls.is_empty() {
+            let mut server = rustrtc::IceServer::new(urls);
+            let user = std::env::var("RTC_ICE_USER").unwrap_or_default();
+            let pass = std::env::var("RTC_ICE_PASS").unwrap_or_default();
+            if !user.is_empty() {
+                server = server.with_credential(&user, &pass);
+            }
+            config.ice_servers.push(server);
+            info!("ICE server configured from environment (RTC_ICE_URL)");
+        }
+    }
+
     let pc = PeerConnection::new(config);
 
     // Handle Events
