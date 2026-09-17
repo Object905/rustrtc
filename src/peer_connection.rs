@@ -3010,6 +3010,33 @@ impl PeerConnection {
         Some(std::net::SocketAddr::new(ip, port))
     }
 
+    /// Whether an incoming RTCP packet should be delivered to a sender whose
+    /// SSRC is `sender_ssrc`.
+    ///
+    /// Feedback packets (PLI/FIR/NACK) target our sender SSRC directly.
+    /// Receiver Reports carry per-source reception blocks *about* our stream,
+    /// and Sender Reports describe the remote stream (jitter/loss plus the
+    /// remote packet count used to estimate receive-direction loss), so both
+    /// must be delivered too — otherwise `RtpSender::subscribe_rtcp()` never
+    /// yields RR/SR and the per-leg media-quality stats (jitter / RTT /
+    /// fraction lost) stay permanently zero.
+    fn rtcp_targets_sender(packet: &RtcpPacket, sender_ssrc: u32) -> bool {
+        match packet {
+            RtcpPacket::PictureLossIndication(pli) => pli.media_ssrc == sender_ssrc,
+            RtcpPacket::FullIntraRequest(fir) => fir
+                .requests
+                .iter()
+                .any(|request| request.ssrc == sender_ssrc),
+            RtcpPacket::GenericNack(nack) => nack.media_ssrc == sender_ssrc,
+            RtcpPacket::ReceiverReport(rr) => {
+                rr.report_blocks.is_empty()
+                    || rr.report_blocks.iter().any(|block| block.ssrc == sender_ssrc)
+            }
+            RtcpPacket::SenderReport(_) => true,
+            _ => false,
+        }
+    }
+
     fn create_rtcp_loop(
         rtp_transport: Arc<RtpTransport>,
         inner_weak: Weak<PeerConnectionInner>,
@@ -3048,20 +3075,8 @@ impl PeerConnection {
                         let transceivers = inner.transceivers.lock();
                         for t in transceivers.iter() {
                             if let Some(sender) = &*t.sender.lock() {
-                                let is_for_sender = match &packet {
-                                    RtcpPacket::PictureLossIndication(pli) => {
-                                        pli.media_ssrc == sender.ssrc()
-                                    }
-                                    RtcpPacket::FullIntraRequest(fir) => fir
-                                        .requests
-                                        .iter()
-                                        .any(|request| request.ssrc == sender.ssrc()),
-                                    RtcpPacket::GenericNack(nack) => {
-                                        nack.media_ssrc == sender.ssrc()
-                                    }
-                                    _ => false,
-                                };
-
+                                let is_for_sender =
+                                    Self::rtcp_targets_sender(&packet, sender.ssrc());
                                 if is_for_sender {
                                     sender.deliver_rtcp(packet.clone());
                                 }
@@ -7597,6 +7612,57 @@ mod tests {
     use super::*;
     use crate::transports::ice::IceTransportState;
     use crate::{Direction, MediaKind, RtcConfiguration};
+
+    /// Regression: Receiver/Sender Reports must reach the sender's RTCP
+    /// broadcast. Previously the RTCP loop only delivered PLI/FIR/NACK, so
+    /// `RtpSender::subscribe_rtcp()` never yielded RR/SR and the per-leg media
+    /// quality stats (jitter / RTT / fraction lost) stayed permanently zero.
+    #[test]
+    fn rtcp_rr_sr_are_delivered_to_sender() {
+        use crate::rtp::{ReceiverReport, ReportBlock, SenderReport};
+
+        let our_ssrc = 10000u32;
+        let block = |ssrc: u32| ReportBlock {
+            ssrc,
+            fraction_lost: 12,
+            packets_lost: 3,
+            highest_sequence: 999,
+            jitter: 160,
+            last_sender_report: 0,
+            delay_since_last_sender_report: 0,
+        };
+
+        let rr_matching = RtcpPacket::ReceiverReport(ReceiverReport {
+            sender_ssrc: 555,
+            report_blocks: vec![block(our_ssrc)],
+        });
+        let rr_other = RtcpPacket::ReceiverReport(ReceiverReport {
+            sender_ssrc: 555,
+            report_blocks: vec![block(7777)],
+        });
+        let sr = RtcpPacket::SenderReport(SenderReport {
+            sender_ssrc: 555,
+            ntp_most: 0,
+            ntp_least: 0,
+            rtp_timestamp: 0,
+            packet_count: 42,
+            octet_count: 0,
+            report_blocks: vec![block(our_ssrc)],
+        });
+
+        assert!(
+            PeerConnection::rtcp_targets_sender(&rr_matching, our_ssrc),
+            "RR about our SSRC must be delivered to the sender"
+        );
+        assert!(
+            !PeerConnection::rtcp_targets_sender(&rr_other, our_ssrc),
+            "RR about another SSRC must not be delivered"
+        );
+        assert!(
+            PeerConnection::rtcp_targets_sender(&sr, our_ssrc),
+            "SR must be delivered (remote packet count / jitter)"
+        );
+    }
 
     /// Regression test: an `RtpObserver` registered BEFORE the RTP transport
     /// exists (e.g. rustpbx attaches its IngressTap at leg construction) must

@@ -304,6 +304,7 @@ impl DtlsTransport {
                 .await
             {
                 debug!(
+                    label = inner_clone.conn.label.as_deref().unwrap_or("-"),
                     "DTLS handshake failed: {e} (remote={})",
                     inner_clone.conn.remote_addr.read()
                 );
@@ -924,6 +925,7 @@ impl DtlsInner {
 
         if ctx.server_random.is_some() {
             debug!(
+                label = self.conn.label.as_deref().unwrap_or("-"),
                 message_seq = ctx.message_seq,
                 "ClientHello retransmission received — resending server flight"
             );
@@ -961,6 +963,7 @@ impl DtlsInner {
         };
 
         debug!(
+            label = self.conn.label.as_deref().unwrap_or("-"),
             offered_cipher_suites = ?client_hello.cipher_suites,
             client_version = ?client_hello.version,
             extensions_len = client_hello.extensions.len(),
@@ -1422,6 +1425,7 @@ impl DtlsInner {
                 self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                 let _ = self.state_tx.send(state);
                 debug!(
+                    label = self.conn.label.as_deref().unwrap_or("-"),
                     "DTLS handshake complete (server role) (remote={})",
                     self.conn.remote_addr.read()
                 );
@@ -1458,6 +1462,7 @@ impl DtlsInner {
                         self.write_seq.store(ctx.sequence_number, Ordering::SeqCst);
                         let _ = self.state_tx.send(state);
                         debug!(
+                            label = self.conn.label.as_deref().unwrap_or("-"),
                             "DTLS handshake complete (client role) (remote={})",
                             self.conn.remote_addr.read()
                         );
@@ -1957,7 +1962,7 @@ impl DtlsInner {
                 }
                 // Handshake timeout — abort if the peer never responds.
                 _ = &mut handshake_timeout, if matches!(*self.state.lock(), DtlsState::Handshaking) => {
-                    debug!("DTLS handshake timed out after {}s — aborting (remote={})", DTLS_HANDSHAKE_TIMEOUT.as_secs(), self.conn.remote_addr.read());
+                    debug!(label = self.conn.label.as_deref().unwrap_or("-"), "DTLS handshake timed out after {}s — aborting (remote={})", DTLS_HANDSHAKE_TIMEOUT.as_secs(), self.conn.remote_addr.read());
                     *self.state.lock() = DtlsState::Failed;
                     let _ = self.state_tx.send(DtlsState::Failed);
                     return Err(anyhow::anyhow!(

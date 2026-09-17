@@ -1850,6 +1850,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
     for p in &successful_pairs {
         debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
             "ICE successful pair ({}): local {} {:?} -> remote {} {:?}",
             if role == IceRole::Controlling {
                 "controlling"
@@ -1870,7 +1871,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // re-nomination is only expected after an ICE restart, which resets
         // nomination state).
         if inner.nomination_complete.borrow().is_some() {
-            debug!("ICE checks complete (controlling): already nominated, keeping selected pair");
+            debug!(label = inner.config.label.as_deref().unwrap_or("-"), "ICE checks complete (controlling): already nominated, keeping selected pair");
             return;
         }
 
@@ -1899,12 +1900,14 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 break;
             }
             debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
                 "Controlling agent nominating pair: {} -> {}",
                 pair.local.address, pair.remote.address
             );
             match perform_binding_check(&pair.local, &pair.remote, &inner, role, true).await {
                 Ok(_) => {
                     debug!(
+                        label = inner.config.label.as_deref().unwrap_or("-"),
                         "Nomination succeeded: {} -> {}",
                         pair.local.address, pair.remote.address
                     );
@@ -1913,6 +1916,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                 }
                 Err(e) => {
                     debug!(
+                        label = inner.config.label.as_deref().unwrap_or("-"),
                         "Nomination failed for {} -> {}: {}",
                         pair.local.address, pair.remote.address, e
                     );
@@ -1933,6 +1937,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             publish_selected_rtcp_socket(&inner, Some(socket));
         }
         debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
             "ICE checks complete. Selected pair: {} -> {}",
             final_pair.local.address, final_pair.remote.address
         );
@@ -1954,7 +1959,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // by late (e.g. peer-reflexive) candidates would otherwise stomp the
         // nominated pair with a locally-preferred one the peer never chose.
         if inner.nomination_complete.borrow().is_some() {
-            debug!("ICE checks complete (controlled): keeping peer-nominated pair");
+            debug!(label = inner.config.label.as_deref().unwrap_or("-"), "ICE checks complete (controlled): keeping peer-nominated pair");
             return;
         }
         let pair = &successful_pairs[0];
@@ -1969,6 +1974,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             let _ = inner.nomination_complete.send(Some(true));
         }
         debug!(
+            label = inner.config.label.as_deref().unwrap_or("-"),
             "ICE checks complete. Selected pair: {} -> {}",
             pair.local.address, pair.remote.address
         );
@@ -2511,6 +2517,7 @@ async fn handle_stun_request(
                 };
                 if should_select {
                     debug!(
+                        label = inner.config.label.as_deref().unwrap_or("-"),
                         "Controlled agent following UseCandidate: {} -> {}",
                         pair.local.address, pair.remote.address
                     );
