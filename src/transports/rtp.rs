@@ -113,9 +113,11 @@ pub struct RtpRewriteBridgeOptions {
     /// Ignored for the first packet when [`Self::initial_output_timestamp`] is set.
     pub initial_timestamp_offset: Option<u32>,
     /// Force the first forwarded packet's *output* RTP timestamp to this value
-    /// by choosing `offset = value - src_ts`. Later packets keep source
-    /// deltas. Use this to continue a destination leg's paced-sender timeline
-    /// when IVR and rewrite share the same outbound SSRC (WebRTC).
+    /// by choosing `offset = value - src_ts`. Applies to the FIRST source
+    /// stream only — later source-stream switches continue the outgoing
+    /// timeline right after the previous stream's tail (bridge-owned, never
+    /// backwards), so a shared destination SSRC stays continuous across
+    /// ringback → relay, IVR → relay and similar source churn.
     pub initial_output_timestamp: Option<u32>,
 }
 
@@ -158,12 +160,38 @@ impl RtpRewriteRule {
     }
 }
 
+/// Nominal frame step (20 ms at 8 kHz) used to continue the outgoing
+/// timestamp timeline when the relayed source stream changes. The bridge has
+/// no clock-rate knowledge, so a small constant step keeps receivers' jitter
+/// buffers stable; the following packets re-establish the real source cadence
+/// through their timestamp deltas.
+const REWRITE_STREAM_STEP: u32 = 160;
+
 #[derive(Debug, Clone, Copy)]
 struct StreamRewriteState {
     out_ssrc: u32,
-    next_sequence_number: u16,
     last_source_timestamp: Option<u32>,
     timestamp_offset: u32,
+    /// Next outgoing sequence number this stream expects to use; `None`
+    /// until the stream emits its first packet.
+    next_sequence_number: Option<u16>,
+}
+
+/// Outgoing timeline state for one destination SSRC. Sequence numbers and
+/// RTP timestamps are per-destination-SSRC properties: two sources relayed to
+/// DIFFERENT outgoing SSRCs (BUNDLE audio + video) must never influence each
+/// other's counters, while two sources sharing one outgoing SSRC (ringback →
+/// talk, IVR → relay) must hand the timeline over without re-using numbers.
+#[derive(Debug, Clone, Copy, Default)]
+struct OutTimeline {
+    /// Highest outgoing sequence number assigned on this outgoing SSRC.
+    high_water_seq: Option<u16>,
+    /// Last outgoing RTP timestamp emitted on this outgoing SSRC. Guards the
+    /// shared destination timeline: timestamps must never go backwards and a
+    /// stream switch continues right after the previous stream's tail.
+    last_output_timestamp: Option<u32>,
+    /// Source SSRC of the most recent packet on this outgoing SSRC.
+    last_src_ssrc: Option<u32>,
 }
 
 struct RewriteBridge {
@@ -173,6 +201,16 @@ struct RewriteBridge {
     options: RtpRewriteBridgeOptions,
     rules: Vec<RtpRewriteRule>,
     streams: RefCell<HashMap<u32, StreamRewriteState>>,
+    /// Outgoing timeline per destination SSRC (see [`OutTimeline`]).
+    ///
+    /// A re-used sequence number on an outgoing SSRC looks like a stale
+    /// retransmission to the receiver, and the receiver's jitter buffer
+    /// silently discards it (observed as seconds of mute after a ring→answer
+    /// transition) — so a stream may only keep advancing its own counter while
+    /// it still owns the destination timeline (nothing else was assigned
+    /// after its last packet); otherwise it re-anchors past the high-water
+    /// mark.
+    timelines: RefCell<HashMap<u32, OutTimeline>>,
 }
 
 impl RewriteBridge {
@@ -190,6 +228,7 @@ impl RewriteBridge {
             options,
             rules,
             streams: RefCell::new(HashMap::new()),
+            timelines: RefCell::new(HashMap::new()),
         }
     }
 
@@ -244,15 +283,12 @@ impl RewriteBridge {
             .entry(src_ssrc)
             .or_insert_with(|| StreamRewriteState {
                 out_ssrc,
-                next_sequence_number: self
-                    .options
-                    .initial_sequence_number
-                    .unwrap_or(random_u32() as u16),
                 last_source_timestamp: None,
                 timestamp_offset: self
                     .options
                     .initial_timestamp_offset
                     .unwrap_or_else(random_u32),
+                next_sequence_number: None,
             });
 
         if let Some(r) = &rule
@@ -261,6 +297,40 @@ impl RewriteBridge {
             packet.header.payload_type = payload_type;
         }
         packet.header.ssrc = state.out_ssrc;
+
+        let mut timelines = self.timelines.borrow_mut();
+        let timeline = timelines.entry(state.out_ssrc).or_default();
+
+        // Outgoing sequence number. While this source stream still OWNS the
+        // destination timeline (nothing was assigned on this outgoing SSRC
+        // after its last packet), it keeps its own counter — so interleaved
+        // streams stay internally consecutive. Otherwise (a brand-new stream,
+        // or a stream whose counter fell behind because an interim stream
+        // emitted meanwhile) it re-anchors past the outgoing SSRC's high-water
+        // mark: re-using a number the receiver already saw makes the packet
+        // look like a stale retransmission and the jitter buffer silently
+        // discards it.
+        let owns_timeline = matches!(
+            (&state.next_sequence_number, timeline.high_water_seq),
+            (Some(next), Some(hw)) if *next == hw.wrapping_add(1)
+        );
+        let out_seq = if owns_timeline {
+            state.next_sequence_number.expect("checked above")
+        } else {
+            match timeline.high_water_seq {
+                Some(last) => last.wrapping_add(1),
+                // Fresh outgoing timeline: honour the caller-provided seed
+                // (rustpbx derives it from the destination paced sender so the
+                // relay continues that sender's sequence space), else random.
+                None => self
+                    .options
+                    .initial_sequence_number
+                    .unwrap_or(random_u32() as u16),
+            }
+        };
+        packet.header.sequence_number = out_seq;
+        state.next_sequence_number = Some(out_seq.wrapping_add(1));
+        timeline.high_water_seq = Some(out_seq);
 
         if let Some(last_src) = state.last_source_timestamp {
             let delta = src_timestamp.wrapping_sub(last_src);
@@ -274,21 +344,52 @@ impl RewriteBridge {
                 state.last_source_timestamp = Some(src_timestamp);
             }
         } else {
-            // First packet of this source stream: optionally pin the output
-            // timestamp so a shared destination SSRC stays continuous with
-            // prior local playback / prior relay.
-            if let Some(desired_out) = self.options.initial_output_timestamp {
-                state.timestamp_offset = desired_out.wrapping_sub(src_timestamp);
-                // Tell the receiver this continues a prior stream on the same
-                // SSRC after a source switch (IVR/CNG → relay).
-                packet.header.marker = true;
-            }
             state.last_source_timestamp = Some(src_timestamp);
         }
 
-        packet.header.timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
-        packet.header.sequence_number = state.next_sequence_number;
-        state.next_sequence_number = state.next_sequence_number.wrapping_add(1);
+        // Timestamp continuity on this outgoing SSRC. When a different source
+        // stream takes over (ringback → talk, IVR → relay) the timeline
+        // continues right after the previous stream's tail instead of
+        // replaying a stale pin; the very first packet on a fresh outgoing
+        // timeline may pin to the destination leg's prior local playback
+        // (paced sender).
+        let is_timeline_switch =
+            matches!(timeline.last_src_ssrc, Some(src) if src != src_ssrc);
+        let mut switched_stream = false;
+        if timeline.last_output_timestamp.is_none() {
+            if let Some(desired_out) = self.options.initial_output_timestamp {
+                state.timestamp_offset = desired_out.wrapping_sub(src_timestamp);
+                packet.header.marker = true;
+            }
+        } else if is_timeline_switch {
+            if let Some(last_out) = timeline.last_output_timestamp {
+                state.timestamp_offset = last_out
+                    .wrapping_add(REWRITE_STREAM_STEP)
+                    .wrapping_sub(src_timestamp);
+                // Tell the receiver this continues a prior stream on the same
+                // SSRC after a source switch (ring→relay, IVR/CNG → relay).
+                packet.header.marker = true;
+                switched_stream = true;
+            }
+        }
+        timeline.last_src_ssrc = Some(src_ssrc);
+
+        let mut out_timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
+        // Safety net: never emit a timestamp behind what the destination has
+        // already received on this SSRC (covers resumed streams whose
+        // per-source offset lags a stream that interleaved meanwhile).
+        if !switched_stream
+            && let Some(last_out) = timeline.last_output_timestamp
+            && out_timestamp.wrapping_sub(last_out) >= 0x8000_0000
+        {
+            state.timestamp_offset = last_out
+                .wrapping_add(REWRITE_STREAM_STEP)
+                .wrapping_sub(src_timestamp);
+            out_timestamp = src_timestamp.wrapping_add(state.timestamp_offset);
+            packet.header.marker = true;
+        }
+        timeline.last_output_timestamp = Some(out_timestamp);
+        packet.header.timestamp = out_timestamp;
 
         if !self.options.strip_extensions {
             // Stamp the matched rule's SDES-MID (payload-type-scoped: audio
@@ -497,6 +598,15 @@ impl RtpTransport {
             observers: RwLock::new(Vec::new()),
             has_observers: AtomicBool::new(false),
         }
+    }
+
+    /// Feed an already-received plaintext RTP datagram into the transport's
+    /// inbound pipeline (rewrite bridge → observers → demux) without going
+    /// through the ICE socket read loop. Public entry point for external
+    /// pumps and test harnesses that own the socket themselves.
+    pub async fn feed_packet(&self, packet: Bytes, addr: SocketAddr) {
+        let mut buf = Vec::new();
+        self.receive(packet, addr, &mut buf).await;
     }
 
     /// Cumulative count of inbound RTP packets accepted at the transport
@@ -1531,6 +1641,328 @@ mod tests {
         assert!(!second.header.marker, "subsequent packets keep source marker");
     }
 
+    /// Reproduction of the incident behind the ring→answer mute: a plain-RTP
+    /// trunk sent early media on one SSRC, switched to a second SSRC (ringback
+    /// generator) for the ringing phase, then switched BACK to the original
+    /// SSRC on answer. Because the rewrite bridge kept one outgoing sequence
+    /// counter per source SSRC, the outgoing stream restarted at the seed and
+    /// the resumed stream resumed BELOW the numbers the interim stream had
+    /// already consumed — the receiver discarded the overlapping post-answer
+    /// packets (~2.3 s of audio).
+    ///
+    /// Contract: the bridge OWNS the outgoing timeline. Sequence numbers must
+    /// be strictly monotonic in emission order and output timestamps must
+    /// never go backwards, regardless of source SSRC churn.
+    #[tokio::test]
+    async fn test_rewrite_bridge_source_ssrc_switch_keeps_output_timeline_monotonic() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = RtpTransport::new(src_conn, false);
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        src_transport.bridge_rewrite_rules_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeOptions {
+                strip_extensions: false,
+                initial_sequence_number: Some(100),
+                initial_timestamp_offset: None,
+                // Mirrors rustpbx seeding the relay off the destination paced
+                // sender ("continue a prior stream on the same SSRC").
+                initial_output_timestamp: Some(50_000),
+            },
+            vec![RtpRewriteRule {
+                match_payload_type: None,
+                fixed_out_ssrc: Some(0xABCD),
+                ssrc_offset: 0,
+                out_payload_type: None,
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
+            }],
+        );
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge");
+
+        let mut emitted: Vec<(u16, u32, bool)> = Vec::new();
+        let mut feed = |src_ssrc: u32, src_seq: u16, src_ts: u32, marker: bool| {
+            let mut header = crate::rtp::RtpHeader::new(8, src_seq, src_ts, src_ssrc);
+            header.marker = marker;
+            let mut packet = RtpPacket::new(header, vec![0xd5u8; 160]);
+            bridge.rewrite_packet(&mut packet);
+            assert_eq!(packet.header.ssrc, 0xABCD, "destination SSRC must stay fixed");
+            emitted.push((
+                packet.header.sequence_number,
+                packet.header.timestamp,
+                packet.header.marker,
+            ));
+        };
+
+        // Phase 1: main stream, 13 packets (as captured: seq 40781.., 20 ms cadence).
+        for i in 0..13u16 {
+            feed(0x1000_0001, 17672 + i, 100_000 + 160 * i as u32, i == 0);
+        }
+        // Phase 2: ringback generator takes over on a second SSRC with an
+        // unrelated timestamp domain, 130 packets of ringing.
+        for i in 0..130u16 {
+            feed(0x2000_0002, 58089 + i, 900_000 + 160 * i as u32, i == 0);
+        }
+        // Phase 3: answer — the trunk returns to the ORIGINAL SSRC, continuing
+        // its original timestamp timeline (phase-1 ts + 23520 = 2.94 s).
+        for i in 0..5u16 {
+            feed(0x1000_0001, 17819 + i, 123_520 + 160 * i as u32, i == 0);
+        }
+
+        let (seqs, tss, markers): (Vec<u16>, Vec<u32>, Vec<bool>) = {
+            let mut s = Vec::with_capacity(emitted.len());
+            let mut t = Vec::with_capacity(emitted.len());
+            let mut m = Vec::with_capacity(emitted.len());
+            for (seq, ts, marker) in emitted.drain(..) {
+                s.push(seq);
+                t.push(ts);
+                m.push(marker);
+            }
+            (s, t, m)
+        };
+        assert_eq!(seqs.len(), 148);
+
+        // 1) Sequence numbers: strictly consecutive in emission order — no
+        //    resets, no re-use, so the receiver never sees a "stale" packet.
+        for w in seqs.windows(2) {
+            assert_eq!(
+                w[1].wrapping_sub(w[0]),
+                1,
+                "outgoing sequence numbers must advance by exactly 1 ({} -> {})",
+                w[0],
+                w[1]
+            );
+        }
+
+        // 2) Timestamps: never backwards in emission order. A receiver's
+        //    jitter buffer treats a decreasing timestamp on the same SSRC as a
+        //    stream restart and stops rendering.
+        for w in tss.windows(2) {
+            assert!(
+                w[1].wrapping_sub(w[0]) < 0x8000_0000,
+                "outgoing timestamps must not go backwards ({} -> {})",
+                w[0],
+                w[1]
+            );
+        }
+
+        // 3) The stream switch into phase 2 continues the timeline right
+        //    after the last packet of phase 1 (one 20 ms frame step).
+        assert_eq!(tss[13], tss[12] + 160, "phase-2 must continue phase-1 timeline");
+        assert!(markers[13], "first packet after a source switch must carry the marker bit");
+
+        // 4) The switch BACK to the resumed main stream continues AFTER the
+        //    ringback tail — this is exactly where the incident discarded
+        //    117 packets.
+        assert_eq!(tss[143], tss[142] + 160, "resumed stream must continue the ringback tail");
+        assert!(markers[143], "resume packet must carry the marker bit");
+    }
+
+    /// Defect class: a SHORT interim stream (≤ a handful of packets) must not
+    /// trick the resumed stream into re-using numbers the interim stream just
+    /// consumed. The resumed stream re-anchors past the high-water mark even
+    /// when it returns "quickly".
+    #[tokio::test]
+    async fn test_rewrite_bridge_short_interim_stream_never_reuses_sequences() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let src_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_src_tx, src_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(src_socket))));
+        let src_conn = IceConn::new(src_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = RtpTransport::new(src_conn, false);
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        src_transport.bridge_rewrite_rules_to(
+            dst_transport.clone(),
+            RtpRewriteBridgeOptions {
+                strip_extensions: false,
+                initial_sequence_number: Some(100),
+                initial_timestamp_offset: None,
+                initial_output_timestamp: Some(50_000),
+            },
+            vec![RtpRewriteRule {
+                match_payload_type: None,
+                fixed_out_ssrc: Some(0xABCD),
+                ssrc_offset: 0,
+                out_payload_type: None,
+                sdes_mid_extension_id: None,
+                sdes_mid: None,
+            }],
+        );
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge");
+
+        let mut emitted: Vec<(u16, u32)> = Vec::new();
+        let mut feed = |src_ssrc: u32, src_seq: u16, src_ts: u32| {
+            let header = crate::rtp::RtpHeader::new(8, src_seq, src_ts, src_ssrc);
+            let mut packet = RtpPacket::new(header, vec![0xd5u8; 160]);
+            bridge.rewrite_packet(&mut packet);
+            emitted.push((packet.header.sequence_number, packet.header.timestamp));
+        };
+
+        // Main stream: 13 packets.
+        for i in 0..13u16 {
+            feed(0x1000_0001, 100 + i, 100_000 + 160 * i as u32);
+        }
+        // Brief interim stream: only 5 packets.
+        for i in 0..5u16 {
+            feed(0x2000_0002, 900 + i, 700_000 + 160 * i as u32);
+        }
+        // Main stream resumes for 5 packets.
+        for i in 0..5u16 {
+            feed(0x1000_0001, 113 + i, 120_800 + 160 * i as u32);
+        }
+
+        // Every outgoing sequence number must be unique AND strictly advance.
+        let mut seqs: Vec<u16> = emitted.iter().map(|(s, _)| *s).collect();
+        let n = seqs.len();
+        seqs.sort();
+        seqs.dedup();
+        assert_eq!(seqs.len(), n, "no sequence number may ever be re-used");
+        for w in emitted.windows(2) {
+            assert_eq!(
+                w[1].0.wrapping_sub(w[0].0),
+                1,
+                "outgoing sequence numbers must advance by exactly 1"
+            );
+        }
+        // Timestamps never backwards.
+        for w in emitted.windows(2) {
+            assert!(
+                w[1].1.wrapping_sub(w[0].1) < 0x8000_0000,
+                "outgoing timestamps must not go backwards"
+            );
+        }
+    }
+
+    /// BUNDLE audio+video: the two sources are relayed to DIFFERENT outgoing
+    /// SSRCs, so each keeps its own fully consecutive sequence numbers and its
+    /// own timestamp domain — neither may be re-anchored onto the other's
+    /// timeline (a +2 step on video would look like loss and trigger NACKs;
+    /// an audio timeline re-anchored onto the video clock would corrupt
+    /// pacing).
+    #[tokio::test]
+    async fn test_rewrite_bridge_bundle_av_streams_keep_independent_timelines() {
+        use crate::transports::ice::IceSocketWrapper;
+        use tokio::net::UdpSocket;
+        use tokio::sync::watch;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_tx, rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(socket))));
+        let src_conn = IceConn::new(rx, "127.0.0.1:9".parse().unwrap(), None);
+        let src_transport = Arc::new(RtpTransport::new(src_conn, false));
+
+        let dst_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (_dst_tx, dst_rx) = watch::channel(Some(IceSocketWrapper::Udp(Arc::new(dst_socket))));
+        let dst_conn = IceConn::new(dst_rx, "127.0.0.1:9".parse().unwrap(), None);
+        let dst_transport = Arc::new(RtpTransport::new(dst_conn, false));
+
+        let audio_ssrc = 0x0A0A_0A0A;
+        let video_ssrc = 0x0B0B_0B0B;
+        src_transport.bridge_rewrite_rules_to_with_video(
+            dst_transport.clone(),
+            None,
+            [98u8].into_iter().collect(),
+            RtpRewriteBridgeOptions {
+                strip_extensions: false,
+                initial_sequence_number: Some(500),
+                initial_timestamp_offset: None,
+                initial_output_timestamp: Some(40_000),
+            },
+            vec![
+                RtpRewriteRule {
+                    match_payload_type: None,
+                    fixed_out_ssrc: Some(audio_ssrc),
+                    ssrc_offset: 0,
+                    out_payload_type: None,
+                    sdes_mid_extension_id: None,
+                    sdes_mid: None,
+                },
+                RtpRewriteRule {
+                    match_payload_type: Some(98),
+                    fixed_out_ssrc: Some(video_ssrc),
+                    ssrc_offset: 0,
+                    out_payload_type: None,
+                    sdes_mid_extension_id: None,
+                    sdes_mid: None,
+                },
+            ],
+        );
+
+        let mut guard = src_transport.rewrite_bridge.lock();
+        let bridge = guard.as_mut().expect("rewrite bridge");
+
+        let mut audio_out: Vec<(u16, u32)> = Vec::new();
+        let mut video_out: Vec<(u16, u32)> = Vec::new();
+        let mut audio_marker_seen_after_first = false;
+        // 20 video frames, each interleaved with 2 audio packets
+        // (audio 8 kHz: ts step 160; video 90 kHz: ts step 3000).
+        for v in 0..20u32 {
+            for a in 0..2u16 {
+                let mut packet = RtpPacket::new(
+                    crate::rtp::RtpHeader::new(
+                        0,
+                        4000 + (v * 2 + a as u32) as u16,
+                        80_000 + 160 * (v * 2 + a as u32),
+                        0x1111_1111,
+                    ),
+                    vec![1u8; 160],
+                );
+                bridge.rewrite_packet(&mut packet);
+                audio_out.push((packet.header.sequence_number, packet.header.timestamp));
+                if v > 0 || a > 0 {
+                    audio_marker_seen_after_first |= packet.header.marker;
+                }
+            }
+            let mut packet = RtpPacket::new(
+                crate::rtp::RtpHeader::new(98, 9000 + v as u16, 90_000 + 3000 * v, 0x2222_2222),
+                vec![2u8; 1200],
+            );
+            bridge.rewrite_packet(&mut packet);
+            video_out.push((packet.header.sequence_number, packet.header.timestamp));
+        }
+
+        // Audio: consecutive sequence numbers, source-cadence timestamps
+        // (consecutive audio packets are one 160-sample source frame apart).
+        for w in audio_out.windows(2) {
+            assert_eq!(w[1].0.wrapping_sub(w[0].0), 1, "audio seq must stay +1");
+            assert_eq!(w[1].1.wrapping_sub(w[0].1), 160, "audio ts must track src frames");
+        }
+        // Video: consecutive sequence numbers, source-cadence timestamps.
+        for w in video_out.windows(2) {
+            assert_eq!(w[1].0.wrapping_sub(w[0].0), 1, "video seq must stay +1");
+            assert_eq!(
+                w[1].1.wrapping_sub(w[0].1),
+                3000,
+                "video ts must stay on the 90 kHz source cadence"
+            );
+        }
+        assert!(
+            !audio_marker_seen_after_first,
+            "audio must not be re-anchored onto the video timeline"
+        );
+        drop(guard);
+    }
+
     #[tokio::test]
     async fn test_rewrite_packet_remaps_dtmf_payload_type() {
         use crate::transports::ice::IceSocketWrapper;
@@ -1692,7 +2124,12 @@ mod tests {
         assert_eq!(rtx.header.ssrc, video_ssrc);
         assert_eq!(rtx.header.payload_type, 103);
 
-        // Each source stream keeps independent sequence/timestamp continuity.
+        // Each source stream keeps timestamp continuity on its outgoing SSRC,
+        // and interleaved streams never RE-USE a sequence number the interim
+        // stream consumed: the resumed video stream re-anchors PAST the RTX
+        // packet (+2, an apparent one-packet loss a receiver tolerates) rather
+        // than duplicating the RTX packet's number (which the receiver would
+        // silently discard).
         let mut video2 =
             RtpPacket::new(crate::rtp::RtpHeader::new(98, 8, 2382, 2222), vec![1u8; 32]);
         let video2_target = bridge.target_for(video2.header.payload_type);
@@ -1700,12 +2137,35 @@ mod tests {
         assert!(Arc::ptr_eq(&video2_target, &video_dst_transport));
         assert_eq!(
             video2.header.sequence_number,
-            video.header.sequence_number + 1
+            video.header.sequence_number + 2,
+            "resumed stream must skip past the interim RTX stream's numbers"
         );
+        // The resumed stream re-anchors its timestamp after the interim RTX
+        // packet's tail (+one stream step): monotone and delta-preserving from
+        // here on, never backwards.
         assert_eq!(
             video2.header.timestamp,
-            video.header.timestamp.wrapping_add(160)
+            video.header.timestamp.wrapping_add(320),
+            "resumed stream continues after the interim stream's tail"
         );
+        assert!(
+            video2.header.timestamp.wrapping_sub(video.header.timestamp) < 0x8000_0000,
+            "video timestamps must stay monotone"
+        );
+
+        // Sequence numbers forwarded so far are globally unique per outgoing
+        // SSRC — no duplicates between the audio, DTMF, video and RTX streams.
+        let mut seqs = vec![
+            audio.header.sequence_number,
+            dtmf.header.sequence_number,
+            video.header.sequence_number,
+            rtx.header.sequence_number,
+            video2.header.sequence_number,
+        ];
+        seqs.sort();
+        let n = seqs.len();
+        seqs.dedup();
+        assert_eq!(seqs.len(), n, "sequence numbers must never be re-used");
         drop(guard);
     }
 
