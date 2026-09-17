@@ -632,13 +632,13 @@ impl IceTransportRunner {
                     inner.config.ice_disconnect_threshold
                 };
                 if elapsed > ice_conn_timeout {
-                    let _ = inner.state.send(IceTransportState::Failed);
+                    let _ = inner.set_state(IceTransportState::Failed);
                 } else if elapsed > disconnect_threshold {
                     if state != IceTransportState::Disconnected {
-                        let _ = inner.state.send(IceTransportState::Disconnected);
+                        let _ = inner.set_state(IceTransportState::Disconnected);
                     }
                 } else if state == IceTransportState::Disconnected {
-                    let _ = inner.state.send(IceTransportState::Connected);
+                    let _ = inner.set_state(IceTransportState::Connected);
                 }
             }
 
@@ -1113,9 +1113,7 @@ impl IceTransport {
             let mut params = self.inner.remote_parameters.lock();
             *params = Some(remote);
         }
-        if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
-            debug!("start: failed to set state to Checking: {}", e);
-        }
+        self.inner.set_state(IceTransportState::Checking);
         self.try_connectivity_checks();
         Ok(())
     }
@@ -1190,7 +1188,7 @@ impl IceTransport {
             let _ = self.inner.selected_socket.send(Some(socket.clone()));
             publish_selected_rtcp_socket(&self.inner, Some(socket));
         }
-        let _ = self.inner.state.send(IceTransportState::Connected);
+        let _ = self.inner.set_state(IceTransportState::Connected);
         Ok(())
     }
 
@@ -1315,7 +1313,7 @@ impl IceTransport {
             .inner
             .selected_rtcp_socket
             .send(Some(IceSocketWrapper::Udp(rtcp_socket)));
-        let _ = self.inner.state.send(IceTransportState::Connected);
+        let _ = self.inner.set_state(IceTransportState::Connected);
 
         Ok(cand_addr)
     }
@@ -1453,7 +1451,7 @@ impl IceTransport {
             let _ = self.inner.selected_socket.send(Some(socket.clone()));
             publish_selected_rtcp_socket(&self.inner, Some(socket));
         }
-        let _ = self.inner.state.send(IceTransportState::Connected);
+        let _ = self.inner.set_state(IceTransportState::Connected);
     }
 
     /// Best-effort explicit destruction of all TURN allocations (RFC 5766 §7.4).
@@ -1499,7 +1497,7 @@ impl IceTransport {
             });
         }
 
-        let _ = self.inner.state.send(IceTransportState::Closed);
+        let _ = self.inner.set_state(IceTransportState::Closed);
         let _ = self.inner.selected_socket.send(None);
         let _ = self.inner.selected_rtcp_socket.send(None);
         let _ = self.inner.selected_pair_notifier.send(None);
@@ -1521,7 +1519,7 @@ impl IceTransport {
     /// full ICE stack.  Production code must never call this.
     #[cfg(test)]
     pub fn force_state_for_test(&self, state: IceTransportState) {
-        let _ = self.inner.state.send(state);
+        let _ = self.inner.set_state(state);
     }
 
     pub fn set_role(&self, role: IceRole) {
@@ -1542,7 +1540,7 @@ impl IceTransport {
             let _ = self.inner.selected_socket.send(Some(socket.clone()));
             publish_selected_rtcp_socket(&self.inner, Some(socket));
         }
-        let _ = self.inner.state.send(IceTransportState::Connected);
+        let _ = self.inner.set_state(IceTransportState::Connected);
     }
 
     pub fn config(&self) -> &RtcConfiguration {
@@ -1863,7 +1861,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
 
     if role == IceRole::Controlling {
         // Signal Connected so the PeerConnection starts waiting for nomination_complete.
-        let _ = inner.state.send(IceTransportState::Connected);
+        let _ = inner.set_state(IceTransportState::Connected);
 
         // Nominate once. Late trickle candidates re-trigger connectivity checks;
         // re-nominating on every round would make the controlled peer flap
@@ -1947,7 +1945,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         } else {
             debug!("All {} nomination attempts failed", successful_pairs.len());
             let _ = inner.nomination_complete.send(Some(false));
-            let _ = inner.state.send(IceTransportState::Failed);
+            let _ = inner.set_state(IceTransportState::Failed);
         }
     } else {
         // Controlled side: select best pair but don't nominate.
@@ -1969,7 +1967,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             let _ = inner.selected_socket.send(Some(socket.clone()));
             publish_selected_rtcp_socket(&inner, Some(socket));
         }
-        let _ = inner.state.send(IceTransportState::Connected);
+        let _ = inner.set_state(IceTransportState::Connected);
         if pair.local.transport == "tcp" {
             let _ = inner.nomination_complete.send(Some(true));
         }
@@ -2093,7 +2091,7 @@ async fn complete_controlled_inbound_tcp_nomination(
         *inner.selected_pair.lock() = Some(pair.clone());
         let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
         publish_selected_socket(&inner, &pair, Some(sender));
-        let _ = inner.state.send(IceTransportState::Connected);
+        let _ = inner.set_state(IceTransportState::Connected);
     } else {
         debug!(
             "Inbound TCP nomination: synthesizing pair for {} -> {}",
@@ -2114,7 +2112,7 @@ async fn complete_controlled_inbound_tcp_nomination(
             *inner.selected_pair.lock() = Some(pair.clone());
             let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
             publish_selected_socket(&inner, &pair, Some(sender));
-            let _ = inner.state.send(IceTransportState::Connected);
+            let _ = inner.set_state(IceTransportState::Connected);
         } else {
             let _ = inner.selected_socket.send(Some(sender.clone()));
             publish_selected_rtcp_socket(&inner, Some(sender.clone()));
@@ -2530,7 +2528,7 @@ async fn handle_stun_request(
                         pair.local.address, pair.remote.address
                     );
                 }
-                let _ = inner.state.send(IceTransportState::Connected);
+                let _ = inner.set_state(IceTransportState::Connected);
                 let _ = inner.nomination_complete.send(Some(true));
             } else {
                 debug!(
@@ -2997,6 +2995,47 @@ async fn perform_tcp_binding_check(
                 let _ = tcp_write_all(&write, &framed).await;
             }
         }
+    }
+}
+
+/// Store `new` into the ICE state watch, notifying subscribers only when the
+/// value actually changes.
+///
+/// `watch::Sender::send` marks the channel changed even for an identical value,
+/// so re-sending `Connected` on hot paths (USE-CANDIDATE consent keepalives,
+/// per-check-round completion) made the peer-connection state loop log
+/// "ICE recovered" and re-broadcast on every keepalive.
+fn store_ice_state(state: &watch::Sender<IceTransportState>, new: IceTransportState) {
+    if *state.borrow() != new {
+        let _ = state.send(new);
+    }
+}
+
+impl IceTransportInner {
+    fn set_state(&self, new: IceTransportState) {
+        store_ice_state(&self.state, new);
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::{IceTransportState, store_ice_state};
+    use tokio::sync::watch;
+
+    /// Regression guard: an unchanged value must not wake subscribers.
+    #[test]
+    fn store_ice_state_dedupes_equal_values() {
+        let (tx, mut rx) = watch::channel(IceTransportState::Checking);
+        store_ice_state(&tx, IceTransportState::Connected);
+        assert!(rx.has_changed().unwrap());
+        let _ = rx.borrow_and_update();
+        store_ice_state(&tx, IceTransportState::Connected);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "re-sending an equal state must not notify (ICE recovered spam)"
+        );
+        store_ice_state(&tx, IceTransportState::Disconnected);
+        assert!(rx.has_changed().unwrap());
     }
 }
 
