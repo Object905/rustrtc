@@ -235,11 +235,10 @@ impl IceConn {
         }
     }
 
-    pub(crate) fn set_remote_addr_from_selected_pair(
-        &self,
-        addr: SocketAddr,
-        reason: &'static str,
-    ) {
+    /// Apply the pair the ICE layer selected before any connectivity check has
+    /// confirmed it — the address still comes from signaling, so an established
+    /// RTP latch wins over it.
+    pub(crate) fn set_remote_addr_from_initial_pair(&self, addr: SocketAddr, reason: &'static str) {
         let current = *self.remote_addr.read();
         if self.latch_on_rtp.load(Ordering::Relaxed)
             && self.rtp_latched.load(Ordering::Relaxed)
@@ -251,12 +250,30 @@ impl IceConn {
             );
             return;
         }
+        self.set_remote_addr_from_selected_pair(addr, reason);
+    }
 
+    /// Apply a pair the ICE layer re-selected mid-session. This only happens
+    /// after a real re-nomination (RFC 8445, or a peer-reflexive/relay failover
+    /// once the controlling agent's path died), so it overrides the RTP latch —
+    /// holding the latch here keeps RTP/DTLS pointed at the abandoned address
+    /// and the leg goes one-way silent.
+    pub(crate) fn set_remote_addr_from_selected_pair(
+        &self,
+        addr: SocketAddr,
+        reason: &'static str,
+    ) {
+        let current = *self.remote_addr.read();
         if current != addr {
             debug!(
                 "IceConn: selected-pair remote changed {} -> {} ({})",
                 current, addr, reason
             );
+            // Re-arm latching: the latch only ever engages while unlatched, so
+            // without this the new address is final even if the peer's media
+            // actually keeps arriving from somewhere else. Re-arming lets
+            // inbound RTP confirm or correct the ICE layer's choice.
+            self.reset_latch();
         }
         *self.remote_addr.write() = addr;
     }
@@ -980,6 +997,61 @@ mod tests {
         conn.receive(pkt, latched_addr, &mut marshal_buf).await;
 
         assert_eq!(*conn.remote_addr.read(), latched_addr);
+    }
+
+    /// The initial pair-monitor callback carries an address that is still only
+    /// signaling-derived, so an established RTP latch outranks it.
+    #[tokio::test]
+    async fn test_initial_pair_does_not_override_rtp_latch() {
+        let (_tx, rx) = watch::channel(None);
+        let latched_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        let sdp_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4000);
+        let conn = IceConn::new(rx, latched_addr, None);
+        conn.enable_latch_on_rtp();
+        conn.rtp_latched.store(true, Ordering::Relaxed);
+
+        conn.set_remote_addr_from_initial_pair(sdp_addr, "pair monitor initial update");
+
+        assert_eq!(*conn.remote_addr.read(), latched_addr);
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
+    }
+
+    /// Regression: a mid-session re-nomination must retarget RTP even once
+    /// latched. Freezing on the latched address kept media pointed at the
+    /// abandoned path and the leg went one-way silent. The latch is re-armed so
+    /// inbound RTP can still correct the ICE layer's choice.
+    #[tokio::test]
+    async fn test_renominated_pair_overrides_rtp_latch_and_rearms() {
+        let (_tx, rx) = watch::channel(None);
+        let latched_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        let renominated_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6000);
+        let conn = IceConn::new(rx, latched_addr, None);
+        conn.enable_latch_on_rtp();
+        conn.rtp_latched.store(true, Ordering::Relaxed);
+
+        conn.set_remote_addr_from_selected_pair(renominated_addr, "pair monitor update");
+
+        assert_eq!(*conn.remote_addr.read(), renominated_addr);
+        assert!(
+            !conn.rtp_latched.load(Ordering::Relaxed),
+            "latch must re-arm so inbound RTP can confirm or correct the new pair"
+        );
+    }
+
+    /// A pair-monitor update that repeats the current address must not churn
+    /// the latch (the watch channel can re-fire with an unchanged pair).
+    #[tokio::test]
+    async fn test_unchanged_selected_pair_keeps_rtp_latch() {
+        let (_tx, rx) = watch::channel(None);
+        let latched_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
+        let conn = IceConn::new(rx, latched_addr, None);
+        conn.enable_latch_on_rtp();
+        conn.rtp_latched.store(true, Ordering::Relaxed);
+
+        conn.set_remote_addr_from_selected_pair(latched_addr, "pair monitor update");
+
+        assert_eq!(*conn.remote_addr.read(), latched_addr);
+        assert!(conn.rtp_latched.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

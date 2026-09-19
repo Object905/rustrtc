@@ -3099,7 +3099,7 @@ impl PeerConnection {
                 old_addr, pair.remote.address
             );
             ice_conn_monitor
-                .set_remote_addr_from_selected_pair(
+                .set_remote_addr_from_initial_pair(
                     pair.remote.address,
                     "pair monitor initial update",
                 );
