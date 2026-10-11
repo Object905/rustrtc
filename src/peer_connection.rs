@@ -5579,7 +5579,7 @@ impl PeerConnectionInner {
 
                 while candidates.is_empty() && start.elapsed() < timeout_dur {
                     let _ = crate::platform::time::with_timeout(
-                        timeout_dur - start.elapsed(),
+                        timeout_dur.saturating_sub(start.elapsed()),
                         rx.recv(),
                     )
                     .await;
