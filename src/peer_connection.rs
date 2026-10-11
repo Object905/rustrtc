@@ -6528,18 +6528,24 @@ impl PeerConnectionInner {
         let _ = self.ice_connection_state.send(IceConnectionState::Closed);
         let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
 
-        // Clean up all tracks to prevent audio bleeding into new connections
+        // Clean up all tracks to prevent audio bleeding into new connections,
+        // and release the transports held by the senders/receivers so the
+        // shared `RtpTransport` (plus each receiver's receive loop and TWCC
+        // flush loop) can be freed even while the application still holds a
+        // transceiver or receiver-track handle.
         {
             let transceivers = self.transceivers.lock();
             for t in transceivers.iter() {
-                // Stop sender send loops immediately
+                // Stop the sender send loop and drop its transport reference.
                 if let Some(sender) = t.sender() {
-                    sender.stop();
+                    sender.detach();
                 }
-                // Stop receiver tracks by marking them as ended
+                // Stop the receiver track, end its receive loop, and drop its
+                // transport reference.
                 if let Some(receiver) = t.receiver() {
                     let track = receiver.track();
                     track.stop();
+                    receiver.detach();
                     tracing::trace!(
                         "PeerConnection.close: marked receiver track {} as ended",
                         track.id()
@@ -6606,6 +6612,11 @@ impl PeerConnectionInner {
         for transport in extra_ice {
             transport.stop();
         }
+
+        // Release the primary RTP transport reference so it (and the tasks that
+        // hold it weakly, e.g. the TWCC flush loops) can be freed even if the
+        // application keeps this `PeerConnection` handle after `close()`.
+        *self.rtp_transport.lock() = None;
     }
 }
 
@@ -7896,6 +7907,14 @@ impl RtpSender {
         // Arc<dyn MediaStreamTrack> it captures).
         self.stop_tx.notify_one();
     }
+
+    /// Stop the send loop and release the transport reference on close, so the
+    /// shared `RtpTransport` can be freed even while the application still
+    /// holds the transceiver/sender handle.
+    pub(crate) fn detach(&self) {
+        self.stop();
+        *self.transport.lock() = None;
+    }
 }
 
 impl Drop for RtpSender {
@@ -8086,6 +8105,18 @@ impl RtpReceiverBuilder {
 }
 
 impl RtpReceiver {
+    /// End the receive loop and release the transport reference on close, so
+    /// the shared `RtpTransport` (and the per-receiver TWCC flush loop) can be
+    /// freed even while the application still holds the transceiver/receiver
+    /// handle.
+    pub(crate) fn detach(&self) {
+        // Dropping the command sender makes `run_loop`'s `cmd_rx.recv()` return
+        // `None`, ending that task.
+        *self.runner_tx.lock() = None;
+        *self.packet_tx.lock() = None;
+        *self.transport.lock() = None;
+    }
+
     pub fn new(
         kind: MediaKind,
         ssrc: u32,
