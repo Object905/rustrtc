@@ -401,7 +401,10 @@ pub mod time {
 
     /// Minimal instant used for inactivity/expiry accounting.
     ///
-    /// - std: wall-clock milliseconds.
+    /// - std: monotonic milliseconds (`CLOCK_MONOTONIC`, measured from a
+    ///   lazily-initialized anchor). Immune to wall-clock steps: NTP
+    ///   adjustments can no longer make `elapsed()` shrink or `Ord` invert,
+    ///   which is what caused the `Duration` underflow in #64/#65.
     /// - no_std: logical milliseconds from a global counter. The embedder
     ///   advances it via [`advance_ms`].
     #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -409,15 +412,27 @@ pub mod time {
         ms: u64,
     }
 
+    /// std only: first-use anchor for the monotonic clock. All `Instant`
+    /// values are offsets from it, so comparisons stay relative and the
+    /// anchor's absolute position never leaks.
+    #[cfg(feature = "std")]
+    static MONO_ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    /// std only: monotonic milliseconds since first use. `CLOCK_MONOTONIC`
+    /// never steps (unlike the `SystemTime` source this replaces).
+    #[cfg(feature = "std")]
+    fn monotonic_ms() -> u64 {
+        MONO_ANCHOR
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
     impl Instant {
         pub fn now() -> Self {
             #[cfg(feature = "std")]
             {
-                let ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                Self { ms }
+                Self { ms: monotonic_ms() }
             }
             #[cfg(not(feature = "std"))]
             {
@@ -428,16 +443,12 @@ pub mod time {
         }
 
         /// Duration elapsed since this instant.
-        /// std: real wall-clock delta. no_std: logical-clock delta
+        /// std: monotonic delta. no_std: logical-clock delta
         /// (advances only when [`advance_ms`]/[`set_now_ms`] run).
         pub fn elapsed(&self) -> core::time::Duration {
             #[cfg(feature = "std")]
             {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                core::time::Duration::from_millis(now_ms.saturating_sub(self.ms))
+                core::time::Duration::from_millis(monotonic_ms().saturating_sub(self.ms))
             }
             #[cfg(not(feature = "std"))]
             {
@@ -933,4 +944,69 @@ pub mod sync {
     pub use crate::platform::sync_embedded::watch;
     pub use crate::platform::sync_embedded::{AsyncMutex, Mutex, MutexGuard};
     pub use crate::platform::sync_embedded::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+}
+
+/// Regression guard for the wall→monotonic `time::Instant` switch on std
+/// (the #64/#65 class): the clock source must never step, so successive
+/// reads can neither go backward nor produce a shrinking `elapsed()`.
+#[cfg(all(test, feature = "std"))]
+mod time_instant_tests {
+    use super::time::Instant;
+    use core::time::Duration;
+
+    #[test]
+    fn instant_reads_never_go_backward() {
+        let mut prev = Instant::now();
+        let mut prev_elapsed = prev.elapsed();
+        for _ in 0..10_000 {
+            let now = Instant::now();
+            assert!(now >= prev, "Instant::now() went backward");
+            let now_elapsed = now.elapsed();
+            assert!(
+                now_elapsed >= prev_elapsed,
+                "elapsed() shrank between two reads"
+            );
+            prev = now;
+            prev_elapsed = now_elapsed;
+        }
+    }
+
+    #[test]
+    fn elapsed_tracks_real_time() {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(15),
+            "elapsed too small after 20ms sleep: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(5),
+            "elapsed unreasonably large after 20ms sleep: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn arithmetic_saturates_instead_of_panicking() {
+        let now = Instant::now();
+        // `Instant - huge Duration` must saturate, not panic (the #64 panic
+        // class), and `duration_since` must clamp at zero.
+        let past = now - Duration::from_secs(u64::MAX / 2000);
+        let _ = past.elapsed();
+        assert_eq!(now.duration_since(now), Duration::ZERO);
+        assert_eq!(past.duration_since(now), Duration::ZERO);
+        // `Instant + Duration` must not panic either.
+        let future = now + Duration::from_secs(u64::MAX / 2000);
+        assert!(future >= now);
+        // checked_sub_ms mirrors Sub<Duration>.
+        assert!(now.checked_sub_ms(Duration::from_secs(u64::MAX / 2000)) <= now);
+    }
+
+    #[test]
+    fn ordering_follows_creation() {
+        let a = Instant::now();
+        let b = Instant::now();
+        assert!(b >= a);
+        assert!(b.duration_since(a) <= Duration::from_secs(1));
+    }
 }
