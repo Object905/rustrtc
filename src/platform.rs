@@ -957,17 +957,17 @@ mod time_instant_tests {
     #[test]
     fn instant_reads_never_go_backward() {
         let mut prev = Instant::now();
-        let mut prev_elapsed = prev.elapsed();
         for _ in 0..10_000 {
             let now = Instant::now();
             assert!(now >= prev, "Instant::now() went backward");
-            let now_elapsed = now.elapsed();
-            assert!(
-                now_elapsed >= prev_elapsed,
-                "elapsed() shrank between two reads"
-            );
+            // Two `elapsed()` reads taken from the *same* instant must not
+            // shrink: the second re-reads the clock, which only moves
+            // forward. (Comparing `elapsed()` across different instants is
+            // racy on the ms-resolution clock — the reference point differs.)
+            let first = now.elapsed();
+            let second = now.elapsed();
+            assert!(second >= first, "elapsed() shrank between two reads");
             prev = now;
-            prev_elapsed = now_elapsed;
         }
     }
 
