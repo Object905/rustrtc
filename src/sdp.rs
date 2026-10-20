@@ -1424,6 +1424,80 @@ pub fn modify_sdp_direction(sdp: &str, direction: &str) -> String {
     result.join("\r\n")
 }
 
+/// Telephone-event payload type from `a=rtpmap:<pt> telephone-event/…`.
+pub fn telephone_event_pt(sdp: &str) -> Option<u8> {
+    for line in sdp.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+            if let Some((pt, spec)) = rest.split_once(' ') {
+                if spec.to_ascii_lowercase().starts_with("telephone-event") {
+                    return pt.trim().parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Injects `a=rtpmap:<pt> telephone-event/8000` + `a=fmtp:<pt> 0-16` into the
+/// first `m=audio` section. Idempotent when telephone-event is already present.
+pub fn patch_telephone_event(sdp: &str, pt: u8) -> String {
+    if telephone_event_pt(sdp).is_some() {
+        return sdp.to_string();
+    }
+    let mut lines: Vec<String> = sdp.lines().map(|l| l.to_string()).collect();
+    let mut patched = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("m=audio") && !lines[i].contains(&format!(" {pt}")) {
+            lines[i].push_str(&format!(" {pt}"));
+            // Find insertion point: after existing rtpmap lines in this m= section
+            let mut insert_at = i + 1;
+            while insert_at < lines.len()
+                && (lines[insert_at].starts_with("a=rtpmap")
+                    || lines[insert_at].starts_with("a=fmtp")
+                    || lines[insert_at].starts_with("a=rtcp"))
+            {
+                insert_at += 1;
+            }
+            lines.insert(insert_at, format!("a=rtpmap:{pt} telephone-event/8000"));
+            lines.insert(insert_at + 1, format!("a=fmtp:{pt} 0-16"));
+            patched = true;
+            break;
+        }
+        i += 1;
+    }
+    if patched {
+        lines.join("\r\n") + "\r\n"
+    } else {
+        sdp.to_string()
+    }
+}
+
+/// First `m=audio` payload type that is not telephone-event.
+pub fn first_non_dtmf_audio_pt(sdp: &str) -> Option<u8> {
+    let te_pt = telephone_event_pt(sdp);
+    for line in sdp.lines() {
+        let l = line.trim_end_matches('\r');
+        // Byte-wise compare: a raw (pre-validation) remote SDP may contain
+        // multi-byte UTF-8, and slicing would panic on a char boundary.
+        if l.len() >= 7 && l.as_bytes()[..7].eq_ignore_ascii_case(b"m=audio") {
+            let mut parts = l.split_whitespace();
+            parts.next()?; // m=audio
+            parts.next()?; // port
+            parts.next()?; // proto
+            for p in parts {
+                if let Ok(pt) = p.parse::<u8>() {
+                    if Some(pt) != te_pt {
+                        return Some(pt);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_bundle_mid_info(sdp: &str) -> Option<(u8, String, String)> {
     let mut extmap_id: Option<u8> = None;
     let mut audio_mid: Option<String> = None;
@@ -2325,5 +2399,36 @@ a=mid:1\r\n";
         let desc = SessionDescription::parse(SdpType::Offer, sdp).unwrap();
         assert!(desc.first_image_section().is_some());
         assert_eq!(desc.first_image_section().unwrap().mid, "1");
+    }
+
+    #[test]
+    fn test_telephone_event_pt() {
+        let sdp = "v=0\r\nm=audio 40000 RTP/AVP 0 8 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        assert_eq!(telephone_event_pt(sdp), Some(101));
+        let sdp = "v=0\r\nm=audio 40000 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(telephone_event_pt(sdp), None);
+    }
+
+    #[test]
+    fn test_patch_telephone_event() {
+        let sdp = "v=0\r\nm=audio 9 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n";
+        let patched = patch_telephone_event(sdp, 101);
+        assert!(patched.contains(" 101"));
+        assert!(patched.contains("a=rtpmap:101 telephone-event/8000"));
+        assert!(patched.contains("a=fmtp:101 0-16"));
+        // Idempotent
+        assert_eq!(patched, patch_telephone_event(&patched, 101));
+    }
+
+    #[test]
+    fn test_first_non_dtmf_audio_pt() {
+        let sdp = "v=0\r\nm=audio 40000 RTP/AVP 18 0 101\r\na=rtpmap:18 G729/8000\r\na=rtpmap:101 telephone-event/8000\r\n";
+        assert_eq!(first_non_dtmf_audio_pt(sdp), Some(18));
+        // te listed first: the audio codec must still win
+        let sdp = "v=0\r\nm=audio 40000 RTP/AVP 101 0\r\na=rtpmap:101 telephone-event/8000\r\na=rtpmap:0 PCMU/8000\r\n";
+        assert_eq!(first_non_dtmf_audio_pt(sdp), Some(0));
+        // no te at all
+        let sdp = "v=0\r\nm=audio 40000 RTP/AVP 0\r\n";
+        assert_eq!(first_non_dtmf_audio_pt(sdp), Some(0));
     }
 }
