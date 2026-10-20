@@ -24,7 +24,10 @@ pub use frame::{AudioFrame, MediaKind, MediaSample, VideoFrame, VideoPixelFormat
 #[cfg(feature = "std")]
 pub use jitter_buffer::JitterBuffer;
 #[cfg(feature = "std")]
-pub use packetizer::{Packetizer, Payloader, SimplePayloader, Vp8Payloader, Vp9Payloader};
+pub use packetizer::{
+    H264Fragments, H264Packetizer, H264Payloader, Packetizer, Payloader, SimplePayloader,
+    Vp8Payloader, Vp9Payloader,
+};
 #[cfg(feature = "std")]
 pub use pipeline::{
     ChannelMediaSink, ChannelMediaSource, DynMediaSink, DynMediaSource, MediaSink, MediaSource,

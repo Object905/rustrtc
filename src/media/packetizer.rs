@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::media::{DynMediaSource, MediaKind, MediaResult, MediaSample, MediaSource};
+use crate::media::{
+    DynMediaSource, MediaKind, MediaResult, MediaSample, MediaSource, VideoFrame, VideoPixelFormat,
+};
 
 /// Payloader splits a frame into RTP payloads
 pub trait Payloader: Send + Sync {
@@ -402,5 +404,221 @@ mod vp9_tests {
         assert!(parse_vp9_descriptor(&[]).is_none());
         assert!(parse_vp9_descriptor(&[0x80]).is_none()); // I set, PID missing
         assert!(parse_vp9_descriptor(&[0x80, 0x81]).is_none()); // M=1, second byte missing
+    }
+
+    // ── H264 packetizer ──
+    #[test]
+    fn h264_small_nal_is_single_packet() {
+        let p = H264Packetizer::new();
+        let nal = [0x65u8, 1, 2, 3];
+        let frags = p.packetize_from_raw(&nal, 1000);
+        assert_eq!(frags.len(), 1);
+        let frames = frags.into_frames(640, 480);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_last_packet);
+        assert_eq!(frames[0].rtp_timestamp, 1000);
+        assert_eq!(frames[0].data.to_vec(), nal.to_vec());
+    }
+
+    #[test]
+    fn h264_large_nal_uses_fu_a() {
+        let p = H264Packetizer::new();
+        let mut nal = vec![0x65u8];
+        nal.extend(std::iter::repeat(0xAB).take(4000));
+        let frags = p.packetize(&nal);
+        assert!(frags.len() > 1, "must fragment");
+        let frames = frags.into_frames(1280, 720);
+        for f in &frames {
+            assert_eq!(f.data[0] & 0x1F, 28);
+        }
+        assert_eq!(frames[0].data[1] & 0x80, 0x80);
+        let last = frames.last().unwrap();
+        assert_eq!(last.data[1] & 0x40, 0x40);
+        assert!(last.is_last_packet);
+        assert!(!frames[0].is_last_packet);
+    }
+
+    #[test]
+    fn h264_start_code_is_stripped() {
+        let p = H264Packetizer::new();
+        let nal = vec![0, 0, 0, 1, 0x65, 9, 9];
+        let frames = p.packetize(&nal).into_frames(1, 1);
+        assert_eq!(frames[0].data.to_vec(), vec![0x65, 9, 9]);
+        let nal3 = vec![0, 0, 1, 0x41, 7];
+        let frames3 = p.packetize(&nal3).into_frames(1, 1);
+        assert_eq!(frames3[0].data.to_vec(), vec![0x41, 7]);
+    }
+
+    #[test]
+    fn h264_timestamp_advances() {
+        let mut p = H264Packetizer::new();
+        assert_eq!(p.timestamp(), 0);
+        p.advance();
+        assert_eq!(p.timestamp(), H264_TS_PER_FRAME);
+        let nal = [0x41u8, 1];
+        let frames = p.packetize(&nal).into_frames(1, 1);
+        assert_eq!(frames[0].rtp_timestamp, H264_TS_PER_FRAME);
+    }
+
+    #[test]
+    fn h264_empty_input() {
+        let p = H264Packetizer::new();
+        assert!(p.packetize(&[]).is_empty());
+        assert_eq!(p.packetize(&[0, 0, 1]).len(), 1);
+    }
+}
+
+// ── H.264 (RFC 6184) ──────────────────────────────────────────────────────
+// Single NAL below MTU, FU-A above. STAP-A aggregation is not implemented.
+
+const H264_FU_A_INDICATOR: u8 = 0x1C;
+const H264_NAL_TYPE_MASK: u8 = 0x1F;
+const H264_FU_A_START: u8 = 0x80;
+const H264_FU_A_END: u8 = 0x40;
+const H264_MTU: usize = 1200;
+
+/// 90000 / 25 fps timestamp step.
+pub const H264_TS_PER_FRAME: u32 = 3600;
+
+/// FU-A fragmentation into RTP payloads at the given MTU.
+pub struct H264Payloader;
+
+impl Payloader for H264Payloader {
+    fn payload(&self, mtu: usize, data: Bytes) -> Vec<Bytes> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        let nal_type = data[0] & H264_NAL_TYPE_MASK;
+        let nri = data[0] & 0x60;
+        let payload = &data[1..];
+        let max_frag = mtu.saturating_sub(2).max(1);
+        if payload.len() < mtu {
+            vec![data]
+        } else {
+            let mut fragments = Vec::new();
+            let total = payload.len();
+            let mut offset = 0;
+            while offset < total {
+                let remaining = total - offset;
+                let frag_size = remaining.min(max_frag);
+                let is_start = offset == 0;
+                let is_end = offset + frag_size >= total;
+                let fu_indicator = nri | H264_FU_A_INDICATOR;
+                let mut fu_header = nal_type;
+                if is_start {
+                    fu_header |= H264_FU_A_START;
+                }
+                if is_end {
+                    fu_header |= H264_FU_A_END;
+                }
+                let mut fragment = Vec::with_capacity(2 + frag_size);
+                fragment.push(fu_indicator);
+                fragment.push(fu_header);
+                fragment.extend_from_slice(&payload[offset..offset + frag_size]);
+                fragments.push(Bytes::from(fragment));
+                offset += frag_size;
+            }
+            fragments
+        }
+    }
+}
+
+/// Tracks the 90 kHz RTP clock; NALs (Annex-B or raw) → fragment lists.
+pub struct H264Packetizer {
+    timestamp: u32,
+}
+
+impl Default for H264Packetizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H264Packetizer {
+    pub fn new() -> Self {
+        Self { timestamp: 0 }
+    }
+
+    pub fn timestamp(&self) -> u32 {
+        self.timestamp
+    }
+
+    pub fn advance(&mut self) {
+        self.timestamp = self.timestamp.wrapping_add(H264_TS_PER_FRAME);
+    }
+
+    pub fn packetize_from_raw(&self, nal_data: &[u8], ts: u32) -> H264Fragments {
+        if nal_data.is_empty() {
+            return H264Fragments::empty();
+        }
+        let payloads = H264Payloader.payload(H264_MTU, Bytes::copy_from_slice(nal_data));
+        H264Fragments {
+            data: payloads.into_iter().map(|b| b.to_vec()).collect(),
+            timestamp: ts,
+        }
+    }
+
+    /// Packetize one Annex-B NAL (3/4-byte start code stripped if present).
+    pub fn packetize(&self, nal: &[u8]) -> H264Fragments {
+        let start_code =
+            if nal.len() > 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1 {
+                4
+            } else if nal.len() > 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1 {
+                3
+            } else {
+                0
+            };
+        self.packetize_from_raw(&nal[start_code..], self.timestamp)
+    }
+}
+
+/// One access unit's RTP payloads sharing one timestamp (last = marker).
+pub struct H264Fragments {
+    data: Vec<Vec<u8>>,
+    timestamp: u32,
+}
+
+impl H264Fragments {
+    fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            timestamp: 0,
+        }
+    }
+
+    /// Fragment payloads, in transmission order.
+    pub fn payloads(&self) -> &[Vec<u8>] {
+        &self.data
+    }
+
+    /// Build from raw fragment payloads sharing one timestamp.
+    pub fn from_payloads(data: Vec<Vec<u8>>, timestamp: u32) -> Self {
+        Self { data, timestamp }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn into_frames(self, width: u16, height: u16) -> Vec<VideoFrame> {
+        let count = self.data.len();
+        let ts = self.timestamp;
+        self.data
+            .into_iter()
+            .enumerate()
+            .map(|(i, data)| VideoFrame {
+                data: Bytes::from(data),
+                width,
+                height,
+                format: VideoPixelFormat::Unspecified,
+                is_last_packet: i + 1 == count,
+                rtp_timestamp: ts,
+                ..Default::default()
+            })
+            .collect()
     }
 }
