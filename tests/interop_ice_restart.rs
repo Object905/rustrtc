@@ -1,5 +1,4 @@
 #![cfg(feature = "std")]
-
 // Interop test: ICE restart between rustrtc (server/answerer) and pion v3
 // (Go, client). The pion client connects normally, then the rustrtc side
 // rolls fresh ICE credentials (restart_ice + new offer). pion detects the

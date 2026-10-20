@@ -1,5 +1,4 @@
 #![cfg(feature = "std")]
-
 // E2E tests: ICE restart (RFC 8445 §9).
 //
 // 1. Local restart: the offerer calls `restart_ice()`, the new offer carries

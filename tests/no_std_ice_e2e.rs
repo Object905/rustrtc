@@ -8,7 +8,9 @@
 mod common;
 
 use common::{drive_until, install_mock_platform};
-use rustrtc::transports::ice::{IceCandidate, IceCandidateType, IceRole, IceTransport, IceTransportState};
+use rustrtc::transports::ice::{
+    IceCandidate, IceCandidateType, IceRole, IceTransport, IceTransportState,
+};
 
 #[test]
 fn two_ice_agents_connect_over_the_loopback_seams() {

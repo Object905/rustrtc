@@ -1,8 +1,8 @@
 use crate::RtcConfiguration;
-pub use crate::transports::datachannel::*;
 use crate::errors::RtcError;
-use crate::platform::sync::{mpsc, Mutex, Notify};
+use crate::platform::sync::{Mutex, Notify, mpsc};
 use crate::platform::time::Instant;
+pub use crate::transports::datachannel::*;
 use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -13,11 +13,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 // 64-bit atomics are emulated on targets without them (ESP32-Xtensa, RISC-V).
 use crate::platform::atomic64::AtomicU64;
+use alloc::sync::{Arc, Weak};
 use core::time::Duration;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use tracing::{debug, trace};
-use alloc::sync::{Arc, Weak};
 
 /// Local result alias: the module predates the typed error enum and used
 /// `anyhow`; messages surface as `RtcError::Internal`.
@@ -1303,18 +1303,17 @@ impl SctpInner {
                 let mut arm2 = core::pin::pin!(timer_fut);
                 let mut arm3 = core::pin::pin!(sleep_fut);
                 let mut arm4 = core::pin::pin!(recv_fut);
-            match crate::platform::select::select5(
-                &mut arm0, &mut arm1, &mut arm2, &mut arm3, &mut arm4,
-            )
-            .await
-            {
-                crate::platform::select::Which5::A(_) => {
-                    debug!("SctpTransport run_loop exiting (closed)");
-                    *self.close_reason.lock() = Some("LOCAL_CLOSE".into());
-                    break;
-                }
-                crate::platform::select::Which5::B(res) => {
-                    match res {
+                match crate::platform::select::select5(
+                    &mut arm0, &mut arm1, &mut arm2, &mut arm3, &mut arm4,
+                )
+                .await
+                {
+                    crate::platform::select::Which5::A(_) => {
+                        debug!("SctpTransport run_loop exiting (closed)");
+                        *self.close_reason.lock() = Some("LOCAL_CLOSE".into());
+                        break;
+                    }
+                    crate::platform::select::Which5::B(res) => match res {
                         Ok(()) => {
                             let state = dtls_state_rx.borrow_and_update().clone();
                             if let DtlsState::Failed | DtlsState::Closed = state {
@@ -1332,42 +1331,40 @@ impl SctpInner {
                             *self.close_reason.lock() = Some("DTLS_CHANNEL_CLOSED".into());
                             break;
                         }
-                    }
-                }
-                crate::platform::select::Which5::C(_) => {
-                    // Woken up by sender, recalculate timeout
-                    if let Err(e) = self.transmit().await {
-                         trace!("Transmit error: {}", e);
-                    }
-                }
-                crate::platform::select::Which5::D(_) => {
-                    // Check T1 Timer (INIT / COOKIE-ECHO retransmission)
-                    if let Err(e) = self.handle_t1_timeout().await {
-                        trace!("SCTP T1 timeout error: {}", e);
-                    }
-
-                    // Check Tail Loss Probe before T3 — TLP has a shorter timeout
-                    // (PTO) and should recover tail losses before the much
-                    // heavier RTO-based retransmission kicks in.
-                    self.maybe_send_tlp_probe(Instant::now());
-
-                    // Check RTO Timer
-                    // We check this regardless of whether sleep woke up due to RTO or SACK,
-                    // because they might be close.
-                    if let Err(e) = self.handle_timeout().await {
-                        trace!("SCTP handle timeout error: {}", e);
-                    }
-
-                    // Check Heartbeat Timer
-                    if Instant::now() >= last_heartbeat + heartbeat_interval {
-                        if let Err(e) = self.send_heartbeat().await {
-                            trace!("Failed to send HEARTBEAT: {}", e);
+                    },
+                    crate::platform::select::Which5::C(_) => {
+                        // Woken up by sender, recalculate timeout
+                        if let Err(e) = self.transmit().await {
+                            trace!("Transmit error: {}", e);
                         }
-                        last_heartbeat = Instant::now();
                     }
-                }
-                crate::platform::select::Which5::E(res) => {
-                    match res {
+                    crate::platform::select::Which5::D(_) => {
+                        // Check T1 Timer (INIT / COOKIE-ECHO retransmission)
+                        if let Err(e) = self.handle_t1_timeout().await {
+                            trace!("SCTP T1 timeout error: {}", e);
+                        }
+
+                        // Check Tail Loss Probe before T3 — TLP has a shorter timeout
+                        // (PTO) and should recover tail losses before the much
+                        // heavier RTO-based retransmission kicks in.
+                        self.maybe_send_tlp_probe(Instant::now());
+
+                        // Check RTO Timer
+                        // We check this regardless of whether sleep woke up due to RTO or SACK,
+                        // because they might be close.
+                        if let Err(e) = self.handle_timeout().await {
+                            trace!("SCTP handle timeout error: {}", e);
+                        }
+
+                        // Check Heartbeat Timer
+                        if Instant::now() >= last_heartbeat + heartbeat_interval {
+                            if let Err(e) = self.send_heartbeat().await {
+                                trace!("Failed to send HEARTBEAT: {}", e);
+                            }
+                            last_heartbeat = Instant::now();
+                        }
+                    }
+                    crate::platform::select::Which5::E(res) => match res {
                         Some(packet) => {
                             if let Err(e) = self.handle_packet(packet).await {
                                 trace!("SCTP handle packet error: {}", e);
@@ -1375,13 +1372,11 @@ impl SctpInner {
                         }
                         None => {
                             debug!("SCTP loop error: Channel closed");
-                            *self.close_reason.lock() =
-                                Some("INCOMING_CHANNEL_CLOSED".into());
+                            *self.close_reason.lock() = Some("INCOMING_CHANNEL_CLOSED".into());
                             break;
                         }
-                    }
+                    },
                 }
-            }
             }
 
             // Batch receive: drain any packets queued behind the first one.
@@ -3971,7 +3966,11 @@ mod tests {
         for len in 0..=data.len() {
             let slice = &data[..len];
             // Stability: the table and the append path must agree.
-            assert_eq!(sctp_crc32c(slice), sctp_crc32c_append(0, slice), "crc mismatch at len={len}");
+            assert_eq!(
+                sctp_crc32c(slice),
+                sctp_crc32c_append(0, slice),
+                "crc mismatch at len={len}"
+            );
         }
 
         // A realistic ~1200-byte SCTP packet size (self-consistency across

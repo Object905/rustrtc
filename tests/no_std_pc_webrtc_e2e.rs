@@ -16,9 +16,9 @@ use std::sync::Arc;
 
 use common::{drive, drive_until, install_mock_platform};
 use rustrtc::config::RtcConfiguration;
-use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::media::MediaKind as TrackMediaKind;
 use rustrtc::media::MediaStreamTrack;
+use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::peer_connection::{
     PeerConnection, PeerConnectionState, RtpCodecParameters, RtpSender, TransceiverDirection,
 };
@@ -60,8 +60,7 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
     let _ = &pc2;
 
     // PC1 sends video; PC2 receives.
-    let (source, track, _) =
-        rustrtc::media::track::sample_track(TrackMediaKind::Video, 100);
+    let (source, track, _) = rustrtc::media::track::sample_track(TrackMediaKind::Video, 100);
     let source = Arc::new(source);
     let _sender: Arc<RtpSender> = pc1
         .add_track(
@@ -92,7 +91,8 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
         offer_sdp.contains("a=candidate:"),
         "WebRtc offers must carry ICE candidates:\n{offer_sdp}"
     );
-    pc1.set_local_description(offer.clone()).expect("local offer");
+    pc1.set_local_description(offer.clone())
+        .expect("local offer");
     drive(pc2.set_remote_description(offer), 5_000)
         .expect("remote offer")
         .expect("remote offer result");
@@ -108,7 +108,8 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
         answer_sdp.contains("a=fingerprint:sha-256") && answer_sdp.contains("a=candidate:"),
         "WebRtc answers must carry fingerprint + candidates:\n{answer_sdp}"
     );
-    pc2.set_local_description(answer.clone()).expect("local answer");
+    pc2.set_local_description(answer.clone())
+        .expect("local answer");
     drive(pc1.set_remote_description(answer), 5_000)
         .expect("remote answer")
         .expect("remote answer result");
@@ -140,43 +141,52 @@ fn two_no_std_pcs_run_full_webrtc_over_the_seams() {
         *state2.borrow(),
         common::clock(),
     );
-    assert!(connected, "both PCs must reach Connected (ICE + DTLS + SRTP)");
+    assert!(
+        connected,
+        "both PCs must reach Connected (ICE + DTLS + SRTP)"
+    );
 
     // Media over the DTLS-SRTP channel, payload order verified.
     let sender_source = source.clone();
-    common::keep_task_labeled("media-feed", Box::new(async move {
-        for seq in 0..40u8 {
-            let frame = VideoFrame {
-                rtp_timestamp: seq as u32 * 3000,
-                data: bytes::Bytes::from(vec![seq; 100]),
-                is_last_packet: true,
-                ..Default::default()
-            };
-            if let Err(e) = sender_source.send(MediaSample::Video(frame)) {
-                eprintln!("[feed] send failed at seq={seq}: {e}");
-                break;
+    common::keep_task_labeled(
+        "media-feed",
+        Box::new(async move {
+            for seq in 0..40u8 {
+                let frame = VideoFrame {
+                    rtp_timestamp: seq as u32 * 3000,
+                    data: bytes::Bytes::from(vec![seq; 100]),
+                    is_last_packet: true,
+                    ..Default::default()
+                };
+                if let Err(e) = sender_source.send(MediaSample::Video(frame)) {
+                    eprintln!("[feed] send failed at seq={seq}: {e}");
+                    break;
+                }
+                rustrtc::platform::task::sleep(std::time::Duration::from_millis(10)).await;
             }
-            rustrtc::platform::task::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        eprintln!("[feed] all 40 frames queued");
-    }));
+            eprintln!("[feed] all 40 frames queued");
+        }),
+    );
 
     let transceivers = pc2.get_transceivers();
     let receiver = transceivers[0].receiver().expect("receiver");
     let track_remote = receiver.track();
     let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = received.clone();
-    common::keep_task_labeled("media-recv", Box::new(async move {
-        while let Ok(sample) = track_remote.recv().await {
-            if let MediaSample::Video(frame) = sample {
-                let marker = frame.data.first().copied().unwrap_or(0xFF);
-                seen.lock().unwrap().push(marker);
-                if seen.lock().unwrap().len() >= 20 {
-                    break;
+    common::keep_task_labeled(
+        "media-recv",
+        Box::new(async move {
+            while let Ok(sample) = track_remote.recv().await {
+                if let MediaSample::Video(frame) = sample {
+                    let marker = frame.data.first().copied().unwrap_or(0xFF);
+                    seen.lock().unwrap().push(marker);
+                    if seen.lock().unwrap().len() >= 20 {
+                        break;
+                    }
                 }
             }
-        }
-    }));
+        }),
+    );
 
     let got = drive_until(|| received.lock().unwrap().len() >= 20, 30_000);
     let packets = received.lock().unwrap().clone();

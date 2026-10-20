@@ -69,7 +69,11 @@ fn injected_sleep_backend_contract() {
     block_on(async {
         sleep(Duration::from_millis(250)).await; // must not hang
     });
-    assert_eq!(LAST_SLEEP_MS.with(|c| c.get()), 250, "factory saw the duration");
+    assert_eq!(
+        LAST_SLEEP_MS.with(|c| c.get()),
+        250,
+        "factory saw the duration"
+    );
 
     // Interval is driven by the injected sleep (ticks complete instantly).
     block_on(async {
@@ -78,7 +82,11 @@ fn injected_sleep_backend_contract() {
             tick.tick().await;
         }
     });
-    assert_eq!(LAST_SLEEP_MS.with(|c| c.get()), 20, "ticker used the factory");
+    assert_eq!(
+        LAST_SLEEP_MS.with(|c| c.get()),
+        20,
+        "ticker used the factory"
+    );
 
     // with_timeout races the injected sleep: instant-completion factory →
     // a never-ready inner must report Err immediately.

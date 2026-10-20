@@ -1,5 +1,4 @@
 #![cfg(feature = "std")]
-
 // E2E test: rustrtc<->rustrtc loopback data-channel transfer.
 // Exercises the full WebRTC stack (PeerConnection <-> ICE <-> DTLS <-> SCTP
 // <-> DataChannel) and specifically the SCTP robustness/congestion-control

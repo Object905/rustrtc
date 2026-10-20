@@ -476,7 +476,8 @@ impl DtlsInner {
         }
         if let Some(records) = &ctx.last_flight_records
             && let Err(e) = self.conn.send_dtls_record_batch(records).await
-        {            let msg = e.to_string();
+        {
+            let msg = e.to_string();
             if msg.contains("No selected socket") || msg.contains("Remote address not set") {
                 debug!("Retransmission skipped — ICE socket unavailable");
             } else {

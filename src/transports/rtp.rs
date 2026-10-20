@@ -8,8 +8,8 @@ use crate::srtp::{SrtpPacket, SrtpSession};
 use crate::transports::PacketReceiver;
 use crate::transports::ice::conn::IceConn;
 use crate::transports::ice::stun::random_u32;
-use async_trait::async_trait;
 use alloc::collections::VecDeque;
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use core::cell::RefCell;
 use core::net::SocketAddr;
@@ -689,8 +689,7 @@ impl RtpTransport {
             self.srtp_pending_bytes
                 .fetch_sub(old.0.len(), Ordering::Relaxed);
             self.srtp_pending_count.fetch_sub(1, Ordering::Relaxed);
-            self.srtp_dropped_no_session
-                .fetch_add(1, Ordering::Relaxed);
+            self.srtp_dropped_no_session.fetch_add(1, Ordering::Relaxed);
         }
         queue.push_back((packet, addr));
         self.srtp_pending_bytes.fetch_add(len, Ordering::Relaxed);
@@ -722,7 +721,8 @@ impl RtpTransport {
             }
             debug!("flush_pending_srtp: replaying {} packet(s)", pending.len());
             for (packet, addr) in pending {
-                self.process_rtp_packet(packet, addr, &mut marshal_buf).await;
+                self.process_rtp_packet(packet, addr, &mut marshal_buf)
+                    .await;
             }
         }
     }
@@ -1281,171 +1281,171 @@ impl RtpTransport {
     /// required but the session is not ready yet, the packet is buffered for
     /// replay instead of dropped (see [`Self::buffer_pending_srtp`]).
     async fn process_rtp_packet(&self, packet: Bytes, addr: SocketAddr, marshal_buf: &mut Vec<u8>) {
-            let rtp_packet = {
-                // Parse outside both session guards. The inner SRTP lock is
-                // held only while authenticating and decrypting the packet.
-                let session = self.srtp_session.lock().as_ref().cloned();
-                match session {
-                    Some(session) => {
-                        let packet = match packet.try_into_mut() {
-                            Ok(packet) => packet,
-                            Err(packet) => BytesMut::from(packet.as_ref()),
-                        };
-                        match SrtpPacket::parse(packet) {
-                            Ok(srtp_packet) => {
-                                let ssrc = srtp_packet.header().ssrc;
-                                let payload_type = srtp_packet.header().payload_type;
-                                let sequence = srtp_packet.header().sequence_number;
-                                let mut srtp = session.lock();
-                                match srtp.unprotect_rtp(srtp_packet) {
-                                    Ok(rtp_packet) => rtp_packet,
-                                    Err(error) => {
-                                        let failures = self
-                                            .srtp_unprotect_failures
-                                            .fetch_add(1, Ordering::Relaxed)
-                                            + 1;
-                                        if failures <= 5 || failures.is_multiple_of(100) {
-                                            tracing::warn!(
-                                                failures,
-                                                from = %addr,
-                                                ssrc,
-                                                payload_type,
-                                                sequence,
-                                                %error,
-                                                "SRTP unprotect RTP failed, dropping"
-                                            );
-                                        }
-                                        return;
+        let rtp_packet = {
+            // Parse outside both session guards. The inner SRTP lock is
+            // held only while authenticating and decrypting the packet.
+            let session = self.srtp_session.lock().as_ref().cloned();
+            match session {
+                Some(session) => {
+                    let packet = match packet.try_into_mut() {
+                        Ok(packet) => packet,
+                        Err(packet) => BytesMut::from(packet.as_ref()),
+                    };
+                    match SrtpPacket::parse(packet) {
+                        Ok(srtp_packet) => {
+                            let ssrc = srtp_packet.header().ssrc;
+                            let payload_type = srtp_packet.header().payload_type;
+                            let sequence = srtp_packet.header().sequence_number;
+                            let mut srtp = session.lock();
+                            match srtp.unprotect_rtp(srtp_packet) {
+                                Ok(rtp_packet) => rtp_packet,
+                                Err(error) => {
+                                    let failures = self
+                                        .srtp_unprotect_failures
+                                        .fetch_add(1, Ordering::Relaxed)
+                                        + 1;
+                                    if failures <= 5 || failures.is_multiple_of(100) {
+                                        tracing::warn!(
+                                            failures,
+                                            from = %addr,
+                                            ssrc,
+                                            payload_type,
+                                            sequence,
+                                            %error,
+                                            "SRTP unprotect RTP failed, dropping"
+                                        );
                                     }
+                                    return;
                                 }
                             }
-                            Err(e) => {
-                                trace!("SRTP parse failed: {}", e);
-                                return;
-                            }
                         }
-                    }
-                    None => {
-                        if self.srtp_required {
-                            // Early media can arrive before our DTLS/SRTP is
-                            // ready (peer greeting during our handshake):
-                            // buffer it (bounded) for replay instead of
-                            // dropping it.
-                            self.buffer_pending_srtp(packet, addr);
+                        Err(e) => {
+                            trace!("SRTP parse failed: {}", e);
                             return;
                         }
-                        match RtpPacket::parse_bytes(packet) {
-                            Ok(rtp_packet) => rtp_packet,
-                            Err(e) => {
-                                trace!("RTP parse failed: {}", e);
-                                return;
-                            }
+                    }
+                }
+                None => {
+                    if self.srtp_required {
+                        // Early media can arrive before our DTLS/SRTP is
+                        // ready (peer greeting during our handshake):
+                        // buffer it (bounded) for replay instead of
+                        // dropping it.
+                        self.buffer_pending_srtp(packet, addr);
+                        return;
+                    }
+                    match RtpPacket::parse_bytes(packet) {
+                        Ok(rtp_packet) => rtp_packet,
+                        Err(e) => {
+                            trace!("RTP parse failed: {}", e);
+                            return;
                         }
                     }
                 }
-            };
+            }
+        };
 
-            // Count every accepted inbound RTP packet at the transport layer.
-            // This runs before the rewrite-bridge fast-path early-return, so
-            // the counter advances for both relayed and depacketized packets.
-            self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
+        // Count every accepted inbound RTP packet at the transport layer.
+        // This runs before the rewrite-bridge fast-path early-return, so
+        // the counter advances for both relayed and depacketized packets.
+        self.received_rtp_packets.fetch_add(1, Ordering::Relaxed);
 
-            // Ingress observation: fire on the plaintext packet BEFORE the
-            // relay fast-path early-return, so observers (stats/DTMF/recording)
-            // see every inbound packet regardless of forwarding mode. Zero cost
-            // (single Acquire load) when no observer is registered.
-            self.fire_ingress(&rtp_packet, addr);
+        // Ingress observation: fire on the plaintext packet BEFORE the
+        // relay fast-path early-return, so observers (stats/DTMF/recording)
+        // see every inbound packet regardless of forwarding mode. Zero cost
+        // (single Acquire load) when no observer is registered.
+        self.fire_ingress(&rtp_packet, addr);
 
-            let ssrc = rtp_packet.header.ssrc;
-            let pt = rtp_packet.header.payload_type;
+        let ssrc = rtp_packet.header.ssrc;
+        let pt = rtp_packet.header.payload_type;
 
-            // Extract the RID/MID extension slices BEFORE taking the listeners
-            // lock — the byte-scan depends only on the packet, not the registry,
-            // so it should not run inside the demux critical section.
-            let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
-            let mid_id = decode_ext_id(self.sdes_mid_extension_id.load(Ordering::Relaxed));
-            let rid_bytes = rid_id.and_then(|id| rtp_packet.header.get_extension(id));
-            let mid_bytes = mid_id.and_then(|id| rtp_packet.header.get_extension(id));
+        // Extract the RID/MID extension slices BEFORE taking the listeners
+        // lock — the byte-scan depends only on the packet, not the registry,
+        // so it should not run inside the demux critical section.
+        let rid_id = decode_ext_id(self.rid_extension_id.load(Ordering::Relaxed));
+        let mid_id = decode_ext_id(self.sdes_mid_extension_id.load(Ordering::Relaxed));
+        let rid_bytes = rid_id.and_then(|id| rtp_packet.header.get_extension(id));
+        let mid_bytes = mid_id.and_then(|id| rtp_packet.header.get_extension(id));
 
-            let (listener, receiver) = {
-                let mut listeners = self.listeners.lock();
-                let mut selected = None;
-                let mut bind_ssrc = false;
+        let (listener, receiver) = {
+            let mut listeners = self.listeners.lock();
+            let mut selected = None;
+            let mut bind_ssrc = false;
 
-                if let Some(rid) = &rid_bytes
-                    && let Ok(rid_str) = core::str::from_utf8(rid)
-                {
-                    selected = listeners.by_rid.get(rid_str).cloned();
-                    bind_ssrc = selected.is_some();
-                }
-
-                if selected.is_none()
-                    && let Some(mid) = &mid_bytes
-                    && let Ok(mid_str) = core::str::from_utf8(mid)
-                {
-                    selected = listeners.by_mid(mid_str);
-                    bind_ssrc = selected.is_some();
-                }
-
-                if selected.is_none() {
-                    selected = listeners.by_ssrc.get(&ssrc).cloned();
-                    bind_ssrc = false;
-                }
-
-                if selected.is_none() {
-                    selected = listeners.unique_by_pt(pt);
-                    bind_ssrc = selected.is_some();
-                }
-
-                if selected.is_none() {
-                    selected = listeners.single_provisional();
-                    bind_ssrc = false;
-                }
-
-                if let Some(tx) = selected.as_ref()
-                    && bind_ssrc
-                {
-                    listeners.bind_ssrc_route(ssrc, tx.clone());
-                }
-
-                let receiver = selected.as_ref().and_then(|tx| {
-                    listeners
-                        .routes
-                        .iter()
-                        .find(|route| route.tx.same_channel(tx))
-                        .and_then(|route| route.receiver.as_ref())
-                        .and_then(Weak::upgrade)
-                });
-                (selected, receiver)
-            };
-
-            // Account on the original SSRC before either forwarding or depacketization.
-            if let Some(receiver) = receiver
-                && let Some(report) = receiver.observe_reception(&rtp_packet)
-                && let Err(error) = self.send_rtcp(&[report]).await
+            if let Some(rid) = &rid_bytes
+                && let Ok(rid_str) = core::str::from_utf8(rid)
             {
-                trace!(%error, "Failed to send reception report");
+                selected = listeners.by_rid.get(rid_str).cloned();
+                bind_ssrc = selected.is_some();
             }
-            let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
-                return;
-            };
 
-            if let Some(tx) = listener {
-                match try_send_dropping(&tx, (rtp_packet, addr)) {
-                    Ok(()) => {}
-                    Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Closed(_)) => {
-                        let mut listeners = self.listeners.lock();
-                        listeners.by_ssrc.remove(&ssrc);
-                        listeners.remove_sender(&tx);
-                    }
-                }
-            } else {
-                trace!(
-                    "No listener found for packet SSRC: {} PT: {} from {}",
-                    ssrc, pt, addr
-                );
+            if selected.is_none()
+                && let Some(mid) = &mid_bytes
+                && let Ok(mid_str) = core::str::from_utf8(mid)
+            {
+                selected = listeners.by_mid(mid_str);
+                bind_ssrc = selected.is_some();
             }
+
+            if selected.is_none() {
+                selected = listeners.by_ssrc.get(&ssrc).cloned();
+                bind_ssrc = false;
+            }
+
+            if selected.is_none() {
+                selected = listeners.unique_by_pt(pt);
+                bind_ssrc = selected.is_some();
+            }
+
+            if selected.is_none() {
+                selected = listeners.single_provisional();
+                bind_ssrc = false;
+            }
+
+            if let Some(tx) = selected.as_ref()
+                && bind_ssrc
+            {
+                listeners.bind_ssrc_route(ssrc, tx.clone());
+            }
+
+            let receiver = selected.as_ref().and_then(|tx| {
+                listeners
+                    .routes
+                    .iter()
+                    .find(|route| route.tx.same_channel(tx))
+                    .and_then(|route| route.receiver.as_ref())
+                    .and_then(Weak::upgrade)
+            });
+            (selected, receiver)
+        };
+
+        // Account on the original SSRC before either forwarding or depacketization.
+        if let Some(receiver) = receiver
+            && let Some(report) = receiver.observe_reception(&rtp_packet)
+            && let Err(error) = self.send_rtcp(&[report]).await
+        {
+            trace!(%error, "Failed to send reception report");
+        }
+        let Some(rtp_packet) = self.try_bridge_rewrite_rtp(rtp_packet, marshal_buf) else {
+            return;
+        };
+
+        if let Some(tx) = listener {
+            match try_send_dropping(&tx, (rtp_packet, addr)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Closed(_)) => {
+                    let mut listeners = self.listeners.lock();
+                    listeners.by_ssrc.remove(&ssrc);
+                    listeners.remove_sender(&tx);
+                }
+            }
+        } else {
+            trace!(
+                "No listener found for packet SSRC: {} PT: {} from {}",
+                ssrc, pt, addr
+            );
+        }
     }
 }
 

@@ -171,7 +171,6 @@ impl TaskHandle {
     }
 }
 
-
 // Shared waker vtable for the mock task wakers (all point at TaskWoken).
 static TASK_WAKER_VTABLE: std::task::RawWakerVTable = build_task_vtable();
 
@@ -308,7 +307,13 @@ impl UdpSocket for LoopSocket {
 
     fn try_send_to(&self, buf: &[u8], addr: SocketAddr) -> Result<usize, NetError> {
         if std::env::var("LOOPNET_TRACE").is_ok() {
-            eprintln!("[net] {} -> {} len={} first={:?}", self.local, addr, buf.len(), buf.first());
+            eprintln!(
+                "[net] {} -> {} len={} first={:?}",
+                self.local,
+                addr,
+                buf.len(),
+                buf.first()
+            );
         }
         let mut inboxes = inboxes().lock().unwrap();
         let Some(inbox) = inboxes.get_mut(&addr.port()) else {
@@ -396,7 +401,10 @@ pub fn drive_until(pred: impl Fn() -> bool, budget_ms: u64) -> bool {
 /// runtime: polls the local future and every runnable task each round,
 /// advancing the logical clock between rounds.
 pub fn drive<F: std::future::Future>(fut: F, budget_ms: u64) -> Option<F::Output> {
-    let local_waker = TaskHandle(Arc::new(TaskWoken(std::sync::atomic::AtomicBool::new(true)))).waker();
+    let local_waker = TaskHandle(Arc::new(TaskWoken(std::sync::atomic::AtomicBool::new(
+        true,
+    ))))
+    .waker();
     let mut fut = Box::pin(fut);
     let mut cx = std::task::Context::from_waker(&local_waker);
     let deadline = clock() + budget_ms;
@@ -469,7 +477,6 @@ fn task_waker_for(woken: &Arc<TaskWoken>) -> std::task::Waker {
     }
     unsafe { Waker::from_raw(RawWaker::new(ptr, &TASK_WAKER_VTABLE)) }
 }
-
 
 /// Spin-poll one future to completion without advancing the clock or
 /// polling tasks (for short futures that only need a few polls).

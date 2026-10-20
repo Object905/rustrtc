@@ -15,7 +15,9 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 fn alive_tasks() -> usize {
-    tokio::runtime::Handle::current().metrics().num_alive_tasks()
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
 }
 
 /// Wait up to `secs` for every task on this runtime to end.

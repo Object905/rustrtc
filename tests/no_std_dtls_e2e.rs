@@ -13,13 +13,13 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use common::bind_loop;
 use common::{block_on, drive_until, install_mock_platform};
 use rustrtc::platform::net::UdpSocket;
-use rustrtc::transports::dtls::{Certificate, DtlsState, DtlsTransport, fingerprint};
-use rustrtc::transports::ice::conn::IceConn;
 use rustrtc::transports::PacketReceiver;
+use rustrtc::transports::dtls::{Certificate, DtlsState, DtlsTransport, fingerprint};
 use rustrtc::transports::ice::IceSocketWrapper;
-use common::bind_loop;
+use rustrtc::transports::ice::conn::IceConn;
 
 const CERT_DER: &[u8] = include_bytes!("fixtures/dtls_cert.der");
 const KEY_DER: &[u8] = include_bytes!("fixtures/dtls_key.der");
@@ -39,9 +39,7 @@ async fn pump(sock: Arc<dyn UdpSocket>, transport: Arc<DtlsTransport>) {
 }
 
 fn make_conn(sock: Arc<dyn UdpSocket>, peer: std::net::SocketAddr) -> Arc<IceConn> {
-    let (tx, rx) = rustrtc::platform::sync::watch::channel(Some(IceSocketWrapper::Platform(
-        sock,
-    )));
+    let (tx, rx) = rustrtc::platform::sync::watch::channel(Some(IceSocketWrapper::Platform(sock)));
     let _ = tx;
     IceConn::new(rx, peer, None)
 }
@@ -50,9 +48,7 @@ fn make_conn(sock: Arc<dyn UdpSocket>, peer: std::net::SocketAddr) -> Arc<IceCon
 fn dtls_handshake_completes_over_the_loopback_seams() {
     install_mock_platform();
     // Explicit (the crypto-p256 feature also provides this as a fallback).
-    rustrtc::platform::crypto::set_crypto(Arc::new(
-        rustrtc::platform::crypto_p256::P256Crypto,
-    ));
+    rustrtc::platform::crypto::set_crypto(Arc::new(rustrtc::platform::crypto_p256::P256Crypto));
 
     let sock_c = bind_loop("127.0.0.1:40100".parse().unwrap()).unwrap();
     let sock_s = bind_loop("127.0.0.1:40102".parse().unwrap()).unwrap();
@@ -61,12 +57,12 @@ fn dtls_handshake_completes_over_the_loopback_seams() {
 
     // Same self-signed fixture on both sides (factory-provisioned cert
     // shape: pre-provisioned DER, no runtime certificate generation).
-    let cert_c = Certificate::from_pkcs8_der(CERT_DER.to_vec(), KEY_DER.to_vec())
-        .expect("client cert");
+    let cert_c =
+        Certificate::from_pkcs8_der(CERT_DER.to_vec(), KEY_DER.to_vec()).expect("client cert");
     let fp = fingerprint(&cert_c);
     assert!(!fp.is_empty());
-    let cert_s = Certificate::from_pkcs8_der(CERT_DER.to_vec(), KEY_DER.to_vec())
-        .expect("server cert");
+    let cert_s =
+        Certificate::from_pkcs8_der(CERT_DER.to_vec(), KEY_DER.to_vec()).expect("server cert");
 
     let conn_c = make_conn(sock_c.clone(), addr_s);
     let conn_s = make_conn(sock_s.clone(), addr_c);
@@ -79,14 +75,9 @@ fn dtls_handshake_completes_over_the_loopback_seams() {
         Some(fp.clone()),
     ))
     .expect("client DTLS transport");
-    let (dtls_s, mut in_s, run_s) = block_on(DtlsTransport::new(
-        conn_s,
-        cert_s,
-        false,
-        1500,
-        Some(fp),
-    ))
-    .expect("server DTLS transport");
+    let (dtls_s, mut in_s, run_s) =
+        block_on(DtlsTransport::new(conn_s, cert_s, false, 1500, Some(fp)))
+            .expect("server DTLS transport");
     common::keep_task(Box::new(run_c));
     common::keep_task(Box::new(run_s));
 
@@ -110,17 +101,10 @@ fn dtls_handshake_completes_over_the_loopback_seams() {
     common::keep_task(Box::new(collector(in_c, seen_c.clone())));
     common::keep_task(Box::new(collector(in_s, seen_s.clone())));
 
-    let is_connected = |t: &Arc<DtlsTransport>| {
-        matches!(
-            *t.subscribe_state().borrow(),
-            DtlsState::Connected(..)
-        )
-    };
+    let is_connected =
+        |t: &Arc<DtlsTransport>| matches!(*t.subscribe_state().borrow(), DtlsState::Connected(..));
 
-    let ok = drive_until(
-        || is_connected(&dtls_c) && is_connected(&dtls_s),
-        60_000,
-    );
+    let ok = drive_until(|| is_connected(&dtls_c) && is_connected(&dtls_s), 60_000);
     assert!(ok, "DTLS handshake must complete over the seams");
 
     // SRTP keying material must match on both sides (same extraction).

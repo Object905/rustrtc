@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use common::{drive, drive_until, install_mock_platform};
 use rustrtc::config::{RtcConfiguration, TransportMode};
-use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::media::MediaKind as TrackMediaKind;
 use rustrtc::media::MediaStreamTrack;
+use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::peer_connection::{
     PeerConnection, PeerConnectionState, RtpCodecParameters, RtpSender, TransceiverDirection,
 };
@@ -43,8 +43,7 @@ fn two_no_std_pcs_exchange_srtp_media_over_the_seams() {
     let pc2 = srtp_agent(51_000, 51_020);
 
     // PC1 sends video; PC2 receives.
-    let (source, track, _) =
-        rustrtc::media::track::sample_track(TrackMediaKind::Video, 100);
+    let (source, track, _) = rustrtc::media::track::sample_track(TrackMediaKind::Video, 100);
     let source = Arc::new(source);
     let _sender: Arc<RtpSender> = pc1
         .add_track(
@@ -71,7 +70,8 @@ fn two_no_std_pcs_exchange_srtp_media_over_the_seams() {
         "Srtp mode offers must carry SDES keying (a=crypto):\n{offer_sdp}"
     );
     eprintln!("=== OFFER SDP ===\n{offer_sdp}");
-    pc1.set_local_description(offer.clone()).expect("set local offer");
+    pc1.set_local_description(offer.clone())
+        .expect("set local offer");
     drive(pc2.set_remote_description(offer), 5_000)
         .expect("set remote offer")
         .expect("set remote offer result");
@@ -86,7 +86,8 @@ fn two_no_std_pcs_exchange_srtp_media_over_the_seams() {
         "Srtp mode answers must carry SDES keying (a=crypto):\n{answer_sdp}"
     );
     eprintln!("=== ANSWER SDP ===\n{answer_sdp}");
-    pc2.set_local_description(answer.clone()).expect("set local answer");
+    pc2.set_local_description(answer.clone())
+        .expect("set local answer");
     drive(pc1.set_remote_description(answer), 5_000)
         .expect("set remote answer")
         .expect("set remote answer result");
@@ -146,10 +147,7 @@ fn two_no_std_pcs_exchange_srtp_media_over_the_seams() {
         }
     }));
 
-    let got = drive_until(
-        || received.lock().unwrap().len() >= 20,
-        30_000,
-    );
+    let got = drive_until(|| received.lock().unwrap().len() >= 20, 30_000);
     let packets = received.lock().unwrap().clone();
     eprintln!(
         "srtp e2e: got={got} packets={} first_markers={:?} sim_clock={}ms",

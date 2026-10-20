@@ -1,9 +1,9 @@
 use crate::errors::RtcError;
 use crate::platform::sync::Mutex;
+use crate::platform::sync::{AsyncMutex as TokioMutex, mpsc};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::platform::sync::{mpsc, AsyncMutex as TokioMutex};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
@@ -51,7 +51,9 @@ impl DataChannelOpen {
     pub fn unmarshal(data: &[u8]) -> Result<Self> {
         let mut buf = Bytes::copy_from_slice(data);
         if buf.remaining() < 12 {
-            return Err(RtcError::Internal("DCEP Open message too short".to_string()));
+            return Err(RtcError::Internal(
+                "DCEP Open message too short".to_string(),
+            ));
         }
 
         let message_type = buf.get_u8();
@@ -66,7 +68,9 @@ impl DataChannelOpen {
         let protocol_len = buf.get_u16() as usize;
 
         if buf.remaining() < label_len + protocol_len {
-            return Err(RtcError::Internal("DCEP Open message too short for payload".to_string()));
+            return Err(RtcError::Internal(
+                "DCEP Open message too short for payload".to_string(),
+            ));
         }
 
         let label_bytes = buf.split_to(label_len);

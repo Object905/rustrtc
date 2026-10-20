@@ -242,10 +242,11 @@ async fn simulate_stun_respond_delay(sender: &IceSocketWrapper) {
         if ms == 0 {
             return;
         }
-        let is_relayed_or_tcp = matches!(sender, IceSocketWrapper::Turn(_, _)) || matches!(
-            sender,
-            IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _)
-        );
+        let is_relayed_or_tcp = matches!(sender, IceSocketWrapper::Turn(_, _))
+            || matches!(
+                sender,
+                IceSocketWrapper::TcpListener(_) | IceSocketWrapper::TcpStream(_, _, _)
+            );
         if is_relayed_or_tcp {
             return;
         }
@@ -423,7 +424,6 @@ struct IceTransportRunner {
 
 impl IceTransportRunner {
     async fn run(mut self) {
-
         // mDNS responder lifetime: started when `enable_mdns` is set, stopped
         // when the runner loop exits (the guard's Drop signals the task).
         #[cfg(feature = "std")]
@@ -612,7 +612,8 @@ impl IceTransportRunner {
                         }
                     }
                 }
-                GatherArm::Candidate(res) => match res {                    Ok(_) => {
+                GatherArm::Candidate(res) => match res {
+                    Ok(_) => {
                         let inner = self.inner.clone();
                         read_futures.push(Box::pin(async move {
                             perform_connectivity_checks_async(inner).await;
@@ -620,10 +621,8 @@ impl IceTransportRunner {
                     }
                     Err(broadcast::RecvError::Closed) => break,
                     Err(broadcast::RecvError::Lagged(_)) => continue,
-                }
+                },
                 GatherArm::Cmd(cmd) => {
-
-
                     trace!("Runner received command: {:?}", cmd);
                     match cmd {
                         IceCommand::StartGathering => {
@@ -1868,15 +1867,9 @@ impl IceTransport {
         let pair = IceCandidatePair::new(local_candidate, remote_candidate);
         *self.inner.selected_pair.lock() = Some(pair.clone());
         let _ = self.inner.selected_pair_notifier.send(Some(pair));
-        let _ = self
-            .inner
-            .selected_socket
-            .send(Some(socket.clone()));
+        let _ = self.inner.selected_socket.send(Some(socket.clone()));
         let rtcp_socket = rtcp_socket.unwrap_or_else(|| socket.clone());
-        let _ = self
-            .inner
-            .selected_rtcp_socket
-            .send(Some(rtcp_socket));
+        let _ = self.inner.selected_rtcp_socket.send(Some(rtcp_socket));
         let _ = self.inner.set_state(IceTransportState::Connected);
 
         Ok(cand_addr)
@@ -1975,10 +1968,7 @@ impl IceTransport {
             self.inner.gatherer.push_candidate(candidate);
         }
         if let Some(rtcp_socket) = rtcp_socket {
-            let _ = self
-                .inner
-                .selected_rtcp_socket
-                .send(Some(rtcp_socket));
+            let _ = self.inner.selected_rtcp_socket.send(Some(rtcp_socket));
         }
 
         *self.inner.gatherer.state.lock() = IceGathererState::Complete;
@@ -2568,9 +2558,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // complete before its do under asymmetric timing). Keep the selected
         // pair and wait, bounded by nomination_timeout — a dead controlling
         // agent still fails the transport via the PC-level timeout.
-        if pair.local.transport != "tcp"
-            && inner.nomination_complete.borrow().is_none()
-        {
+        if pair.local.transport != "tcp" && inner.nomination_complete.borrow().is_none() {
             debug!(
                 label = inner.config.label.as_deref().unwrap_or("-"),
                 "Controlled checks complete without nomination — waiting for USE-CANDIDATE"
@@ -2622,7 +2610,10 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
             return Some(shared);
         }
         // Factory-bound platform sockets (rtcembed / loopback backends).
-        if let Some(platform) = inner.gatherer.get_platform_socket(pair.local.base_address()) {
+        if let Some(platform) = inner
+            .gatherer
+            .get_platform_socket(pair.local.base_address())
+        {
             return Some(IceSocketWrapper::Platform(platform));
         }
         let socket = inner.gatherer.get_socket(pair.local.base_address());
@@ -2865,14 +2856,14 @@ async fn bind_direct_rtcp_socket(
     Ok((rtcp, candidate))
 }
 
-
 async fn handle_packet(
     packet: &[u8],
     addr: SocketAddr,
     inner: Arc<IceTransportInner>,
     sender: IceSocketWrapper,
     marshal_buf: &mut Vec<u8>,
-) {    if should_drop_packet() {
+) {
+    if should_drop_packet() {
         return;
     }
     inner.last_received_nanos.store(
@@ -4336,9 +4327,8 @@ struct IceGatherer {
     /// ([`crate::platform::net::set_udp_bind_fn`] — rtcembed's embassy-net
     /// backend, or a host-test loopback). Kept so socket resolution can
     /// send from the same base socket the candidate advertises.
-    platform_sockets: Arc<
-        crate::platform::sync::Mutex<Vec<Arc<dyn crate::platform::net::UdpSocket>>>,
-    >,
+    platform_sockets:
+        Arc<crate::platform::sync::Mutex<Vec<Arc<dyn crate::platform::net::UdpSocket>>>>,
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     tcp_listeners: Arc<crate::platform::sync::Mutex<Vec<Arc<TcpListener>>>>,
     tcp_streams: Arc<crate::platform::sync::Mutex<BTreeMap<SocketAddr, IceSocketWrapper>>>,
@@ -5729,11 +5719,7 @@ impl IceSocketWrapper {
     pub fn try_send_to(&self, data: &[u8], addr: SocketAddr) -> RtcResult<usize> {
         match self {
             IceSocketWrapper::Platform(s) => {
-                match <dyn crate::platform::net::UdpSocket>::try_send_to(
-                    s.as_ref(),
-                    data,
-                    addr,
-                ) {
+                match <dyn crate::platform::net::UdpSocket>::try_send_to(s.as_ref(), data, addr) {
                     Ok(len) => Ok(len),
                     Err(e) => Err(RtcError::Internal(alloc::format!(
                         "platform try_send_to: {e}"

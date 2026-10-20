@@ -3025,7 +3025,8 @@ impl PeerConnection {
         is_client: bool,
         profile_opt: Option<u16>,
         rtp_transport: &Arc<RtpTransport>,
-    ) {        // Default to Aes128Sha1_80 if not specified or unknown
+    ) {
+        // Default to Aes128Sha1_80 if not specified or unknown
         let profile = match profile_opt {
             Some(0x0001) => crate::srtp::SrtpProfile::Aes128Sha1_80,
             Some(0x0002) => crate::srtp::SrtpProfile::Aes128Sha1_32,
