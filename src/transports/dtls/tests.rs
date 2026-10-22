@@ -953,6 +953,83 @@ async fn server_handle_client_hello(
         .await
 }
 
+/// Regression: a failed first send of the server flight must not lose it.
+///
+/// `handle_client_hello` sets `server_random` (marking the ClientHello as
+/// handled) before sending the ServerHello..ServerHelloDone flight. When that
+/// send failed - ICE socket not published yet, a transient send error - it
+/// returned before storing `last_flight_records`, so every ClientHello the
+/// client retransmitted took the "retransmission" branch with nothing to
+/// resend, and so did the server's own retransmit timer. The handshake stalled
+/// until its timeout: ICE connected, DTLS stuck in `connecting`, no media.
+#[tokio::test]
+async fn test_server_flight_survives_failed_first_send() -> Result<()> {
+    let client_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let client_addr = client_socket.local_addr()?;
+    let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+
+    // no selected ICE socket yet: the first flight send fails
+    let (server_socket_tx, _) = watch::channel(None);
+    let server_conn = IceConn::new(server_socket_tx.subscribe(), client_addr, None);
+    let (server_dtls, _rx, _runner) =
+        DtlsTransport::new(server_conn, generate_certificate()?, false, 1500, None).await?;
+
+    let client_hello = ClientHello {
+        version: ProtocolVersion::DTLS_1_2,
+        random: Random::new(),
+        session_id: vec![],
+        cookie: vec![],
+        cipher_suites: vec![0xC02B],
+        compression_methods: vec![0],
+        extensions: vec![],
+    };
+    let mut body = BytesMut::new();
+    client_hello.encode(&mut body);
+    let msg = HandshakeMessage {
+        msg_type: HandshakeType::ClientHello,
+        message_seq: 0,
+        fragment_offset: 0,
+        fragment_length: body.len() as u32,
+        total_length: body.len() as u32,
+        body: body.freeze(),
+    };
+    let mut ctx = HandshakeContext::new(None).unwrap();
+    let certificate = generate_certificate()?;
+
+    server_dtls
+        .inner
+        .handle_client_hello(msg.clone(), &mut ctx, &certificate, false)
+        .await
+        .expect("a failed send is retried, not a handshake error");
+    assert!(ctx.server_random.is_some());
+    let flight = ctx
+        .last_flight_records
+        .clone()
+        .expect("flight kept for retransmission despite the failed send");
+
+    // the socket shows up; the client's retransmitted ClientHello must now
+    // get the whole flight
+    server_socket_tx
+        .send(Some(IceSocketWrapper::Udp(server_socket)))
+        .map_err(|e| dtls_err!("socket watch send failed: {e}"))?;
+    server_dtls
+        .inner
+        .handle_client_hello(msg, &mut ctx, &certificate, false)
+        .await?;
+
+    let mut buf = vec![0u8; 2048];
+    for record in &flight {
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client_socket.recv_from(&mut buf),
+        )
+        .await
+        .map_err(|_| dtls_err!("server flight never resent"))??;
+        assert_eq!(&buf[..len], record.as_slice());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_server_accepts_client_hello_offering_supported_suite() -> Result<()> {
     let server_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
