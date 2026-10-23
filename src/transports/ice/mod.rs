@@ -497,57 +497,55 @@ impl IceTransportRunner {
                 let mut turn_tick_fut = core::pin::pin!(turn_refresh_interval.tick());
                 let mut upnp_tick_fut = core::pin::pin!(upnp_refresh_interval.tick());
                 let mut read_next_fut = core::pin::pin!(read_futures.next());
-                loop {
-                    if let Poll::Ready(res) = state_fut.as_mut().poll(cx) {
-                        return Poll::Ready(GatherArm::State(res));
-                    }
-                    if socket_rx_open && let Poll::Ready(v) = socket_fut.as_mut().poll(cx) {
-                        match v {
-                            Some(socket) => return Poll::Ready(GatherArm::Socket(socket)),
-                            None => socket_rx_open = false,
-                        }
-                    }
-                    if let Poll::Ready(res) = cand_fut.as_mut().poll(cx) {
-                        return Poll::Ready(GatherArm::Candidate(res.map(|_| ())));
-                    }
-                    if cmd_rx_open && let Poll::Ready(v) = cmd_fut.as_mut().poll(cx) {
-                        match v {
-                            Some(cmd) => return Poll::Ready(GatherArm::Cmd(cmd)),
-                            None => cmd_rx_open = false,
-                        }
-                    }
-                    if ka_fut.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(GatherArm::Keepalive);
-                    }
-                    if turn_tick_fut.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(GatherArm::TurnRefreshTick);
-                    }
-                    if core::pin::Pin::new(&mut turn_refresh_future)
-                        .poll(cx)
-                        .is_ready()
-                    {
-                        return Poll::Ready(GatherArm::TurnRefreshDone);
-                    }
-                    if upnp_tick_fut.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(GatherArm::UpnpTick);
-                    }
-                    if core::pin::Pin::new(&mut upnp_refresh_future)
-                        .poll(cx)
-                        .is_ready()
-                    {
-                        return Poll::Ready(GatherArm::UpnpDone);
-                    }
-                    if let Poll::Ready(Some(_)) = read_next_fut.as_mut().poll(cx) {
-                        return Poll::Ready(GatherArm::ReadLoopDone);
-                    }
-                    if core::pin::Pin::new(&mut gathering_future)
-                        .poll(cx)
-                        .is_ready()
-                    {
-                        return Poll::Ready(GatherArm::GatheringDone);
-                    }
-                    return Poll::Pending;
+                if let Poll::Ready(res) = state_fut.as_mut().poll(cx) {
+                    return Poll::Ready(GatherArm::State(res));
                 }
+                if socket_rx_open && let Poll::Ready(v) = socket_fut.as_mut().poll(cx) {
+                    match v {
+                        Some(socket) => return Poll::Ready(GatherArm::Socket(socket)),
+                        None => socket_rx_open = false,
+                    }
+                }
+                if let Poll::Ready(res) = cand_fut.as_mut().poll(cx) {
+                    return Poll::Ready(GatherArm::Candidate(res.map(|_| ())));
+                }
+                if cmd_rx_open && let Poll::Ready(v) = cmd_fut.as_mut().poll(cx) {
+                    match v {
+                        Some(cmd) => return Poll::Ready(GatherArm::Cmd(cmd)),
+                        None => cmd_rx_open = false,
+                    }
+                }
+                if ka_fut.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(GatherArm::Keepalive);
+                }
+                if turn_tick_fut.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(GatherArm::TurnRefreshTick);
+                }
+                if core::pin::Pin::new(&mut turn_refresh_future)
+                    .poll(cx)
+                    .is_ready()
+                {
+                    return Poll::Ready(GatherArm::TurnRefreshDone);
+                }
+                if upnp_tick_fut.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(GatherArm::UpnpTick);
+                }
+                if core::pin::Pin::new(&mut upnp_refresh_future)
+                    .poll(cx)
+                    .is_ready()
+                {
+                    return Poll::Ready(GatherArm::UpnpDone);
+                }
+                if let Poll::Ready(Some(_)) = read_next_fut.as_mut().poll(cx) {
+                    return Poll::Ready(GatherArm::ReadLoopDone);
+                }
+                if core::pin::Pin::new(&mut gathering_future)
+                    .poll(cx)
+                    .is_ready()
+                {
+                    return Poll::Ready(GatherArm::GatheringDone);
+                }
+                Poll::Pending
             })
             .await;
             match arm {
@@ -1032,8 +1030,37 @@ impl IceTransportRunner {
     /// by the caller. The future waits up to 5 s for the keepalive response then
     /// removes the transaction from `pending_transactions`.
     async fn run_keepalive_tick(inner: &Arc<IceTransportInner>) -> Option<BoxFuture<'static, ()>> {
-        let state = *inner.state.borrow();
-        if state == IceTransportState::Connected || state == IceTransportState::Disconnected {
+        let mut state = *inner.state.borrow();
+
+        // Invariant watchdog: `Checking` is only valid while no pair is
+        // selected (restart_internal clears the pair BEFORE entering
+        // Checking, and nomination publishes the pair before/with Connected).
+        // A selected pair plus Checking therefore means some path stranded a
+        // live session in Checking. Repair it immediately: keepalives,
+        // disconnect/failed detection, and TURN refresh are all gated on
+        // Connected/Disconnected, so every tick spent in Checking silently
+        // stops consent keepalives and TURN allocation refresh — the 600 s
+        // allocation then expires and media dies mid-call (issue seen on
+        // SIP hold/resume renegotiation). The repair is harmless if it ever
+        // races a legitimate nomination: the transport is heading to
+        // Connected anyway and DTLS start still waits for nomination.
+        if state == IceTransportState::Checking && inner.selected_pair.lock().is_some() {
+            debug!(
+                label = inner.config.label.as_deref().unwrap_or("-"),
+                "ICE invariant repair: Checking with selected pair — restoring Connected"
+            );
+            let _ = inner.set_state(IceTransportState::Connected);
+            state = IceTransportState::Connected;
+        }
+
+        // `Completed` is included even though nothing assigns it yet: if a
+        // future change starts signalling it (RFC 8445 "all pairs checked"),
+        // the keepalive and TURN-refresh timers must keep running, or this
+        // exact silent-death incident recurs.
+        if state == IceTransportState::Connected
+            || state == IceTransportState::Disconnected
+            || state == IceTransportState::Completed
+        {
             if inner.config.transport_mode == crate::TransportMode::WebRtc {
                 let last_nanos = inner.last_received_nanos.load(Ordering::Relaxed);
                 let now_nanos = inner.created_at.elapsed().as_nanos() as u64;
@@ -1153,7 +1180,12 @@ impl IceTransportRunner {
         let _guard = RefreshGuard(&inner.turn_refresh_in_progress);
 
         let state = *inner.state.borrow();
-        if state != IceTransportState::Connected && state != IceTransportState::Disconnected {
+        // Same rationale as the keepalive gate: Completed (if ever signalled)
+        // is a live session whose TURN allocation must keep being refreshed.
+        if state != IceTransportState::Connected
+            && state != IceTransportState::Disconnected
+            && state != IceTransportState::Completed
+        {
             return;
         }
 
@@ -1675,12 +1707,41 @@ impl IceTransport {
 
         self.start_gathering()?;
         self.start_keepalive();
-        {
+        // Decide whether the ICE session actually needs (re-)checking. A plain
+        // renegotiation (e.g. a SIP hold/resume re-INVITE) re-signals the SAME
+        // ice-ufrag/ice-pwd while the selected pair is still live. Per RFC 8445
+        // that session is already valid and must be kept: forcing `Checking`
+        // here flapped the advertised state and stranded the transport there,
+        // because `perform_connectivity_checks_async` returns early when a pair
+        // is already selected, so nothing ever restored `Connected`. Keepalives
+        // and TURN refreshes — both gated on Connected/Disconnected — were then
+        // skipped until the 600 s TURN allocation expired and media died.
+        let credentials_changed = {
             let mut params = self.inner.remote_parameters.lock();
+            let changed = match params.as_ref() {
+                None => true, // first start: nothing validated yet
+                Some(prev) => {
+                    prev.username_fragment != remote.username_fragment
+                        || prev.password != remote.password
+                }
+            };
             *params = Some(remote);
+            changed
+        };
+        let has_selected_pair = self.inner.selected_pair.lock().is_some();
+        if credentials_changed || !has_selected_pair {
+            // New session, credential rotation (ICE restart), or no usable
+            // pair yet: (re-)arm connectivity checks as before.
+            self.inner.set_state(IceTransportState::Checking);
+            self.try_connectivity_checks();
+        } else {
+            // Live session, unchanged credentials: keep the current state.
+            // Only repair a leftover `Checking` so keepalive and TURN refresh
+            // keep running on the already-selected pair.
+            if *self.inner.state.borrow() == IceTransportState::Checking {
+                self.inner.set_state(IceTransportState::Connected);
+            }
         }
-        self.inner.set_state(IceTransportState::Checking);
-        self.try_connectivity_checks();
         Ok(())
     }
 
@@ -2206,8 +2267,16 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         return;
     }
 
-    // If we already have a selected pair, don't run more checks
+    // If we already have a selected pair, don't run more checks. But repair a
+    // stranded `Checking` state first: checks were (re-)armed while a valid
+    // pair was still selected (e.g. a late trickle candidate on a live
+    // session). Leaving the transport in `Checking` silently disabled the
+    // keepalive and TURN refresh timers — both gated on Connected/Disconnected
+    // — until the TURN allocation expired and media stopped.
     if inner.selected_pair.lock().is_some() {
+        if state == IceTransportState::Checking {
+            inner.set_state(IceTransportState::Connected);
+        }
         return;
     }
 
