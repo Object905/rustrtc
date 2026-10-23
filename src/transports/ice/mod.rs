@@ -348,6 +348,9 @@ pub(crate) struct IceTransportInner {
     /// a superseded path (RFC 8445 §8.1.1).
     /// no_std: backed by the 32-bit atomic64 shim.
     nomination_generation: crate::platform::atomic64::AtomicU64,
+    /// Serializes every commit of `selected_pair` together with the socket
+    /// published on `selected_socket` (see [`commit_selected_pair`]).
+    selection_lock: crate::platform::sync::Mutex<()>,
     /// mDNS hostname advertising our host candidates (`enable_mdns`).
     mdns_hostname: Option<String>,
     /// Guards against overlapping `run_turn_refresh` invocations: the refresh
@@ -1422,6 +1425,7 @@ impl IceTransport {
             _nomination_complete_rx: nomination_complete_rx,
             restart_requested: core::sync::atomic::AtomicBool::new(false),
             nomination_generation: crate::platform::atomic64::AtomicU64::new(0),
+            selection_lock: crate::platform::sync::Mutex::new(()),
             mdns_hostname: {
                 #[cfg(feature = "std")]
                 {
@@ -2148,11 +2152,9 @@ impl IceTransport {
     }
 
     pub fn select_pair(&self, pair: IceCandidatePair) {
-        *self.inner.selected_pair.lock() = Some(pair.clone());
-        let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
-        if let Some(socket) = resolve_socket(&self.inner, &pair) {
-            let _ = self.inner.selected_socket.send(Some(socket.clone()));
-            publish_selected_rtcp_socket(&self.inner, Some(socket));
+        {
+            let _selection = self.inner.selection_lock.lock();
+            commit_selected_pair(&self.inner, &pair, None);
         }
         let _ = self.inner.set_state(IceTransportState::Connected);
     }
@@ -2571,11 +2573,9 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             .clone()
             .unwrap_or_else(|| successful_pairs[0].clone());
         let nominated = nominated_pair.is_some();
-        *inner.selected_pair.lock() = Some(final_pair.clone());
-        let _ = inner.selected_pair_notifier.send(Some(final_pair.clone()));
-        if let Some(socket) = resolve_socket(&inner, &final_pair) {
-            let _ = inner.selected_socket.send(Some(socket.clone()));
-            publish_selected_rtcp_socket(&inner, Some(socket));
+        {
+            let _selection = inner.selection_lock.lock();
+            commit_selected_pair(&inner, &final_pair, None);
         }
         debug!(
             label = inner.config.label.as_deref().unwrap_or("-"),
@@ -2599,19 +2599,36 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
         // and this selection must not run again: check rounds re-triggered
         // by late (e.g. peer-reflexive) candidates would otherwise stomp the
         // nominated pair with a locally-preferred one the peer never chose.
-        if inner.nomination_complete.borrow().is_some() {
-            debug!(
-                label = inner.config.label.as_deref().unwrap_or("-"),
-                "ICE checks complete (controlled): keeping peer-nominated pair"
-            );
-            return;
-        }
+        //
+        // Likewise, the first check round to finish wins: every `RunChecks`
+        // (start, each trickled or peer-reflexive candidate) spawns its own
+        // round, and rounds that started before any pair was selected can
+        // finish together. Letting a later round overwrite the selection
+        // races its pair/socket commit against the earlier one's, which can
+        // leave the socket of one pair publishing to the remote of another
+        // (e.g. a bridge-interface socket sending to an en0 address, failing
+        // every DTLS flight with EHOSTDOWN). USE-CANDIDATE still moves the
+        // selection to the peer's choice.
         let pair = &successful_pairs[0];
-        *inner.selected_pair.lock() = Some(pair.clone());
-        let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-        if let Some(socket) = resolve_socket(&inner, pair) {
-            let _ = inner.selected_socket.send(Some(socket.clone()));
-            publish_selected_rtcp_socket(&inner, Some(socket));
+        {
+            let _selection = inner.selection_lock.lock();
+            if inner.nomination_complete.borrow().is_some() {
+                debug!(
+                    label = inner.config.label.as_deref().unwrap_or("-"),
+                    "ICE checks complete (controlled): keeping peer-nominated pair"
+                );
+                return;
+            }
+            if let Some(current) = inner.selected_pair.lock().as_ref() {
+                debug!(
+                    label = inner.config.label.as_deref().unwrap_or("-"),
+                    "ICE checks complete (controlled): keeping pair {} -> {} selected by a concurrent round",
+                    current.local.address,
+                    current.remote.address
+                );
+                return;
+            }
+            commit_selected_pair(&inner, pair, None);
         }
         let _ = inner.set_state(IceTransportState::Connected);
         if pair.local.transport == "tcp" {
@@ -2696,6 +2713,22 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
     }
 }
 
+/// Make `pair` the selected pair and publish the socket that serves it.
+///
+/// The pair (which sets the transport's remote address) and the socket
+/// (which sets the local interface) are separate fields, so a commit is only
+/// consistent if no other commit interleaves with it: callers hold
+/// `inner.selection_lock` across their decision and this call.
+fn commit_selected_pair(
+    inner: &IceTransportInner,
+    pair: &IceCandidatePair,
+    inbound: Option<&IceSocketWrapper>,
+) {
+    *inner.selected_pair.lock() = Some(pair.clone());
+    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
+    publish_selected_socket(inner, pair, inbound);
+}
+
 fn publish_selected_socket(
     inner: &IceTransportInner,
     pair: &IceCandidatePair,
@@ -2736,6 +2769,7 @@ fn commit_verified_nomination(
     pair: &IceCandidatePair,
     sender: &IceSocketWrapper,
 ) -> bool {
+    let _selection = inner.selection_lock.lock();
     if inner
         .nomination_generation
         .load(core::sync::atomic::Ordering::SeqCst)
@@ -2743,9 +2777,7 @@ fn commit_verified_nomination(
     {
         return false;
     }
-    *inner.selected_pair.lock() = Some(pair.clone());
-    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-    publish_selected_socket(inner, pair, Some(sender));
+    commit_selected_pair(inner, pair, Some(sender));
     true
 }
 
@@ -2802,9 +2834,10 @@ async fn complete_controlled_inbound_tcp_nomination(
         inner
             .nomination_generation
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        *inner.selected_pair.lock() = Some(pair.clone());
-        let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-        publish_selected_socket(&inner, &pair, Some(sender));
+        {
+            let _selection = inner.selection_lock.lock();
+            commit_selected_pair(&inner, &pair, Some(sender));
+        }
         let _ = inner.set_state(IceTransportState::Connected);
     } else {
         debug!(
@@ -2823,9 +2856,10 @@ async fn complete_controlled_inbound_tcp_nomination(
         };
         if let (Some(l), Some(r)) = (local_cand, remote_cand) {
             let pair = IceCandidatePair::new(l.clone(), r.clone());
-            *inner.selected_pair.lock() = Some(pair.clone());
-            let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-            publish_selected_socket(&inner, &pair, Some(sender));
+            {
+                let _selection = inner.selection_lock.lock();
+                commit_selected_pair(&inner, &pair, Some(sender));
+            }
             let _ = inner.set_state(IceTransportState::Connected);
         } else {
             let _ = inner.selected_socket.send(Some(sender.clone()));
@@ -3229,9 +3263,8 @@ async fn handle_stun_request(
             let mut new_remote = pair.remote.clone();
             new_remote.address = addr;
             let new_pair = IceCandidatePair::new(pair.local.clone(), new_remote);
-            *inner.selected_pair.lock() = Some(new_pair.clone());
-            let _ = inner.selected_pair_notifier.send(Some(new_pair.clone()));
-            publish_selected_socket(&inner, &new_pair, Some(sender));
+            let _selection = inner.selection_lock.lock();
+            commit_selected_pair(&inner, &new_pair, Some(sender));
         }
     }
 
@@ -3318,6 +3351,9 @@ async fn handle_stun_request(
             };
 
             if let Some(pair) = pair {
+                // Decide and commit atomically w.r.t. concurrent check rounds
+                // (see `commit_selected_pair`).
+                let _selection = inner.selection_lock.lock();
                 let same_pair = {
                     let selected = inner.selected_pair.lock();
                     selected
@@ -3344,9 +3380,7 @@ async fn handle_stun_request(
                         pair.local.address,
                         pair.remote.address
                     );
-                    *inner.selected_pair.lock() = Some(pair.clone());
-                    let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
-                    publish_selected_socket(&inner, &pair, Some(sender));
+                    commit_selected_pair(&inner, &pair, Some(sender));
                 } else {
                     // A second nomination on a DIFFERENT pair while already
                     // connected: verify the new path with a same-path round

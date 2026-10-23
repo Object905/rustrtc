@@ -5674,3 +5674,114 @@ async fn superseded_nomination_does_not_override_newer() -> Result<()> {
 
     Ok(())
 }
+
+/// Answer every binding request arriving on `sock`, but only once `release`
+/// fires (immediately when it already has). Requests seen before the release
+/// are answered in a batch, keeping the checking agent's round in flight.
+/// `seen` is notified for each request received.
+async fn answer_binding_checks(
+    sock: UdpSocket,
+    mut release: watch::Receiver<bool>,
+    seen: Arc<tokio::sync::Notify>,
+) {
+    let mut held = Vec::new();
+    let mut buf = [0u8; 1500];
+    loop {
+        tokio::select! {
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, from)) = r else { return };
+                let Ok(m) = StunMessage::decode(&buf[..n]) else { continue };
+                if m.class != StunClass::Request {
+                    continue;
+                }
+                held.push((m.transaction_id, from));
+                seen.notify_one();
+            }
+            r = release.changed(), if !*release.borrow() => {
+                if r.is_err() {
+                    return;
+                }
+            }
+        }
+        if *release.borrow() {
+            for (tx_id, from) in held.drain(..) {
+                let resp = StunMessage::binding_success_response(tx_id, from);
+                if let Ok(bytes) = resp.encode(None, true) {
+                    let _ = sock.send_to(&bytes, from).await;
+                }
+            }
+        }
+    }
+}
+
+/// A connectivity-check round that finishes after another round already
+/// selected a pair must not overwrite that selection on the controlled side.
+///
+/// Every `RunChecks` (start, each trickled or peer-reflexive candidate) spawns
+/// its own round. Rounds that began before any pair was selected used to each
+/// commit their best pair, writing `selected_pair` and the selected socket
+/// separately; when two finished together the writes interleaved and left the
+/// socket of one pair sending to the remote of the other. On a multi-homed
+/// host that sent every DTLS flight from a bridge-interface socket to an en0
+/// address (EHOSTDOWN) until the handshake timed out. The first round to
+/// commit now wins; only USE-CANDIDATE moves the selection afterwards.
+#[tokio::test]
+async fn controlled_late_check_round_keeps_first_selection() -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    let mut cfg = RtcConfiguration::default();
+    cfg.bind_ip = Some("127.0.0.1".into());
+    let (t, runner) = IceTransportBuilder::new(cfg)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner);
+    timeout(Duration::from_secs(5), async {
+        while t.gather_state() != IceGathererState::Complete {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("gathering did not complete in time")?;
+
+    // Round 1 checks the slow peer, which holds its answers until released.
+    let slow = UdpSocket::bind("127.0.0.1:0").await?;
+    let slow_addr = slow.local_addr()?;
+    let (release_slow, release_slow_rx) = watch::channel(false);
+    let slow_seen = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(answer_binding_checks(
+        slow,
+        release_slow_rx,
+        slow_seen.clone(),
+    ));
+    t.add_remote_candidate(IceCandidate::host(slow_addr, 1));
+    t.start(IceParameters::new(
+        "peer_ufrag",
+        "peer_pwd_0123456789abcdef",
+    ))
+    .await?;
+    timeout(Duration::from_secs(5), slow_seen.notified())
+        .await
+        .context("round 1 never checked the slow peer")?;
+
+    // Round 2 checks the fast peer, succeeds and selects it.
+    let fast = UdpSocket::bind("127.0.0.1:0").await?;
+    let fast_addr = fast.local_addr()?;
+    let (_release_fast, release_fast_rx) = watch::channel(true);
+    tokio::spawn(answer_binding_checks(
+        fast,
+        release_fast_rx,
+        Arc::new(tokio::sync::Notify::new()),
+    ));
+    t.add_remote_candidate(IceCandidate::host(fast_addr, 1));
+    wait_selected_remote(&t, fast_addr, Duration::from_secs(5)).await?;
+
+    // Let round 1 succeed too; it must not take the selection over.
+    release_slow.send(true)?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let selected = t.get_selected_pair().expect("selected pair");
+    assert_eq!(
+        selected.remote.address, fast_addr,
+        "a later check round overwrote the controlled side's selected pair"
+    );
+    Ok(())
+}
