@@ -470,6 +470,32 @@ impl Drop for DtlsTransport {
 }
 
 impl DtlsInner {
+    /// Sends a new handshake flight and keeps it for retransmission.
+    ///
+    /// The flight is stored before sending and a failed send is only logged,
+    /// the same as a failed retransmit. By the time a flight is sent the
+    /// handshake state has already moved past the message that triggered it
+    /// (e.g. `server_random` is set, so a repeated ClientHello is treated as a
+    /// retransmission): bailing out with nothing stored would leave every
+    /// later retransmit - ours and the peer's - with nothing to resend,
+    /// stalling the handshake until it times out.
+    async fn send_flight(&self, ctx: &mut HandshakeContext, records: Vec<Vec<u8>>) {
+        if let Err(e) = self.conn.send_dtls_record_batch(&records).await {
+            // IceConn::send returns RtcError; the transient/unreachable cases
+            // (macOS err65 included) are only distinguishable textually
+            let text = e.to_string();
+            if text.contains("unreachable")
+                || text.contains("No selected socket")
+                || text.contains("Remote address not set")
+            {
+                debug!("Failed to send DTLS flight, will retransmit: {}", e);
+            } else {
+                warn!("Failed to send DTLS flight, will retransmit: {}", e);
+            }
+        }
+        ctx.last_flight_records = Some(records);
+    }
+
     async fn handle_retransmit(&self, ctx: &HandshakeContext, _is_client: bool) {
         if *self.state.lock() != DtlsState::Handshaking {
             return;
@@ -1239,8 +1265,7 @@ impl DtlsInner {
         )?);
         ctx.message_seq += 1;
 
-        self.conn.send_dtls_record_batch(&flight_records).await?;
-        ctx.last_flight_records = Some(flight_records);
+        self.send_flight(ctx, flight_records).await;
 
         Ok(())
     }
@@ -1430,8 +1455,7 @@ impl DtlsInner {
                 ctx.session_keys.as_ref(),
                 is_client,
             )?);
-            self.conn.send_dtls_record_batch(&flight_records).await?;
-            ctx.last_flight_records = Some(flight_records);
+            self.send_flight(ctx, flight_records).await;
             // message_seq += 1; // End of handshake
 
             if let Some(keys) = &ctx.session_keys {
@@ -1554,8 +1578,7 @@ impl DtlsInner {
                 None,
                 is_client,
             )?;
-            self.conn.send(&buf).await?;
-            ctx.last_flight_records = Some(vec![buf]);
+            self.send_flight(ctx, vec![buf]).await;
             ctx.message_seq += 1;
             // After sending a new ClientHello in response to HelloVerifyRequest,
             // the server will restart its own handshake message_seq counter.
@@ -1842,8 +1865,7 @@ impl DtlsInner {
             ctx.session_keys.as_ref(),
             is_client,
         )?);
-        self.conn.send_dtls_record_batch(&flight_records).await?;
-        ctx.last_flight_records = Some(flight_records);
+        self.send_flight(ctx, flight_records).await;
         ctx.message_seq += 1;
 
         Ok(())
@@ -1910,17 +1932,16 @@ impl DtlsInner {
             handshake_msg.encode(&mut buf);
             ctx.handshake_messages.extend_from_slice(&buf);
 
-            let buf = self
-                .send_handshake_message(
-                    handshake_msg,
-                    ctx.epoch,
-                    &mut ctx.sequence_number,
-                    None,
-                    is_client,
-                )
-                .await?;
-            trace!("ClientHello sent ({} bytes)", buf.len());
-            ctx.last_flight_records = Some(vec![buf]);
+            let buf = self.build_handshake_record(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                None,
+                is_client,
+            )?;
+            let len = buf.len();
+            self.send_flight(&mut ctx, vec![buf]).await;
+            trace!("ClientHello sent ({} bytes)", len);
             ctx.message_seq += 1;
         }
 
@@ -2091,35 +2112,6 @@ impl DtlsInner {
 
         let mut buf = BytesMut::new();
         record.encode(&mut buf);
-        Ok(buf.to_vec())
-    }
-
-    async fn send_handshake_message(
-        &self,
-        msg: HandshakeMessage,
-        epoch: u16,
-        sequence_number: &mut u64,
-        session_keys: Option<&SessionKeys>,
-        is_client: bool,
-    ) -> Result<Vec<u8>> {
-        let buf =
-            self.build_handshake_record(msg, epoch, sequence_number, session_keys, is_client)?;
-        if let Err(e) = self.conn.send(&buf).await {
-            // IceConn::send now returns RtcError (no_std-graduated); the
-            // io::ErrorKind distinction is preserved textually for the
-            // transient/unreachable cases (macOS err65 included).
-            let text = e.to_string();
-            if text.contains("unreachable")
-                || text.contains("No selected socket")
-                || text.contains("Remote address not set")
-            {
-                debug!("Failed to send DTLS record: {}", e);
-            } else {
-                warn!("Failed to send DTLS record: {}", e);
-            }
-            return Err(e);
-        }
-
         Ok(buf.to_vec())
     }
 }

@@ -3654,6 +3654,105 @@ async fn use_candidate_follows_renomination_to_higher_priority_pair() -> Result<
     Ok(())
 }
 
+/// STUN attribute types present in a raw message (`StunDecoded` doesn't
+/// expose PRIORITY / ICE-CONTROLLED).
+fn stun_attribute_types(raw: &[u8]) -> Vec<u16> {
+    let mut types = Vec::new();
+    let mut pos = 20;
+    while pos + 4 <= raw.len() {
+        let typ = u16::from_be_bytes([raw[pos], raw[pos + 1]]);
+        let len = u16::from_be_bytes([raw[pos + 2], raw[pos + 3]]) as usize;
+        types.push(typ);
+        pos += 4 + len.div_ceil(4) * 4;
+    }
+    types
+}
+
+/// The controlled agent's path-verification check must be a regular
+/// connectivity check: retransmitted, and carrying PRIORITY and ICE-CONTROLLED.
+///
+/// It used to be sent exactly once without either attribute. A single lost
+/// request (or response) - or a peer ignoring the malformed check - kept the
+/// session on the pair the controlling peer had abandoned: STUN kept working on
+/// the new path (responses go back where requests came from) while DTLS/SRTP
+/// went to the old one, so the call connected with no media.
+#[tokio::test]
+async fn use_candidate_verification_is_retransmitted() -> Result<()> {
+    const PRIORITY: u16 = 0x0024;
+    const ICE_CONTROLLED: u16 = 0x8029;
+
+    let (t1, t2) = setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+    assert!(
+        wait_ice_connected(t1.subscribe_state(), Duration::from_secs(10)).await,
+        "controlling agent failed to connect"
+    );
+    let mut nom_rx = t2.subscribe_nomination_complete();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if nom_rx.borrow_and_update().is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            if nom_rx.changed().await.is_err() {
+                anyhow::bail!("nomination channel closed");
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for nomination")??;
+    let nominated_pair = t2
+        .get_selected_pair()
+        .expect("controlled side must have a selected pair after nomination");
+
+    let second_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let second_addr = second_socket.local_addr()?;
+    t2.add_remote_candidate(IceCandidate::host(second_addr, 1));
+
+    // re-nominate from the second socket
+    let controlled_addr = nominated_pair.local.base_address();
+    let mut msg = StunMessage::binding_request(random_bytes::<12>(), None);
+    msg.attributes.push(StunAttribute::UseCandidate);
+    second_socket
+        .send_to(&msg.encode(None, false)?, controlled_addr)
+        .await?;
+
+    // drop the first verification check, answer its retransmission
+    let mut buf = [0u8; 1500];
+    let mut checks = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("verification check seen {checks} time(s), never retransmitted");
+        }
+        let (n, from) = timeout(remaining, second_socket.recv_from(&mut buf)).await??;
+        let m = StunMessage::decode(&buf[..n])?;
+        if m.class != StunClass::Request || m.method != StunMethod::Binding {
+            continue; // the response to our own nomination request
+        }
+        let types = stun_attribute_types(&buf[..n]);
+        assert!(
+            types.contains(&PRIORITY),
+            "verification check without PRIORITY"
+        );
+        assert!(
+            types.contains(&ICE_CONTROLLED),
+            "verification check without ICE-CONTROLLED"
+        );
+        checks += 1;
+        if checks == 1 {
+            continue; // lost
+        }
+        let resp = StunMessage::binding_success_response(m.transaction_id, second_addr);
+        second_socket
+            .send_to(&resp.encode(None, true)?, from)
+            .await?;
+        break;
+    }
+
+    wait_selected_remote(&t2.clone(), second_addr, Duration::from_secs(10)).await?;
+    Ok(())
+}
+
 /// ICE-layer latching (same port, different IP retarget) must not apply to
 /// WebRTC transports: the SRTP media path stays pinned to the nominated pair.
 /// In RTP mode the retarget remains enabled (legacy trunk behaviour).

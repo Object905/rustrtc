@@ -3073,6 +3073,7 @@ async fn handle_packet(
 async fn verify_nominated_path(
     sender: &IceSocketWrapper,
     addr: SocketAddr,
+    local_priority: u32,
     inner: Arc<IceTransportInner>,
 ) -> bool {
     let remote_params = inner.remote_parameters.lock().clone();
@@ -3081,38 +3082,64 @@ async fn verify_nominated_path(
     };
     let local_params = inner.local_parameters.lock().clone();
 
+    // a regular connectivity check (RFC 8445 §7.1): PRIORITY and the role
+    // attribute are mandatory, a peer may reject or ignore a request without
     let tx_id = random_bytes::<12>();
     let mut msg = StunMessage::binding_request(tx_id, Some("rustrtc"));
     msg.attributes.push(StunAttribute::Username(format!(
         "{}:{}",
         rp.username_fragment, local_params.username_fragment
     )));
+    msg.attributes.push(StunAttribute::Priority(local_priority));
+    msg.attributes
+        .push(StunAttribute::IceControlled(local_params.tie_breaker));
     let bytes = match msg.encode(Some(rp.password.as_bytes()), true) {
         Ok(b) => b,
         Err(_) => return false,
     };
 
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
     {
         let mut map = inner.pending_transactions.lock();
         map.insert(tx_id, tx);
     }
+    let _guard = TransactionGuard {
+        map: &inner.pending_transactions,
+        tx_id,
+    };
 
-    if let Err(e) = sender.send_to(&bytes, addr).await {
-        inner.pending_transactions.lock().remove(&tx_id);
-        debug!("Path verification send to {} failed: {}", addr, e);
-        return false;
-    }
+    // retransmitted like any other check: a single lost request or response
+    // would otherwise leave the session on a path the peer has abandoned
+    let max_timeout = inner.config.stun_timeout;
+    let start = Instant::now();
+    let mut rto = Duration::from_millis(500);
+    loop {
+        if let Err(e) = sender.send_to(&bytes, addr).await {
+            // transient (route setup etc.) - the next RTO retries
+            debug!("Path verification send to {} failed: {}", addr, e);
+        }
 
-    let verified = with_timeout(inner.config.stun_timeout, rx)
-        .await
-        .map(|res| res.is_ok())
-        .unwrap_or(false);
-    if !verified {
-        let mut map = inner.pending_transactions.lock();
-        map.remove(&tx_id);
+        let timeout_fut = crate::platform::task::sleep(max_timeout.saturating_sub(start.elapsed()));
+        let rto_fut = crate::platform::task::sleep(rto);
+        let mut timeout_fut = core::pin::pin!(timeout_fut);
+        let mut rto_fut = core::pin::pin!(rto_fut);
+        match crate::platform::select::select3(&mut rx, &mut timeout_fut, &mut rto_fut).await {
+            crate::platform::select::Which3::A(res) => {
+                return res.is_ok_and(|msg| msg.class == StunClass::SuccessResponse);
+            }
+            crate::platform::select::Which3::B(_) => return false,
+            crate::platform::select::Which3::C(_) => {
+                if start.elapsed() >= max_timeout {
+                    return false;
+                }
+                trace!(
+                    "Retransmitting path verification to {} tx={:?}",
+                    addr, tx_id
+                );
+                rto = core::cmp::min(rto * 2, Duration::from_millis(1600));
+            }
+        }
     }
-    verified
 }
 
 async fn handle_stun_request(
@@ -3339,7 +3366,13 @@ async fn handle_stun_request(
                     let sender2 = sender.clone();
                     let pair2 = pair.clone();
                     crate::platform::task::spawn(async move {
-                        let verified = verify_nominated_path(&sender2, addr, inner2.clone()).await;
+                        let verified = verify_nominated_path(
+                            &sender2,
+                            addr,
+                            pair2.local.priority,
+                            inner2.clone(),
+                        )
+                        .await;
                         if !verified {
                             debug!(
                                 label = inner2.config.label.as_deref().unwrap_or("-"),
