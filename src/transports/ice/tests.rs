@@ -1028,6 +1028,443 @@ async fn wait_for_selected_pair(
     .context("timed out waiting for selected pair")?
 }
 
+/// Regression: a plain renegotiation (e.g. a SIP hold/resume re-INVITE)
+/// re-signals the SAME ice-ufrag/ice-pwd while the selected pair is still
+/// live. `IceTransport::start` used to force `Checking` unconditionally; the
+/// connectivity checks then early-returned (pair already selected) and nothing
+/// ever restored `Connected`, so the keepalive and TURN-refresh timers — both
+/// gated on Connected/Disconnected — stopped until the 600 s TURN allocation
+/// expired and media died.
+#[tokio::test]
+#[serial]
+async fn test_hold_renegotiation_keeps_connected_state() -> Result<()> {
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+
+    let mut ctrl_state = controlling.subscribe_state();
+    let mut ctrd_state = controlled.subscribe_state();
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
+
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await
+            && wait_ice_connected(ctrd_state, Duration::from_secs(10)).await,
+        "pair must connect before the renegotiation"
+    );
+    let ctrl_pair = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;
+    let ctrd_pair = wait_for_selected_pair(&controlled, Duration::from_secs(10)).await?;
+
+    // "Hold" renegotiation: identical remote parameters, selected pair alive.
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
+
+    // The session must never drop into Checking, and must stay Connected.
+    assert_ne!(
+        controlling.state(),
+        IceTransportState::Checking,
+        "controlling side must not flap to Checking on a hold renegotiation"
+    );
+    assert_ne!(
+        controlled.state(),
+        IceTransportState::Checking,
+        "controlled side must not flap to Checking on a hold renegotiation"
+    );
+    // Keep sampling for a while: the bug left the transport stuck in Checking
+    // because nothing ever restored Connected.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        matches!(
+            controlling.state(),
+            IceTransportState::Connected | IceTransportState::Completed
+        ),
+        "controlling side is {:?}, expected Connected/Completed",
+        controlling.state()
+    );
+    assert!(
+        matches!(
+            controlled.state(),
+            IceTransportState::Connected | IceTransportState::Completed
+        ),
+        "controlled side is {:?}, expected Connected/Completed",
+        controlled.state()
+    );
+
+    // The selected pair must be untouched — media keeps flowing on the same
+    // path without a re-nomination.
+    let ctrl_now = controlling
+        .get_selected_pair()
+        .context("selected pair lost on controlling side")?;
+    let ctrd_now = controlled
+        .get_selected_pair()
+        .context("selected pair lost on controlled side")?;
+    assert_eq!(
+        (ctrl_now.local.address, ctrl_now.remote.address),
+        (ctrl_pair.local.address, ctrl_pair.remote.address)
+    );
+    assert_eq!(
+        (ctrd_now.local.address, ctrd_now.remote.address),
+        (ctrd_pair.local.address, ctrd_pair.remote.address)
+    );
+    Ok(())
+}
+
+/// The keepalive tick doubles as an invariant watchdog: `Checking` WITH a
+/// selected pair is a stranded live session (any future writer that
+/// reintroduces the hold-renegotiation defect). The tick must self-heal it
+/// back to Connected so the keepalive / TURN-refresh timers resume, instead of
+/// silently stopping until the 600 s TURN allocation expires.
+#[tokio::test]
+#[serial]
+async fn test_keepalive_tick_repairs_stranded_checking_with_selected_pair() -> Result<()> {
+    let (transport, runner) = IceTransportBuilder::new(RtcConfiguration::default()).build();
+    tokio::spawn(runner);
+
+    transport.start_gathering()?;
+    let local = {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(c) = transport.local_candidates().first() {
+                break c.clone();
+            }
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(5),
+                "no host candidate"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    transport.set_remote_parameters(IceParameters::new("remote-ufrag", "remote-pwd"));
+    let remote = IceCandidate::host("127.0.0.1:19999".parse().unwrap(), 1);
+    let pair = IceCandidatePair::new(local, remote);
+    *transport.inner.selected_pair.lock() = Some(pair.clone());
+
+    // 1) Stranded state: Checking + live pair → repaired to Connected, and
+    //    the pair's keepalive is sent in the same tick.
+    let _ = transport.inner.state.send(IceTransportState::Checking);
+    let sent = IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Connected,
+        "stranded Checking with a selected pair must self-heal to Connected"
+    );
+    assert!(
+        sent.is_some(),
+        "keepalive must resume immediately after the repair"
+    );
+
+    // 2) Guard: Checking WITHOUT a pair is a legitimate restart state and
+    //    must be left alone (checks are meant to re-run).
+    *transport.inner.selected_pair.lock() = None;
+    let _ = transport.inner.state.send(IceTransportState::Checking);
+    IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Checking,
+        "legitimate Checking (no pair) must not be touched"
+    );
+
+    // 3) Completed is a live session state: keepalives keep flowing (gate
+    //    must not silently stop the timers on it).
+    *transport.inner.selected_pair.lock() = Some(pair);
+    let _ = transport.inner.state.send(IceTransportState::Completed);
+    let sent = IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert_eq!(transport.state(), IceTransportState::Completed);
+    assert!(
+        sent.is_some(),
+        "keepalive must run in Completed state (live session)"
+    );
+    Ok(())
+}
+
+/// The incident mechanism, end to end against a real TURN server: after a
+/// hold renegotiation (`start` with UNCHANGED credentials) the TURN refresh
+/// timer must keep refreshing the allocation. Pre-fix, the renegotiation
+/// stranded the transport in `Checking` and `run_turn_refresh` silently
+/// early-returned on its Connected/Disconnected gate until the 600 s
+/// allocation expired and media died.
+///
+/// Observability: the client nonce is poisoned with a marker first; a real
+/// refresh round-trip provokes a 401/438 from the server, whose retry path
+/// calls `update_nonce`. If the nonce is still the marker afterwards, no
+/// refresh happened.
+#[tokio::test]
+#[serial]
+async fn test_hold_renegotiation_does_not_stop_turn_refresh() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let (transport, client, relayed) = setup_turn_transport(&turn_server).await?;
+    let remote_params = IceParameters::new("hold-ufrag", "hold-pwd");
+
+    // Initial negotiation: session established, pair nominated.
+    transport.start(remote_params.clone()).await?;
+    let (relay_candidate, remote) = fabricated_relay_pair(&transport, relayed);
+    *transport.inner.selected_pair.lock() = Some(IceCandidatePair::new(relay_candidate, remote));
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+
+    // Hold renegotiation: same credentials re-signalled (PBX ICEStart).
+    transport.start(remote_params.clone()).await?;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Connected,
+        "hold renegotiation must keep the live session Connected"
+    );
+
+    // Consent keepalive for the selected pair must still be sent.
+    let sent = IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert!(sent.is_some(), "keepalive must keep flowing after hold");
+
+    // TURN refresh must still run and actually reach the server.
+    assert_refresh_rotates_nonce(&transport, &client).await?;
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+/// Bad-network variant: the renegotiation arrives while the transport is
+/// already `Disconnected` (media stalled, pair still selected). The
+/// renegotiation must NOT force `Checking` (the pre-fix behavior that killed
+/// the TURN allocations), and keepalive + TURN refresh must keep running so
+/// the session can recover and the allocation survives the outage.
+#[tokio::test]
+#[serial]
+async fn test_hold_renegotiation_while_disconnected_keeps_timers_alive() -> Result<()> {
+    let mut turn_server = TestTurnServer::start().await?;
+    let (transport, client, relayed) = setup_turn_transport(&turn_server).await?;
+    let remote_params = IceParameters::new("hold-ufrag", "hold-pwd");
+
+    transport.start(remote_params.clone()).await?;
+    let (relay_candidate, remote) = fabricated_relay_pair(&transport, relayed);
+    *transport.inner.selected_pair.lock() = Some(IceCandidatePair::new(relay_candidate, remote));
+    let _ = transport.inner.state.send(IceTransportState::Connected);
+
+    // Network degrades: no inbound traffic for a while → Disconnected, pair
+    // stays selected (keepalive sends, nothing comes back).
+    let _ = transport.inner.state.send(IceTransportState::Disconnected);
+    transport.start(remote_params.clone()).await?;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Disconnected,
+        "renegotiation while Disconnected must keep the state (no forced Checking)"
+    );
+    assert_ne!(
+        transport.state(),
+        IceTransportState::Checking,
+        "stranding a degraded session in Checking stops TURN refresh until expiry"
+    );
+
+    // TURN refresh is still allowed in Disconnected — the allocation must
+    // survive the outage.
+    assert_refresh_rotates_nonce(&transport, &client).await?;
+
+    turn_server.stop().await?;
+    Ok(())
+}
+
+/// Bad-network variant for the keepalive invariant watchdog: self-healing a
+/// stranded `Checking` must NOT mask a genuinely dead connection. With fresh
+/// traffic the repair keeps the session `Connected`; with no inbound traffic
+/// beyond `ice_connection_timeout` the same tick must fail the transport
+/// (visible failure beats the incident's silent death).
+#[tokio::test]
+#[serial]
+async fn test_keepalive_repair_does_not_mask_real_outage() -> Result<()> {
+    // Short timeouts so the outage is testable in milliseconds.
+    let config = RtcConfigurationBuilder::new()
+        .ice_disconnect_threshold(Duration::from_millis(150))
+        .ice_connection_timeout(Duration::from_millis(400))
+        .build();
+    let (transport, runner) = IceTransportBuilder::new(config).build();
+    tokio::spawn(runner);
+
+    transport.start_gathering()?;
+    let local = {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(c) = transport.local_candidates().first() {
+                break c.clone();
+            }
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(5),
+                "no host candidate"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    transport.set_remote_parameters(IceParameters::new("outage-ufrag", "outage-pwd"));
+    let remote = IceCandidate::host("127.0.0.1:19998".parse().unwrap(), 1);
+    let pair = IceCandidatePair::new(local, remote);
+
+    // Case 1 — live traffic (the incident shape: media kept flowing over the
+    // old pair): stranded Checking + fresh last_received → repaired to
+    // Connected and STAYS Connected.
+    *transport.inner.selected_pair.lock() = Some(pair.clone());
+    transport.inner.last_received_nanos.store(
+        transport.inner.created_at.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    let _ = transport.inner.state.send(IceTransportState::Checking);
+    let sent = IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Connected,
+        "repair must restore Connected while traffic is fresh"
+    );
+    assert!(sent.is_some());
+    // A later tick must not flap it away again while traffic stays fresh.
+    transport.inner.last_received_nanos.store(
+        transport.inner.created_at.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Connected,
+        "fresh traffic must keep the repaired session Connected"
+    );
+
+    // Case 2 — genuinely dead link: stranded Checking + no inbound traffic
+    // past ice_connection_timeout → the repair runs, then the same watchdog
+    // marks the transport Failed (detectable failure, never silent).
+    transport
+        .inner
+        .last_received_nanos
+        .store(1, Ordering::Relaxed);
+    let _ = transport.inner.state.send(IceTransportState::Checking);
+    tokio::time::sleep(Duration::from_millis(450)).await; // > ice_connection_timeout
+    IceTransportRunner::run_keepalive_tick(&transport.inner).await;
+    assert_eq!(
+        transport.state(),
+        IceTransportState::Failed,
+        "repair must not mask a real outage: no traffic for ice_connection_timeout ⇒ Failed"
+    );
+    Ok(())
+}
+
+/// Real TURN server + real allocation, wired into a spawned transport
+/// runner and TURN read loop (so refresh transactions get dispatched).
+/// Returns the transport, the TURN client, and the allocation's relayed
+/// address (for building a relay local candidate).
+async fn setup_turn_transport(
+    turn_server: &TestTurnServer,
+) -> Result<(IceTransport, Arc<TurnClient>, SocketAddr)> {
+    let uri = IceServerUri::parse(&turn_server.turn_url())?;
+    let server =
+        IceServer::new(vec![turn_server.turn_url()]).with_credential(TEST_USERNAME, TEST_PASSWORD);
+
+    let client = Arc::new(TurnClient::connect(&uri, false).await?);
+    let creds = TurnCredentials::from_server(&server)?;
+    let alloc = client.allocate(creds).await?;
+
+    let mut config = RtcConfiguration::default();
+    config.ice_transport_policy = IceTransportPolicy::Relay;
+    config.ice_servers.push(server);
+    let (transport, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    {
+        let mut clients = transport.inner.gatherer.turn_clients.lock();
+        clients.insert(alloc.relayed_address, client.clone());
+    }
+    let inner_clone = transport.inner.clone();
+    let client_clone = client.clone();
+    let relayed = alloc.relayed_address;
+    tokio::spawn(async move {
+        IceTransportRunner::run_turn_read_loop(client_clone, relayed, inner_clone).await;
+    });
+    Ok((transport, client, relayed))
+}
+
+/// A relay local candidate (registered under the live allocation) paired with
+/// a fake remote host candidate, as the refresh tests use.
+fn fabricated_relay_pair(
+    transport: &IceTransport,
+    relayed: SocketAddr,
+) -> (IceCandidate, IceCandidate) {
+    let relay_candidate = IceCandidate::relay(relayed, 1, "udp");
+    transport
+        .inner
+        .gatherer
+        .local_candidates
+        .lock()
+        .push(relay_candidate.clone());
+    let remote = IceCandidate::host("127.0.0.1:19999".parse().unwrap(), 1);
+    (relay_candidate, remote)
+}
+
+const POISON_NONCE: &str = "stale-poison-nonce";
+
+/// Prove that a TURN refresh really ran: poison the stored nonce, run
+/// `run_turn_refresh`, then verify the server rotated it (401/438 → retry
+/// updates the nonce). If the state gate silently skipped the refresh, the
+/// marker nonce survives and the assertion fails.
+async fn assert_refresh_rotates_nonce(
+    transport: &IceTransport,
+    client: &Arc<TurnClient>,
+) -> Result<()> {
+    client
+        .update_nonce(TEST_REALM.to_string(), POISON_NONCE.to_string())
+        .await;
+
+    let refreshed = timeout(
+        Duration::from_secs(4),
+        IceTransportRunner::run_turn_refresh(&transport.inner),
+    )
+    .await;
+    anyhow::ensure!(
+        refreshed.is_ok(),
+        "run_turn_refresh must complete against a live TURN server"
+    );
+
+    let (bytes, _tx_id) = client.create_refresh_packet().await?;
+    let nonce = StunMessage::decode(&bytes)?.nonce;
+    anyhow::ensure!(
+        nonce.as_deref() != Some(POISON_NONCE),
+        "TURN refresh did not reach the server (nonce still poisoned) — \
+         the state gate skipped it and the allocation will expire in 600 s"
+    );
+    Ok(())
+}
+
+/// Companion guard for the fix above: a genuine credential change (ICE
+/// restart) must still tear the session down into `Checking` with the selected
+/// pair cleared, so checks re-run end-to-end.
+#[tokio::test]
+#[serial]
+async fn test_credential_change_still_restarts_checks() -> Result<()> {
+    let (controlling, controlled) =
+        setup_host_pair(RtcConfiguration::default(), RtcConfiguration::default()).await;
+
+    let mut ctrl_state = controlling.subscribe_state();
+    let mut ctrd_state = controlled.subscribe_state();
+    controlling.start(controlled.local_parameters()).await?;
+    controlled.start(controlling.local_parameters()).await?;
+    assert!(
+        wait_ice_connected(ctrl_state, Duration::from_secs(10)).await
+            && wait_ice_connected(ctrd_state, Duration::from_secs(10)).await,
+        "pair must connect before the restart"
+    );
+    let _ = wait_for_selected_pair(&controlling, Duration::from_secs(10)).await?;
+
+    // The peer re-signals DIFFERENT credentials: this is a remote restart and
+    // must reset the session even though a pair was selected.
+    controlling
+        .start(IceParameters::new(
+            "restart-ufrag",
+            "restart-pwd-long-enough",
+        ))
+        .await?;
+
+    assert_eq!(
+        controlling.state(),
+        IceTransportState::Checking,
+        "credential change must re-arm connectivity checks"
+    );
+    assert!(
+        controlling.get_selected_pair().is_none(),
+        "credential change must clear the selected pair"
+    );
+    Ok(())
+}
+
 /// Test that ICE does NOT transition to Failed when the first batch of
 /// connectivity checks yields no successful pairs (e.g. initial host-only
 /// remote candidates are unreachable).  After adding the correct (reachable)
@@ -5235,5 +5672,116 @@ async fn superseded_nomination_does_not_override_newer() -> Result<()> {
         "an older nomination's late verification must not move media back (issue #55)"
     );
 
+    Ok(())
+}
+
+/// Answer every binding request arriving on `sock`, but only once `release`
+/// fires (immediately when it already has). Requests seen before the release
+/// are answered in a batch, keeping the checking agent's round in flight.
+/// `seen` is notified for each request received.
+async fn answer_binding_checks(
+    sock: UdpSocket,
+    mut release: watch::Receiver<bool>,
+    seen: Arc<tokio::sync::Notify>,
+) {
+    let mut held = Vec::new();
+    let mut buf = [0u8; 1500];
+    loop {
+        tokio::select! {
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, from)) = r else { return };
+                let Ok(m) = StunMessage::decode(&buf[..n]) else { continue };
+                if m.class != StunClass::Request {
+                    continue;
+                }
+                held.push((m.transaction_id, from));
+                seen.notify_one();
+            }
+            r = release.changed(), if !*release.borrow() => {
+                if r.is_err() {
+                    return;
+                }
+            }
+        }
+        if *release.borrow() {
+            for (tx_id, from) in held.drain(..) {
+                let resp = StunMessage::binding_success_response(tx_id, from);
+                if let Ok(bytes) = resp.encode(None, true) {
+                    let _ = sock.send_to(&bytes, from).await;
+                }
+            }
+        }
+    }
+}
+
+/// A connectivity-check round that finishes after another round already
+/// selected a pair must not overwrite that selection on the controlled side.
+///
+/// Every `RunChecks` (start, each trickled or peer-reflexive candidate) spawns
+/// its own round. Rounds that began before any pair was selected used to each
+/// commit their best pair, writing `selected_pair` and the selected socket
+/// separately; when two finished together the writes interleaved and left the
+/// socket of one pair sending to the remote of the other. On a multi-homed
+/// host that sent every DTLS flight from a bridge-interface socket to an en0
+/// address (EHOSTDOWN) until the handshake timed out. The first round to
+/// commit now wins; only USE-CANDIDATE moves the selection afterwards.
+#[tokio::test]
+async fn controlled_late_check_round_keeps_first_selection() -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    let mut cfg = RtcConfiguration::default();
+    cfg.bind_ip = Some("127.0.0.1".into());
+    let (t, runner) = IceTransportBuilder::new(cfg)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner);
+    timeout(Duration::from_secs(5), async {
+        while t.gather_state() != IceGathererState::Complete {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("gathering did not complete in time")?;
+
+    // Round 1 checks the slow peer, which holds its answers until released.
+    let slow = UdpSocket::bind("127.0.0.1:0").await?;
+    let slow_addr = slow.local_addr()?;
+    let (release_slow, release_slow_rx) = watch::channel(false);
+    let slow_seen = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(answer_binding_checks(
+        slow,
+        release_slow_rx,
+        slow_seen.clone(),
+    ));
+    t.add_remote_candidate(IceCandidate::host(slow_addr, 1));
+    t.start(IceParameters::new(
+        "peer_ufrag",
+        "peer_pwd_0123456789abcdef",
+    ))
+    .await?;
+    timeout(Duration::from_secs(5), slow_seen.notified())
+        .await
+        .context("round 1 never checked the slow peer")?;
+
+    // Round 2 checks the fast peer, succeeds and selects it.
+    let fast = UdpSocket::bind("127.0.0.1:0").await?;
+    let fast_addr = fast.local_addr()?;
+    let (_release_fast, release_fast_rx) = watch::channel(true);
+    tokio::spawn(answer_binding_checks(
+        fast,
+        release_fast_rx,
+        Arc::new(tokio::sync::Notify::new()),
+    ));
+    t.add_remote_candidate(IceCandidate::host(fast_addr, 1));
+    wait_selected_remote(&t, fast_addr, Duration::from_secs(5)).await?;
+
+    // Let round 1 succeed too; it must not take the selection over.
+    release_slow.send(true)?;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let selected = t.get_selected_pair().expect("selected pair");
+    assert_eq!(
+        selected.remote.address, fast_addr,
+        "a later check round overwrote the controlled side's selected pair"
+    );
     Ok(())
 }
