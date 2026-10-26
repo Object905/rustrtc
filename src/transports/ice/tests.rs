@@ -5785,3 +5785,137 @@ async fn controlled_late_check_round_keeps_first_selection() -> Result<()> {
     );
     Ok(())
 }
+
+/// A check round that outlives an ICE restart must not commit its stale
+/// pair. `restart()` bumps `nomination_generation` (which the round snapped
+/// up at start) and clears the pending transactions, aborting the round's
+/// in-flight checks — driving the round into its commit path right as the
+/// restart completes. Without the generation guard that commit would land
+/// after the restart's selection reset, and the first-wins rule would keep
+/// the pre-restart pair until the peer's next USE-CANDIDATE.
+#[tokio::test]
+async fn stale_check_round_after_restart_does_not_commit() -> Result<()> {
+    use tokio::net::UdpSocket;
+
+    let mut cfg = RtcConfiguration::default();
+    cfg.bind_ip = Some("127.0.0.1".into());
+    let (t, runner) = IceTransportBuilder::new(cfg)
+        .role(IceRole::Controlled)
+        .build();
+    tokio::spawn(runner);
+    timeout(Duration::from_secs(5), async {
+        while t.gather_state() != IceGathererState::Complete {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("gathering did not complete in time")?;
+
+    // `fast` answers immediately; `held` never does (its release watcher
+    // stays false for the whole test), keeping one check of the round in
+    // flight so the round is still running when the restart fires.
+    let fast = UdpSocket::bind("127.0.0.1:0").await?;
+    let fast_addr = fast.local_addr()?;
+    let (_release_fast, release_fast_rx) = watch::channel(true);
+    let fast_seen = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(answer_binding_checks(
+        fast,
+        release_fast_rx,
+        fast_seen.clone(),
+    ));
+
+    let held = UdpSocket::bind("127.0.0.1:0").await?;
+    let held_addr = held.local_addr()?;
+    let (_release_held, release_held_rx) = watch::channel(false);
+    tokio::spawn(answer_binding_checks(
+        held,
+        release_held_rx,
+        Arc::new(tokio::sync::Notify::new()),
+    ));
+
+    t.add_remote_candidate(IceCandidate::host(fast_addr, 1));
+    t.add_remote_candidate(IceCandidate::host(held_addr, 1));
+    t.start(IceParameters::new(
+        "peer_ufrag",
+        "peer_pwd_0123456789abcdef",
+    ))
+    .await?;
+    timeout(Duration::from_secs(5), fast_seen.notified())
+        .await
+        .context("the round never checked the fast peer")?;
+    // Let the round collect the fast success while the held check keeps
+    // retransmitting (still inside the round's nomination grace window).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Restart mid-round. Whatever order the aborted round's commit and the
+    // restart's internal steps interleave in, no stale pair may survive:
+    // a commit before the generation bump is itself reset by the locked
+    // selection clear, a commit after it is rejected by the guard.
+    t.restart().await?;
+
+    // Give the aborted round plenty of time to reach (and be rejected at)
+    // its commit.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        t.get_selected_pair().is_none(),
+        "a pre-restart check round committed a stale pair after the restart"
+    );
+
+    // Recovery: a fresh round started after the restart still selects.
+    t.start(IceParameters::new(
+        "peer_ufrag2",
+        "peer_pwd_0123456789abcdeg",
+    ))
+    .await?;
+    timeout(Duration::from_secs(5), async {
+        while t.get_selected_pair().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("no fresh round selected a pair after the restart")?;
+    Ok(())
+}
+
+/// A selection commit must refuse a pair whose local candidate has no
+/// socket: advancing `selected_pair` alone would leave the previously
+/// published socket (or none at all) paired with the new remote — the exact
+/// mismatch `selection_lock` exists to prevent.
+#[tokio::test]
+async fn select_pair_refuses_unresolvable_local() -> Result<()> {
+    let mut cfg = RtcConfiguration::default();
+    cfg.bind_ip = Some("127.0.0.1".into());
+    let (t, runner) = IceTransportBuilder::new(cfg).build();
+    tokio::spawn(runner);
+    timeout(Duration::from_secs(5), async {
+        while t.gather_state() != IceGathererState::Complete {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("gathering did not complete in time")?;
+
+    // A local address no socket was ever bound to: the commit must refuse
+    // rather than publish the pair without a socket.
+    let bogus_local = IceCandidate::host("127.0.0.1:1".parse()?, 1);
+    let remote_addr: SocketAddr = "127.0.0.1:9999".parse()?;
+    let remote = IceCandidate::host(remote_addr, 1);
+    t.select_pair(IceCandidatePair::new(bogus_local, remote.clone()));
+    assert!(
+        t.get_selected_pair().is_none(),
+        "a pair with no resolvable socket must not be selected"
+    );
+
+    // A real gathered local candidate resolves and commits as before.
+    let local = t
+        .local_candidates()
+        .into_iter()
+        .find(|c| c.transport == "udp")
+        .context("no UDP local candidate gathered")?;
+    t.select_pair(IceCandidatePair::new(local, remote));
+    let selected = t
+        .get_selected_pair()
+        .context("real pair was not selected")?;
+    assert_eq!(selected.remote.address, remote_addr);
+    Ok(())
+}
